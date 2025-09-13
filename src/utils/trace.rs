@@ -1,16 +1,20 @@
-use crate::consts::TRACES_BY_BLOCK_PREFIX;
+use std::collections::HashMap;
+
+use crate::runtime::sdb::SDB;
+use crate::utils::cli::get_metashrew_sdb;
+use crate::{consts::TRACES_BY_BLOCK_PREFIX, utils::cli::get_electrum_client};
 use alkanes_support::proto::alkanes;
 use alkanes_support::proto::alkanes::AlkanesTrace;
-use alkanes_support::proto::alkanes::Trace;
 use anyhow::{Context, Result};
-use bitcoin::Transaction;
 use bitcoin::block::Header;
+use bitcoin::consensus::deserialize;
+use bitcoin::{Transaction, Txid};
+use electrum_client::ElectrumApi;
 use protobuf::Message;
-use protobuf_json_mapping::parse_from_str;
-use protobuf_json_mapping::print_to_string;
-use rocksdb::{DB, Direction, IteratorMode, ReadOptions};
+use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EspoSandshrewLikeTrace {
@@ -98,21 +102,21 @@ pub struct EspoOutpoint {
     pub vout: u32,
 }
 pub struct PartialEspoTrace {
-    pub trace: Trace,
+    pub protobuf_trace: AlkanesTrace,
     pub outpoint: Vec<u8>,
 }
 
 //MAIN
 pub struct EspoAlkanesTransaction {
     pub sandshrew_trace: EspoSandshrewLikeTrace,
-    pub protobuf_trace: Trace,
+    pub protobuf_trace: AlkanesTrace,
     pub outpoint: EspoOutpoint,
     pub transaction: Transaction,
 }
 
 pub struct EspoBlock {
-    block_header: Header,
-    transactions: Vec<EspoAlkanesTransaction>,
+    pub block_header: Header,
+    pub transactions: Vec<EspoAlkanesTransaction>,
 }
 
 fn trace_block_prefix(block: &u64) -> Vec<u8> {
@@ -124,7 +128,7 @@ fn trace_block_prefix(block: &u64) -> Vec<u8> {
 }
 fn next_prefix(mut p: Vec<u8>) -> Option<Vec<u8>> {
     for i in (0..p.len()).rev() {
-        if p[i] != 0xFF {
+        if p[i] != 0xff {
             p[i] += 1;
             p.truncate(i + 1);
             return Some(p);
@@ -139,7 +143,7 @@ fn is_length_bucket(key: &[u8], prefix: &[u8]) -> bool {
     let bucket = &key[prefix.len()..key.len() - 4];
     bucket == b"length"
 }
-pub fn collect_outpoints_for_block(db: &DB, block: &u64) -> Result<Vec<Vec<u8>>> {
+pub fn collect_outpoints_for_block(db: &SDB, block: &u64) -> Result<Vec<Vec<u8>>> {
     let prefix = trace_block_prefix(&block);
     let mut ro = ReadOptions::default();
     if let Some(ub) = next_prefix(prefix.clone()) {
@@ -202,10 +206,7 @@ fn bytes_to_string_or_hex(b: &[u8]) -> String {
     }
 }
 
-pub fn prettyify_protobuf_trace_json(input_json: &str) -> Result<String> {
-    let trace: alkanes::AlkanesTrace =
-        parse_from_str(input_json).context("parse AlkanesTrace from JSON")?;
-
+pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
     let mut out: Vec<Value> = Vec::with_capacity(trace.events.len() as usize);
 
     for ev in &trace.events {
@@ -235,8 +236,7 @@ pub fn prettyify_protobuf_trace_json(input_json: &str) -> Result<String> {
 
                     let inputs_hex: Vec<String> = inner.inputs.iter().map(fmt_u128_hex).collect();
 
-                    let incoming_alkanes: Vec<Value> = inner
-                        .incoming_alkanes
+                    let incoming_alkanes: Vec<Value> = inner.incoming_alkanes
                         .iter()
                         .map(|t| {
                             let id = t.id.as_ref();
@@ -250,7 +250,8 @@ pub fn prettyify_protobuf_trace_json(input_json: &str) -> Result<String> {
                         })
                         .collect();
 
-                    out.push(json!({
+                    out.push(
+                        json!({
                         "event": "invoke",
                         "data": {
                             "type": typ,
@@ -269,7 +270,8 @@ pub fn prettyify_protobuf_trace_json(input_json: &str) -> Result<String> {
                             },
                             "fuel": ctx.fuel,
                         }
-                    }));
+                    })
+                    );
                 }
 
                 Event::ExitContext(exit) => {
@@ -282,16 +284,19 @@ pub fn prettyify_protobuf_trace_json(input_json: &str) -> Result<String> {
 
                     let alkanes_list: Vec<Value> = resp
                         .map(|r| {
-                            r.alkanes.iter().map(|t| {
-                                let id = t.id.as_ref();
-                                json!({
+                            r.alkanes
+                                .iter()
+                                .map(|t| {
+                                    let id = t.id.as_ref();
+                                    json!({
                                     "id": {
                                         "block": id.and_then(|x| x.block.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
                                         "tx":    id.and_then(|x| x.tx.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
                                     },
                                     "value": t.value.as_ref().map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
                                 })
-                            }).collect()
+                                })
+                                .collect()
                         })
                         .unwrap_or_default();
 
@@ -308,9 +313,8 @@ pub fn prettyify_protobuf_trace_json(input_json: &str) -> Result<String> {
                         })
                         .unwrap_or_default();
 
-                    let data_hex = resp
-                        .map(|r| fmt_bytes_hex(&r.data))
-                        .unwrap_or_else(|| "0x".to_string());
+                    let data_hex =
+                        resp.map(|r| fmt_bytes_hex(&r.data)).unwrap_or_else(|| "0x".to_string());
 
                     out.push(json!({
                         "event": "return",
@@ -342,7 +346,7 @@ pub fn prettyify_protobuf_trace_json(input_json: &str) -> Result<String> {
                         }
                     }));
                 }
-                &_ => {} // future-proof for new variants
+                &_ => {}
             }
         }
     }
@@ -369,55 +373,117 @@ fn parse_trace_maybe_with_trailer(mut bytes: Vec<u8>) -> Option<AlkanesTrace> {
     })
 }
 
-pub fn traces_for_block_as_protobuf(db: &DB, block: u64) -> Result<Trace> {}
-
-pub fn traces_for_block_as_json_str(db: &DB, block: u64) -> Result<String> {
+pub fn traces_for_block_as_protobuf(db: &SDB, block: u64) -> Result<Vec<PartialEspoTrace>> {
     let outpoints = collect_outpoints_for_block(db, &block)
         .with_context(|| format!("collect_outpoints_for_block({block}) failed"))?; // Vec<Vec<u8>>
 
-    let keys: Vec<Vec<u8>> = outpoints
-        .iter()
-        .map(|op| outpoint_bytes_to_key(op))
+    let keys: Vec<Vec<u8>> = outpoints.iter().map(|op| outpoint_bytes_to_key(op)).collect();
+
+    let values = db.multi_get(keys.iter())?;
+
+    let traces: Vec<PartialEspoTrace> = values
+        .into_iter()
+        .flat_map(Option::into_iter)
+        .map(|bytes| parse_trace_maybe_with_trailer(bytes))
+        .flat_map(Option::into_iter)
+        .enumerate()
+        .map(|(index, protobuf_trace)| PartialEspoTrace {
+            protobuf_trace,
+            outpoint: outpoints[index].clone(),
+        })
         .collect();
+    Ok(traces)
+}
 
-    let values = db.multi_get(keys.iter());
+pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
+    let partial_traces = traces_for_block_as_protobuf(db, block)?;
+    let mut entries: Vec<String> = Vec::new();
 
-    let mut entries: Vec<Value> = Vec::with_capacity(outpoints.len());
-    for (i, res) in values.into_iter().enumerate() {
-        // 1. handle RocksDB errors
-        let opt = match res {
-            Ok(opt) => opt,
-            Err(_) => continue, // skip this entry
-        };
+    for partial_trace in partial_traces {
+        let events = prettyify_protobuf_trace_json(&partial_trace.protobuf_trace)?;
 
-        let dbv = match opt {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let bytes: Vec<u8> = (&*dbv).to_vec();
-        let Some(trace) = parse_trace_maybe_with_trailer(bytes) else {
-            continue;
-        };
-
-        let trace_json = print_to_string(&trace).context("ESPO: Failed to serialize trace")?;
-
-        let pretty_events_str =
-            prettyify_protobuf_trace_json(&trace_json).context("ESPO: Failed to prettify trace")?;
-
-        let events_val: Value = serde_json::from_str(&pretty_events_str)
-            .context("ESPO: prettified events invalid JSON")?;
-
-        let out_label = outpoint_bytes_to_display(&outpoints[i]);
-
-        entries.push(json!({
-            "outpoint": out_label,
-            "events": events_val
-        }));
+        entries.push(
+            json!({
+                "outpoint": outpoint_bytes_to_display(&partial_trace.outpoint),
+                "events": events,
+            })
+            .to_string(),
+        );
     }
 
-    // 5) final JSON array string
     let final_json =
         serde_json::to_string(&entries).context("ESPO: failed to serialize final entries array")?;
+
     Ok(final_json)
+}
+
+pub fn get_espo_block(block: u64) -> Result<EspoBlock> {
+    let metashrew_sdb = &get_metashrew_sdb();
+
+    let partials = traces_for_block_as_protobuf(metashrew_sdb, block)
+        .with_context(|| format!("failed traces_for_block_as_protobuf({block})"))?;
+
+    let mut uniq_txids: Vec<Txid> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for p in &partials {
+        let (txid_le, _vout_le) = p.outpoint.split_at(32);
+        let mut txid_be = txid_le.to_vec();
+        txid_be.reverse();
+        let txid_hex = hex::encode(txid_be);
+        if seen.insert(txid_hex.clone()) {
+            let txid = Txid::from_str(&txid_hex)
+                .with_context(|| format!("invalid txid hex: {txid_hex}"))?;
+            uniq_txids.push(txid);
+        }
+    }
+
+    let client = get_electrum_client();
+    let raw_txs: Vec<Vec<u8>> = client
+        .batch_transaction_get_raw(&uniq_txids)
+        .context("electrum batch_transaction_get_raw failed")?;
+
+    let mut tx_map: HashMap<Txid, bitcoin::Transaction> = HashMap::with_capacity(uniq_txids.len());
+    for (i, tx_bytes) in raw_txs.into_iter().enumerate() {
+        let tx: bitcoin::Transaction = deserialize(&tx_bytes).context("deserialize tx")?;
+        tx_map.insert(uniq_txids[i], tx);
+    }
+
+    let block_header: bitcoin::block::Header =
+        client.block_header(block as usize).context("electrum block_header failed")?;
+
+    let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(partials.len());
+    for p in partials {
+        // outpoint -> txid (BE hex) + vout
+        let (txid_le, vout_le) = p.outpoint.split_at(32);
+        let mut txid_be = txid_le.to_vec();
+        txid_be.reverse();
+        let txid_hex = hex::encode(&txid_be);
+        let txid =
+            Txid::from_str(&txid_hex).with_context(|| format!("invalid txid hex: {txid_hex}"))?;
+        let vout = u32::from_le_bytes(vout_le.try_into().expect("vout 4 bytes"));
+
+        let events_json_str = prettyify_protobuf_trace_json(&p.protobuf_trace)?;
+        let events: Vec<EspoSandshrewLikeTraceEvent> =
+            serde_json::from_str(&events_json_str).context("deserialize sandshrew-like events")?;
+
+        let sandshrew_trace =
+            EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
+
+        let transaction = tx_map
+            .get(&txid)
+            .cloned()
+            .with_context(|| format!("missing raw tx for {txid}"))?;
+
+        let outpoint = EspoOutpoint { txid: txid_be, vout };
+
+        txs.push(EspoAlkanesTransaction {
+            sandshrew_trace,
+            protobuf_trace: p.protobuf_trace,
+            outpoint,
+            transaction,
+        });
+    }
+
+    Ok(EspoBlock { block_header, transactions: txs })
 }

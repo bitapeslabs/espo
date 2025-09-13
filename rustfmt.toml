@@ -1,0 +1,42 @@
+# rustfmt.toml
+
+# Tabs vs spaces
+hard_tabs = false
+tab_spaces = 4
+
+# Line width
+max_width = 100
+use_small_heuristics = "Max"
+
+# Function & struct formatting
+fn_args_layout = "Tall"        # Each arg on its own line if line too long
+fn_single_line = false
+where_single_line = false
+struct_lit_single_line = false
+
+# Control imports
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+
+# Chain formatting
+chain_width = 80
+chain_split_single_child = true
+
+# Match and if/else formatting
+match_arm_blocks = true
+control_brace_style = "AlwaysNextLine"
+
+# Spaces
+space_after_colon = true
+spaces_around_ranges = true
+
+# Comments
+wrap_comments = true
+normalize_comments = true
+comment_width = 100
+
+# Misc
+newline_style = "Unix"
+trailing_comma = "Vertical"
+reorder_imports = true
+reorder_modules = true

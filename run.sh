@@ -1,1 +1,1 @@
-cargo run -- --metashrew-db-path /data/.metashrew/mainnetnew884  --port 5777 --endpoint /traces
+cargo run -- --readonly-metashrew-db-dir /data/.metashrew/mainnetnew884  --port 5778 --electrum-rpc-url 0.0.0.0:50015
