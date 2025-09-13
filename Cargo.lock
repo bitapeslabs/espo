@@ -524,6 +524,7 @@ dependencies = [
  "alkanes-support",
  "anyhow",
  "axum",
+ "bitcoin",
  "clap",
  "hex",
  "protobuf 3.7.2",

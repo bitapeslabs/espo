@@ -1,13 +1,119 @@
 use crate::consts::TRACES_BY_BLOCK_PREFIX;
+use alkanes_support::proto::alkanes;
 use alkanes_support::proto::alkanes::AlkanesTrace;
+use alkanes_support::proto::alkanes::Trace;
 use anyhow::{Context, Result};
+use bitcoin::Transaction;
+use bitcoin::block::Header;
 use protobuf::Message;
 use protobuf_json_mapping::parse_from_str;
 use protobuf_json_mapping::print_to_string;
-use rocksdb::{DB, Direction, IteratorMode, ReadOptions}; // bring the trait into scope
+use rocksdb::{DB, Direction, IteratorMode, ReadOptions};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use alkanes_support::proto::alkanes;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspoSandshrewLikeTrace {
+    pub outpoint: String,
+    pub events: Vec<EspoSandshrewLikeTraceEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", content = "data")]
+pub enum EspoSandshrewLikeTraceEvent {
+    #[serde(rename = "invoke")]
+    Invoke(EspoSandshrewLikeTraceInvokeData),
+
+    #[serde(rename = "return")]
+    Return(EspoSandshrewLikeTraceReturnData),
+
+    #[serde(rename = "create")]
+    Create(EspoSandshrewLikeTraceCreateData),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspoSandshrewLikeTraceInvokeData {
+    #[serde(rename = "type")]
+    pub typ: String,
+    pub context: EspoSandshrewLikeTraceInvokeContext,
+    pub fuel: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspoSandshrewLikeTraceInvokeContext {
+    pub myself: EspoSandshrewLikeTraceShortId,
+    pub caller: EspoSandshrewLikeTraceShortId,
+    pub inputs: Vec<String>,
+    #[serde(rename = "incomingAlkanes")]
+    pub incoming_alkanes: Vec<EspoSandshrewLikeTraceTransfer>,
+    pub vout: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspoSandshrewLikeTraceShortId {
+    pub block: String,
+    pub tx: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspoSandshrewLikeTraceTransfer {
+    pub id: EspoSandshrewLikeTraceShortId,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspoSandshrewLikeTraceReturnData {
+    pub status: EspoSandshrewLikeTraceStatus,
+    pub response: EspoSandshrewLikeTraceReturnResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EspoSandshrewLikeTraceStatus {
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspoSandshrewLikeTraceReturnResponse {
+    pub alkanes: Vec<EspoSandshrewLikeTraceTransfer>,
+    pub data: String,
+    pub storage: Vec<EspoSandshrewLikeTraceStorageKV>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspoSandshrewLikeTraceStorageKV {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspoSandshrewLikeTraceCreateData {
+    #[serde(rename = "newAlkane")]
+    pub new_alkane: EspoSandshrewLikeTraceShortId,
+}
+
+pub struct EspoOutpoint {
+    pub txid: Vec<u8>,
+    pub vout: u32,
+}
+pub struct PartialEspoTrace {
+    pub trace: Trace,
+    pub outpoint: Vec<u8>,
+}
+
+//MAIN
+pub struct EspoAlkanesTransaction {
+    pub sandshrew_trace: EspoSandshrewLikeTrace,
+    pub protobuf_trace: Trace,
+    pub outpoint: EspoOutpoint,
+    pub transaction: Transaction,
+}
+
+pub struct EspoBlock {
+    block_header: Header,
+    transactions: Vec<EspoAlkanesTransaction>,
+}
 
 fn trace_block_prefix(block: &u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(7 + 8 + 1);
@@ -263,21 +369,19 @@ fn parse_trace_maybe_with_trailer(mut bytes: Vec<u8>) -> Option<AlkanesTrace> {
     })
 }
 
-pub fn traces_for_block(db: &DB, block: u64) -> Result<String> {
-    // 1) outpoints for block
+pub fn traces_for_block_as_protobuf(db: &DB, block: u64) -> Result<Trace> {}
+
+pub fn traces_for_block_as_json_str(db: &DB, block: u64) -> Result<String> {
     let outpoints = collect_outpoints_for_block(db, &block)
         .with_context(|| format!("collect_outpoints_for_block({block}) failed"))?; // Vec<Vec<u8>>
 
-    // 2) keys aligned 1:1 with outpoints
     let keys: Vec<Vec<u8>> = outpoints
         .iter()
         .map(|op| outpoint_bytes_to_key(op))
         .collect();
 
-    // 3) multiget (order matches keys)
     let values = db.multi_get(keys.iter());
 
-    // 4) build [{outpoint, events:[...]}...]
     let mut entries: Vec<Value> = Vec::with_capacity(outpoints.len());
     for (i, res) in values.into_iter().enumerate() {
         // 1. handle RocksDB errors
@@ -286,19 +390,16 @@ pub fn traces_for_block(db: &DB, block: u64) -> Result<String> {
             Err(_) => continue, // skip this entry
         };
 
-        // 2. handle missing value
         let dbv = match opt {
             Some(v) => v,
-            None => continue, // skip if no value
+            None => continue,
         };
 
-        // 3. parse trace
-        let bytes: Vec<u8> = (&*dbv).to_vec(); // deref to [u8] then to_vec
+        let bytes: Vec<u8> = (&*dbv).to_vec();
         let Some(trace) = parse_trace_maybe_with_trailer(bytes) else {
-            continue; // skip if unparsable
+            continue;
         };
 
-        // 4. protobuf -> JSON
         let trace_json = print_to_string(&trace).context("ESPO: Failed to serialize trace")?;
 
         let pretty_events_str =

@@ -39,11 +39,11 @@ pub async fn run() -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(health))
-        .nest(&cfg.endpoint, traces_api);
+        .nest("/traces", traces_api);
 
     println!(
-        "Listening on http://{}  (GET {} /{{block}})",
-        addr, cfg.endpoint
+        "Listening on http://{}  (GET {}/{{block}})",
+        addr, "/traces"
     );
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
