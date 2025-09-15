@@ -17,3 +17,8 @@ axum = "0.8.4"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net"] }
 bitcoin = "0.32.7"
 electrum-client = "0.24.0"
+tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "tcp"] }
+borsh = { version = "1.5.7", features = ["derive"] }
+futures = "0.3.31"
+tokio-stream = "0.1.17"
+tokio-serde = {version = "0.9.0", features = ["json"]}

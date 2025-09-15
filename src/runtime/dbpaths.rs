@@ -1,4 +1,4 @@
-use crate::utils::cli::get_config;
+use crate::config::get_config;
 use anyhow::Result;
 
 pub fn get_sdb_path_for_metashrew() -> Result<String> {

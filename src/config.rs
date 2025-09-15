@@ -3,7 +3,7 @@ use clap::Parser;
 use electrum_client::Client;
 use std::{fs, path::Path, sync::OnceLock, time::Duration};
 
-use crate::runtime::{paths::get_sdb_path_for_metashrew, sdb::SDB};
+use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB};
 
 static CONFIG: OnceLock<CliArgs> = OnceLock::new();
 static ELECTRUM_CLIENT: OnceLock<Client> = OnceLock::new();

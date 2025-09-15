@@ -1,3 +1,3 @@
-pub mod paths;
+pub mod dbpaths;
+pub mod rpc;
 pub mod sdb;
-pub mod server;

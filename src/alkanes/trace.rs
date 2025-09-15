@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::config::{get_electrum_client, get_metashrew_sdb};
+use crate::consts::TRACES_BY_BLOCK_PREFIX;
 use crate::runtime::sdb::SDB;
-use crate::utils::cli::get_metashrew_sdb;
-use crate::{consts::TRACES_BY_BLOCK_PREFIX, utils::cli::get_electrum_client};
 use alkanes_support::proto::alkanes;
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result};
@@ -96,7 +96,7 @@ pub struct EspoSandshrewLikeTraceCreateData {
     #[serde(rename = "newAlkane")]
     pub new_alkane: EspoSandshrewLikeTraceShortId,
 }
-
+#[derive(Clone)]
 pub struct EspoOutpoint {
     pub txid: Vec<u8>,
     pub vout: u32,
@@ -105,15 +105,14 @@ pub struct PartialEspoTrace {
     pub protobuf_trace: AlkanesTrace,
     pub outpoint: Vec<u8>,
 }
-
-//MAIN
+#[derive(Clone)]
 pub struct EspoAlkanesTransaction {
     pub sandshrew_trace: EspoSandshrewLikeTrace,
     pub protobuf_trace: AlkanesTrace,
     pub outpoint: EspoOutpoint,
     pub transaction: Transaction,
 }
-
+#[derive(Clone)]
 pub struct EspoBlock {
     pub block_header: Header,
     pub transactions: Vec<EspoAlkanesTransaction>,
@@ -397,18 +396,17 @@ pub fn traces_for_block_as_protobuf(db: &SDB, block: u64) -> Result<Vec<PartialE
 
 pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
     let partial_traces = traces_for_block_as_protobuf(db, block)?;
-    let mut entries: Vec<String> = Vec::new();
+    let mut entries: Vec<serde_json::Value> = Vec::new();
 
     for partial_trace in partial_traces {
-        let events = prettyify_protobuf_trace_json(&partial_trace.protobuf_trace)?;
+        // already-JSON string -> Value
+        let events_v: serde_json::Value =
+            serde_json::from_str(&prettyify_protobuf_trace_json(&partial_trace.protobuf_trace)?)?;
 
-        entries.push(
-            json!({
-                "outpoint": outpoint_bytes_to_display(&partial_trace.outpoint),
-                "events": events,
-            })
-            .to_string(),
-        );
+        entries.push(json!({
+            "outpoint": outpoint_bytes_to_display(&partial_trace.outpoint),
+            "events": events_v, // <-- Value, not a string
+        }));
     }
 
     let final_json =
