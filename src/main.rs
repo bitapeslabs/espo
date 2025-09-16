@@ -4,33 +4,35 @@ pub mod consts;
 pub mod modules;
 pub mod runtime;
 pub mod types;
+pub mod utils;
+
 use std::net::SocketAddr;
+use std::time::Duration;
+
+//modules
+use crate::modules::ammdata::main::AmmData;
+use crate::utils::{EtaTracker, fmt_duration};
 
 use anyhow::{Context, Result};
 
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
-    config::{get_config, init_config},
+    config::{get_config, get_espo_db, init_config},
     consts::{NETWORK, alkanes_genesis_block},
     modules::defs::ModuleRegistry,
     runtime::rpc::run_rpc,
 };
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1) Init config & shared clients.
     init_config()?;
     let cfg = get_config();
-    let tip = get_safe_tip()?;
 
-    eprintln!("[debug] safeheight on {}", tip);
+    // Build module registry with the global ESPO DB
+    let mut mods = ModuleRegistry::with_db(get_espo_db());
+    mods.register_module(AmmData::new());
+    // mods.register_module(TracesData::new());
 
-    // 2) Build module registry and register your modules here.
-    let mut mods = ModuleRegistry::new();
-    // mods.register_module(AmmData);
-    // mods.register_module(TracesData);
-
-    // 3) Start RPC server (single endpoint) in the background.
+    // Start RPC server
     let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
     let rpc_router = mods.router.clone();
     tokio::spawn(async move {
@@ -40,41 +42,95 @@ async fn main() -> Result<()> {
     });
     eprintln!("[rpc] listening on {}", addr);
 
-    // 4) Decide indexing range.
     let global_genesis = alkanes_genesis_block(NETWORK);
 
-    // If there are modules, start at the earliest module’s genesis; otherwise use global.
+    // Decide initial start height (resume at last+1 per module)
     let start_height = mods
         .modules()
         .iter()
-        .map(|m| m.get_genesis_block(NETWORK))
+        .map(|m| {
+            let g = m.get_genesis_block(NETWORK);
+            match m.get_index_height() {
+                Some(h) => h.saturating_add(1).max(g),
+                None => g,
+            }
+        })
         .min()
         .unwrap_or(global_genesis)
-        .min(global_genesis);
+        .max(global_genesis);
 
-    // Current tip from Electrum.
-    let tip = get_safe_tip()?;
-    eprintln!("[indexer] range: {}..={}", start_height, tip);
+    let mut next_height: u32 = start_height;
+    const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-    // 5) Index loop: fetch each block once, feed only interested modules.
-    for height in start_height..=tip {
-        let espo_block = get_espo_block(height.into())
-            .with_context(|| format!("failed to load espo block {height}"))?;
+    // ETA tracker
+    let mut eta = EtaTracker::new(3.0); // EMA smoothing factor (tweak if you want faster/slower adaptation)
 
-        eprintln!(
-            "[indexer] indexing block #{} with {} traces",
-            height,
-            espo_block.transactions.len()
-        );
+    loop {
+        let tip = match get_safe_tip() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[indexer] failed to fetch safe tip: {e:?}");
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+        };
 
-        for m in mods.modules() {
-            if height >= m.get_genesis_block(NETWORK) {
-                if let Err(e) = m.index_block(espo_block.clone()) {
-                    eprintln!("[module:{}] height {}: {e:?}", m.get_name(), height);
+        if next_height == start_height {
+            let remaining = tip.saturating_sub(next_height) + 1;
+            let eta_str = fmt_duration(eta.eta(remaining));
+            eprintln!(
+                "[indexer] starting at {}, safe tip {}, {} blocks behind, ETA ~ {}",
+                next_height, tip, remaining, eta_str
+            );
+        }
+
+        if next_height <= tip {
+            // Compute a fresh ETA before starting the block
+            let remaining = tip.saturating_sub(next_height) + 1;
+            let eta_str = fmt_duration(eta.eta(remaining));
+
+            eprintln!(
+                "[indexer] indexing block #{} ({} left → ETA ~ {})",
+                next_height, remaining, eta_str
+            );
+
+            eta.start_block();
+
+            match get_espo_block(next_height.into())
+                .with_context(|| format!("failed to load espo block {next_height}"))
+            {
+                Ok(espo_block) => {
+                    // (Optional) include hash or tx count here as you like
+                    eprintln!(
+                        "[indexer] block #{} has {} traces",
+                        next_height,
+                        espo_block.transactions.len()
+                    );
+
+                    for m in mods.modules() {
+                        if next_height >= m.get_genesis_block(NETWORK) {
+                            if let Err(e) = m.index_block(espo_block.clone()) {
+                                eprintln!(
+                                    "[module:{}] height {}: {e:?}",
+                                    m.get_name(),
+                                    next_height
+                                );
+                            }
+                        }
+                    }
+
+                    eta.finish_block();
+                    next_height = next_height.saturating_add(1);
+                }
+                Err(e) => {
+                    eprintln!("[indexer] error at height {}: {e:?}", next_height);
+                    // Don’t update EMA on failure; just wait and retry
+                    tokio::time::sleep(POLL_INTERVAL).await;
                 }
             }
+        } else {
+            // Caught up; chill then poll again
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
-
-    Ok(())
 }

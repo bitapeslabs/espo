@@ -114,6 +114,7 @@ pub struct EspoAlkanesTransaction {
 }
 #[derive(Clone)]
 pub struct EspoBlock {
+    pub height: u32,
     pub block_header: Header,
     pub transactions: Vec<EspoAlkanesTransaction>,
 }
@@ -483,5 +484,5 @@ pub fn get_espo_block(block: u64) -> Result<EspoBlock> {
         });
     }
 
-    Ok(EspoBlock { block_header, transactions: txs })
+    Ok(EspoBlock { block_header, transactions: txs, height: block.try_into()? })
 }
