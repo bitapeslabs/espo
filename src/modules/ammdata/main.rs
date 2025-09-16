@@ -15,9 +15,9 @@ use super::rpc::register_rpc;
 use super::schemas::{SchemaCandleV1, SchemaTradeV1};
 
 fn collect_prevout_txids(block: &EspoBlock) -> BTreeSet<Txid> {
-    let mut set = BTreeSet::new();
-    for t in &block.transactions {
-        for vin in &t.transaction.input {
+    let mut transaction_set = BTreeSet::new();
+    for transaction in &block.transactions {
+        for vin in &transaction.transaction.input {
             set.insert(vin.previous_output.txid);
         }
     }
@@ -103,7 +103,10 @@ impl EspoModule for AmmData {
 
         // 1) Batch prevouts for trader address heuristics
         let prev_txids = collect_prevout_txids(&block);
-
+        let client = get_electrum_client();
+        let raw_txs: Vec<Vec<u8>> = client
+            .batch_transaction_get_raw(&uniq_txids)
+            .context("electrum batch_transaction_get_raw failed")?;
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::{get_electrum_client, get_metashrew_sdb};
 use crate::consts::TRACES_BY_BLOCK_PREFIX;
@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 use bitcoin::{Transaction, Txid};
-use electrum_client::ElectrumApi;
+use electrum_client::{ElectrumApi};
 use protobuf::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde::{Deserialize, Serialize};
@@ -117,6 +117,8 @@ pub struct EspoBlock {
     pub height: u32,
     pub block_header: Header,
     pub transactions: Vec<EspoAlkanesTransaction>,
+    //All related prevouts for this block
+    pub prevouts: HashMap<Txid, Transaction>,
 }
 
 fn trace_block_prefix(block: &u64) -> Vec<u8> {
@@ -416,8 +418,37 @@ pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
     Ok(final_json)
 }
 
+fn collect_prevouts_txids_for_block(transactions: &Vec<EspoAlkanesTransaction>) -> Vec<Txid> {
+    let mut prevout_txid_set = HashSet::new();
+
+    for transaction in transactions {
+        for vin in &transaction.transaction.input {
+            prevout_txid_set.insert(vin.previous_output.txid);
+        }
+    }
+
+    prevout_txid_set.into_iter().collect()
+}
+
+fn get_bulk_txs_from_electrum(txids: Vec<Txid>) -> Result<HashMap<Txid, Transaction>> {
+    let client = get_electrum_client();
+
+    let raw_txs: Vec<Vec<u8>> = client
+        .batch_transaction_get_raw(&txids)
+        .context("electrum batch_transaction_get_raw failed")?;
+
+    let mut tx_map: HashMap<Txid, Transaction> = HashMap::with_capacity(txids.len());
+    for (i, tx_bytes) in raw_txs.into_iter().enumerate() {
+        let tx: Transaction = deserialize(&tx_bytes).context("deserialize tx")?;
+        tx_map.insert(txids[i], tx);
+    }
+
+    Ok(tx_map)
+}
+
 pub fn get_espo_block(block: u64) -> Result<EspoBlock> {
     let metashrew_sdb = &get_metashrew_sdb();
+    let client = get_electrum_client();
 
     let partials = traces_for_block_as_protobuf(metashrew_sdb, block)
         .with_context(|| format!("failed traces_for_block_as_protobuf({block})"))?;
@@ -437,16 +468,7 @@ pub fn get_espo_block(block: u64) -> Result<EspoBlock> {
         }
     }
 
-    let client = get_electrum_client();
-    let raw_txs: Vec<Vec<u8>> = client
-        .batch_transaction_get_raw(&uniq_txids)
-        .context("electrum batch_transaction_get_raw failed")?;
-
-    let mut tx_map: HashMap<Txid, bitcoin::Transaction> = HashMap::with_capacity(uniq_txids.len());
-    for (i, tx_bytes) in raw_txs.into_iter().enumerate() {
-        let tx: bitcoin::Transaction = deserialize(&tx_bytes).context("deserialize tx")?;
-        tx_map.insert(uniq_txids[i], tx);
-    }
+    let tx_map = get_bulk_txs_from_electrum(uniq_txids)?;
 
     let block_header: bitcoin::block::Header =
         client.block_header(block as usize).context("electrum block_header failed")?;
@@ -483,6 +505,14 @@ pub fn get_espo_block(block: u64) -> Result<EspoBlock> {
             transaction,
         });
     }
+    let prevout_txids = collect_prevouts_txids_for_block(&txs);
 
-    Ok(EspoBlock { block_header, transactions: txs, height: block.try_into()? })
+    let prev_txs_map = get_bulk_txs_from_electrum(prevout_txids)?;
+
+    Ok(EspoBlock {
+        block_header,
+        transactions: txs,
+        height: block.try_into()?,
+        prevouts: prev_txs_map,
+    })
 }
