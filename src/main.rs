@@ -89,10 +89,10 @@ async fn main() -> Result<()> {
             let remaining = tip.saturating_sub(next_height) + 1;
             let eta_str = fmt_duration(eta.eta(remaining));
 
-            eprintln!(
-                "[indexer] indexing block #{} ({} left → ETA ~ {})",
-                next_height, remaining, eta_str
-            );
+            //eprintln!(
+            //  "[indexer] indexing block #{} ({} left → ETA ~ {})",
+            //  next_height, remaining, eta_str
+            // );
 
             eta.start_block();
 
@@ -101,11 +101,6 @@ async fn main() -> Result<()> {
             {
                 Ok(espo_block) => {
                     // (Optional) include hash or tx count here as you like
-                    eprintln!(
-                        "[indexer] block #{} has {} traces",
-                        next_height,
-                        espo_block.transactions.len()
-                    );
 
                     for m in mods.modules() {
                         if next_height >= m.get_genesis_block(NETWORK) {
