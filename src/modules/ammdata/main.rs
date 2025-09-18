@@ -1,10 +1,11 @@
 use crate::alkanes::trace::EspoBlock;
-use crate::modules::ammdata::consts::{KEY_INDEX_HEIGHT, ammdata_genesis_block, get_amm_contract};
-use crate::modules::ammdata::utils::extract_reserves_from_espo_transaction;
+use crate::modules::ammdata::consts::ammdata_genesis_block;
+use crate::modules::ammdata::schemas::{SchemaAlkaneId, active_timeframes};
+use crate::modules::ammdata::utils::reserves::extract_reserves_from_espo_transaction;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::runtime::mdb::Mdb;
 use anyhow::{Result, anyhow};
-use bitcoin::{Network, transaction};
+use bitcoin::Network;
 use std::sync::Arc;
 
 use super::rpc::register_rpc;
@@ -80,94 +81,129 @@ impl EspoModule for AmmData {
     fn get_genesis_block(&self, network: Network) -> u32 {
         ammdata_genesis_block(network)
     }
-
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let block_ts = block.block_header.time as u64; // unix seconds
 
         for transaction in block.transactions {
+            // cache for this tx
+            let mut tx_cache = crate::modules::ammdata::utils::candles::CandleCache::new();
+
             match extract_reserves_from_espo_transaction(&transaction) {
-                Ok(reserve_data) => {
-                    // Convert pool to decimal for matching/logging
-                    let pool_block_str = reserve_data.pool.block.trim_start_matches("0x");
-                    let pool_tx_hex = reserve_data.pool.tx.trim_start_matches("0x");
-                    let pool_tx_dec = u32::from_str_radix(pool_tx_hex, 16).unwrap_or_default();
+                Ok(reserve_data_vec) => {
+                    if reserve_data_vec.is_empty() {
+                        continue;
+                    }
 
-                    // Only log pool 2:68441
-                    if pool_block_str == "2" && pool_tx_dec == 68441 {
-                        let pool_id_dec = format!("{}:{}", pool_block_str, pool_tx_dec);
+                    for rd in reserve_data_vec {
+                        // Pool id (hex -> decimal) just for logging + keys
+                        let pool_block_dec =
+                            u32::from_str_radix(rd.pool.block.trim_start_matches("0x"), 16)
+                                .unwrap_or_default();
+                        let pool_tx_dec =
+                            u64::from_str_radix(rd.pool.tx.trim_start_matches("0x"), 16)
+                                .unwrap_or_default();
+                        let pool_schema = SchemaAlkaneId { block: pool_block_dec, tx: pool_tx_dec };
+                        let pool_id_dec = format!("{}:{}", pool_block_dec, pool_tx_dec);
 
-                        let prev0 = reserve_data.prev_reserves.0;
-                        let prev1 = reserve_data.prev_reserves.1;
-                        let new0 = reserve_data.new_reserves.0;
-                        let new1 = reserve_data.new_reserves.1;
+                        // Reserves (base, quote) oriented by extractor
+                        let (prev_base, prev_quote) = rd.prev_reserves;
+                        let (new_base, new_quote) = rd.new_reserves;
 
-                        // Deltas (signed)
-                        let d0 = (new0 as i128) - (prev0 as i128);
-                        let d1 = (new1 as i128) - (prev1 as i128);
+                        // Prices derived from NEW reserves
+                        let p_q_per_b =
+                            crate::modules::ammdata::utils::candles::price_quote_per_base(
+                                new_base, new_quote,
+                            ); // quote/base
+                        let p_b_per_q =
+                            crate::modules::ammdata::utils::candles::price_base_per_quote(
+                                new_base, new_quote,
+                            ); // base/quote
 
-                        // Prices from NEW reserves (token0 is "base", token1 is "quote")
-                        let price_base_to_quote: Option<f64> =
-                            if new0 != 0 { Some((new1 as f64) / (new0 as f64)) } else { None };
-                        let price_quote_to_base: Option<f64> =
-                            if new1 != 0 { Some((new0 as f64) / (new1 as f64)) } else { None };
+                        // Volumes from extractor (base_in, quote_out)
+                        let (vol_base_in, vol_quote_out) = rd.volume;
 
-                        // Pretty strings
-                        let token0_id = format!(
-                            "{}/{}",
-                            reserve_data.token_ids[0].block, reserve_data.token_ids[0].tx
-                        );
-                        let token1_id = format!(
-                            "{}/{}",
-                            reserve_data.token_ids[1].block, reserve_data.token_ids[1].tx
-                        );
+                        // Token ids (for log pretty)
+                        let base_id =
+                            format!("{}/{}", rd.token_ids.base.block, rd.token_ids.base.tx);
+                        let quote_id =
+                            format!("{}/{}", rd.token_ids.quote.block, rd.token_ids.quote.tx);
 
-                        let k_ratio_str = reserve_data
+                        // K ratio (pretty)
+                        let k_ratio_str = rd
                             .k_ratio_approx
                             .map(|r| format!("{:.6}", r))
                             .unwrap_or_else(|| "n/a".into());
 
-                        let p_bq_str = price_base_to_quote
-                            .map(|p| format!("{:.12}", p))
-                            .unwrap_or_else(|| "n/a".into());
-                        let p_qb_str = price_quote_to_base
-                            .map(|p| format!("{:.12}", p))
-                            .unwrap_or_else(|| "n/a".into());
+                        // Pretty prices (floating log only)
+                        let p_bq_str = if new_quote != 0 {
+                            format!("{:.12}", (new_base as f64) / (new_quote as f64))
+                        } else {
+                            "n/a".into()
+                        };
+                        let p_qb_str = if new_base != 0 {
+                            format!("{:.12}", (new_quote as f64) / (new_base as f64))
+                        } else {
+                            "n/a".into()
+                        };
 
+                        // ----- accumulate into RAM for all active timeframes -----
+                        tx_cache.apply_trade_for_frames(
+                            block_ts,
+                            pool_schema,
+                            &active_timeframes(),
+                            p_b_per_q,
+                            p_q_per_b,
+                            vol_base_in,
+                            vol_quote_out,
+                        );
+
+                        // ----- log the trade -----
+                        let d_base = (new_base as i128) - (prev_base as i128);
+                        let d_quote = (new_quote as i128) - (prev_quote as i128);
                         println!(
-                            "[AMMDATA] Trade detected in pool {pool} @ block #{blk}, ts={ts} \
-                        → Mapping: {map}\n\
-                        [AMMDATA]   Tokens: [{t0}, {t1}] \
-                        | Δ: [token0={d0}, token1={d1}]\n\
-                        [AMMDATA]   Reserves: prev[{p0}, {p1}] -> new[{n0}, {n1}] \
-                        | K≈{k}\n\
-                        [AMMDATA]   Prices (from NEW reserves): \
-                        base→quote={pbq} | quote→base={pqb}",
+                            "[AMMDATA] Trade detected in pool {pool} @ block #{blk}, ts={ts}\n\
+                         [AMMDATA]   Tokens: base={base_id} | quote={quote_id}\n\
+                         [AMMDATA]   Δ: [base={d_base}, quote={d_quote}]\n\
+                         [AMMDATA]   Reserves: prev[base={p0}, quote={p1}] -> new[base={n0}, quote={n1}] | K≈{k}\n\
+                         [AMMDATA]   Volume: base_in={vbin}, quote_out={vqout}\n\
+                         [AMMDATA]   Prices (from NEW reserves): base→quote={pbq} | quote→base={pqb}",
                             pool = pool_id_dec,
                             blk = block.height,
                             ts = block_ts,
-                            map = reserve_data.mapping,
-                            t0 = token0_id,
-                            t1 = token1_id,
-                            d0 = d0,
-                            d1 = d1,
-                            p0 = prev0,
-                            p1 = prev1,
-                            n0 = new0,
-                            n1 = new1,
+                            base_id = base_id,
+                            quote_id = quote_id,
+                            d_base = d_base,
+                            d_quote = d_quote,
+                            p0 = prev_base,
+                            p1 = prev_quote,
+                            n0 = new_base,
+                            n1 = new_quote,
                             k = k_ratio_str,
+                            vbin = vol_base_in,
+                            vqout = vol_quote_out,
                             pbq = p_bq_str,
                             pqb = p_qb_str
                         );
+                    }
+
+                    // ----- flush this tx atomically (merge with DB) -----
+                    let writes = tx_cache.into_writes(self.mdb())?;
+                    if !writes.is_empty() {
+                        let _ = self.mdb().bulk_write(|wb| {
+                            for (k, v) in writes {
+                                wb.put(&k, &v);
+                            }
+                        });
                     }
                 }
                 Err(_) => continue,
             }
         }
 
-        //eprintln!("[AMMDATA] finished indexing block #{} (ts={})", block.height, block_ts);
         self.set_index_height(block.height)?;
         Ok(())
     }
+
     fn get_index_height(&self) -> Option<u32> {
         *self.index_height.read().unwrap()
     }

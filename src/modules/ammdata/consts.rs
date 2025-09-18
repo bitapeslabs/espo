@@ -20,3 +20,4 @@ pub fn get_amm_contract(network: Network) -> Result<SchemaAlkaneId> {
 pub const KEY_INDEX_HEIGHT: &[u8] = b"/index_height";
 pub const GET_RESERVES_OPCODE: u8 = 0x61;
 pub const DEPLOY_AMM_OPCODE: u8 = 0x01;
+pub const PRICE_SCALE: u128 = 100_000_000; // 1e18
