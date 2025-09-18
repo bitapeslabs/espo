@@ -19,7 +19,7 @@ pub fn get_alkanes_tip_height() -> Result<u32> {
         .map_err(|_| anyhow!("ESPO ERROR: Expected 4 bytes, got {}", bytes.len()))?;
 
     // Use the endianness you stored with
-    Ok(u32::from_le_bytes(arr))
+    Ok(u32::from_le_bytes(arr) - 1u32)
     // Or: Ok(u32::from_be_bytes(arr))
 }
 

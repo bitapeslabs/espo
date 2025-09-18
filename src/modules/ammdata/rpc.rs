@@ -67,116 +67,114 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
     let reg_candles = reg.clone();
     tokio::spawn(async move {
         reg_candles
-            .register("get_candles", move |_cx, payload| {
-                let mdb = mdb_candles.clone();
-                async move {
-                    let tf = payload
-                        .get("timeframe")
-                        .and_then(|v| v.as_str())
-                        .and_then(parse_timeframe)
-                        .unwrap_or(Timeframe::H1);
+        .register("get_candles", move |_cx, payload| {
+            let mdb = mdb_candles.clone();
+            async move {
+                let tf = payload
+                    .get("timeframe")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_timeframe)
+                    .unwrap_or(Timeframe::H1);
 
-                    // Paging (page/limit). Legacy "size" maps to limit when page not provided.
-                    let legacy_size = payload.get("size").and_then(|v| v.as_u64()).map(|n| n as usize);
-                    let limit = payload
-                        .get("limit").and_then(|v| v.as_u64()).map(|n| n as usize)
-                        .or(legacy_size)
-                        .unwrap_or(120);
-                    let page  = payload
-                        .get("page").and_then(|v| v.as_u64()).map(|n| n as usize)
-                        .unwrap_or(1);
+                let legacy_size = payload.get("size").and_then(|v| v.as_u64()).map(|n| n as usize);
+                let limit = payload
+                    .get("limit").and_then(|v| v.as_u64()).map(|n| n as usize)
+                    .or(legacy_size)
+                    .unwrap_or(120);
+                let page  = payload
+                    .get("page").and_then(|v| v.as_u64()).map(|n| n as usize)
+                    .unwrap_or(1);
 
-                    let side = payload
-                        .get("side")
-                        .and_then(|v| v.as_str())
-                        .and_then(parse_side)
-                        .unwrap_or(PriceSide::Base);
+                let side = payload
+                    .get("side")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_side)
+                    .unwrap_or(PriceSide::Base);
 
-                    // still read "now" but not used for anchoring anymore; harmless
-                    let now = payload.get("now").and_then(|v| v.as_u64()).unwrap_or_else(now_ts);
+                let now = payload.get("now").and_then(|v| v.as_u64()).unwrap_or_else(now_ts);
 
-                    // Pool (string, e.g. "2:68441")
-                    let pool = match payload.get("pool").and_then(|v| v.as_str()).and_then(parse_pool_from_str) {
-                        Some(p) => p,
-                        None => {
-                            return json!({
-                                "ok": false,
-                                "error": "missing_or_invalid_pool",
-                                "hint": "pool should be a string like \"2:68441\""
-                            });
-                        }
-                    };
+                let pool = match payload.get("pool").and_then(|v| v.as_str()).and_then(parse_pool_from_str) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[RPC:get_candles] invalid pool, payload={payload:?}");
+                        return json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_pool",
+                            "hint": "pool should be a string like \"2:68441\""
+                        });
+                    }
+                };
 
-                    // Read *all present* candles newest→oldest anchored to latest present bucket
-                    let slice = read_candles_v1(&mdb, pool, tf, /*unused*/limit, now, side);
-                    match slice {
-                        Ok(slice) => {
-                            let total = slice.candles_newest_first.len();
-                            if total == 0 {
-                                return json!({
-                                    "ok": true,
-                                    "pool": format!("{}:{}", pool.block, pool.tx),
-                                    "timeframe": tf.code(),
-                                    "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
-                                    "page": page,
-                                    "limit": limit,
-                                    "total": 0,
-                                    "has_more": false,
-                                    "candles": []
-                                });
-                            }
+                let slice = read_candles_v1(&mdb, pool, tf, /*unused*/limit, now, side);
+                match slice {
+                    Ok(slice) => {
+                        let total = slice.candles_newest_first.len();
 
-                            let dur = tf.duration_secs();
-                            let newest_ts = slice.newest_ts;
+                        // ✅ one log line per request
+                        eprintln!(
+                            "[RPC:get_candles] pool={}:{} tf={} side={:?} page={} limit={} total={}",
+                            pool.block, pool.tx, tf.code(), side, page, limit, total
+                        );
 
-                            // paging
-                            let offset = limit.saturating_mul(page.saturating_sub(1));
-                            let end = (offset + limit).min(total);
-                            let page_slice = if offset >= total {
-                                &[][..]
-                            } else {
-                                &slice.candles_newest_first[offset..end]
-                            };
+                        // … response construction unchanged …
+                        let dur = tf.duration_secs();
+                        let newest_ts = slice.newest_ts;
 
-                            let arr: Vec<Value> = page_slice.iter().enumerate().map(|(i, c)| {
-                                let global_idx = offset + i; // index within newest→oldest stream
-                                let ts = newest_ts.saturating_sub((global_idx as u64) * dur);
-                                json!({
-                                    "ts":     ts,
-                                    "open":   scale(c.open),
-                                    "high":   scale(c.high),
-                                    "low":    scale(c.low),
-                                    "close":  scale(c.close),
-                                    "volume": scale(c.volume),
-                                })
-                            }).collect();
+                        let offset = limit.saturating_mul(page.saturating_sub(1));
+                        let end = (offset + limit).min(total);
+                        let page_slice = if offset >= total {
+                            &[][..]
+                        } else {
+                            &slice.candles_newest_first[offset..end]
+                        };
 
+                        let arr: Vec<Value> = page_slice.iter().enumerate().map(|(i, c)| {
+                            let global_idx = offset + i;
+                            let ts = newest_ts.saturating_sub((global_idx as u64) * dur);
                             json!({
-                                "ok": true,
-                                "pool": format!("{}:{}", pool.block, pool.tx),
-                                "timeframe": tf.code(),
-                                "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
-                                "page": page,
-                                "limit": limit,
-                                "total": total,
-                                "has_more": end < total,
-                                "candles": arr
+                                "ts":     ts,
+                                "open":   scale(c.open),
+                                "high":   scale(c.high),
+                                "low":    scale(c.low),
+                                "close":  scale(c.close),
+                                "volume": scale(c.volume),
                             })
-                        }
-                        Err(e) => json!({ "ok": false, "error": format!("read_failed: {e}") }),
+                        }).collect();
+
+                        json!({
+                            "ok": true,
+                            "pool": format!("{}:{}", pool.block, pool.tx),
+                            "timeframe": tf.code(),
+                            "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
+                            "page": page,
+                            "limit": limit,
+                            "total": total,
+                            "has_more": end < total,
+                            "candles": arr
+                        })
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[RPC:get_candles] pool={}:{} tf={} side={:?} ERROR={}",
+                            pool.block, pool.tx, tf.code(), side, e
+                        );
+                        json!({ "ok": false, "error": format!("read_failed: {e}") })
                     }
                 }
-            })
-            .await;
+            }
+        })
+        .await;
     });
 
     // PING
     let reg_ping = reg.clone();
     tokio::spawn(async move {
         reg_ping
-            .register("ping", |_cx, _payload| async move { Value::String("pong".to_string()) })
+            .register("ping", |_cx, _payload| async move {
+                // ✅ one log line per request
+                eprintln!("[RPC:ping] pong");
+                Value::String("pong".to_string())
+            })
             .await;
     });
-
-    eprintln!("[RPC_AMMDATA] RPC handlers ready.");
 }

@@ -175,35 +175,28 @@ pub struct CandleSlice {
     pub candles_newest_first: Vec<SchemaCandleV1>,
     pub newest_ts: u64, // bucket start of the newest candle that actually exists
 }
-
 pub fn read_candles_v1(
     mdb: &Mdb,
     pool: SchemaAlkaneId,
     tf: Timeframe,
-    _limit_unused: usize, // kept to avoid churn in callers if needed
-    _now_ts: u64,         // no longer anchor to now; we anchor to newest present
+    _limit_unused: usize,
+    now_ts: u64,
     side: PriceSide,
 ) -> Result<CandleSlice> {
     let dur = tf.duration_secs();
 
-    // Build FULL prefix for iter_prefix_rev
     let logical = candle_ns_prefix(&pool, tf);
     let mut full_prefix = Vec::with_capacity(mdb.prefix().len() + logical.len());
     full_prefix.extend_from_slice(mdb.prefix());
     full_prefix.extend_from_slice(&logical);
 
-    // Scan newest→oldest and collect *per-bucket* full candles (already OHLC’d when written)
-    // NOTE: With the new schema you said you're storing per-bucket OHLC directly as:
-    //   SchemaFullCandleV1 { base_candle: SchemaCandleV1, quote_candle: SchemaCandleV1 }
     let mut per_bucket: BTreeMap<u64, SchemaFullCandleV1> = BTreeMap::new();
     for res in mdb.iter_prefix_rev(&full_prefix) {
         let (k, v) = res?;
-        // key ends with "...:<ts>"
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
             if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
                 if let Ok(ts) = ts_str.parse::<u64>() {
                     let fc = decode_full_candle_v1(&v)?;
-                    // Keep only the *latest* write per bucket (iter is newest→oldest)
                     if !per_bucket.contains_key(&ts) {
                         per_bucket.insert(ts, fc);
                     }
@@ -216,27 +209,23 @@ pub fn read_candles_v1(
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
     }
 
-    let start_bucket = *per_bucket.keys().next().unwrap(); // oldest present
-    let newest_bucket_with_data = *per_bucket.keys().last().unwrap(); // newest present
+    let start_bucket = *per_bucket.keys().next().unwrap();
+    let newest_bucket_with_data = *per_bucket.keys().last().unwrap();
+    let newest_bucket_now = (now_ts / dur) * dur;
 
-    // Walk from oldest present → newest present, fill *internal* gaps flat
     let mut last_close: u128 = 0;
-    let mut have_prev: bool = false; // did we see at least one bucket before?
+    let mut have_prev: bool = false;
     let mut forward: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     let mut bts = start_bucket;
 
     while bts <= newest_bucket_with_data {
         if let Some(fc) = per_bucket.get(&bts) {
-            // take the stored candle for the chosen side
             let mut c = match side {
                 PriceSide::Base => fc.base_candle,
                 PriceSide::Quote => fc.quote_candle,
             };
-
-            // **fix open**: use last known close if we have one
             if have_prev {
                 c.open = last_close;
-                // optional: expand high/low to include the (possibly different) open
                 if c.open > c.high {
                     c.high = c.open;
                 }
@@ -244,14 +233,10 @@ pub fn read_candles_v1(
                     c.low = c.open;
                 }
             }
-
-            // advance state
             last_close = c.close;
             have_prev = true;
-
             forward.insert(bts, c);
         } else {
-            // internal gap → synth flat candle at last_close (vol=0)
             let c = SchemaCandleV1 {
                 open: last_close,
                 high: last_close,
@@ -259,20 +244,34 @@ pub fn read_candles_v1(
                 close: last_close,
                 volume: 0,
             };
-            // after emitting a flat candle, we definitely have a previous close
             have_prev = true;
-
             forward.insert(bts, c);
         }
-
         bts = match bts.checked_add(dur) {
             Some(n) => n,
             None => break,
         };
     }
 
-    // Convert to newest→oldest
+    if newest_bucket_now > newest_bucket_with_data {
+        let mut t = newest_bucket_with_data.saturating_add(dur);
+        while t <= newest_bucket_now {
+            let c = SchemaCandleV1 {
+                open: last_close,
+                high: last_close,
+                low: last_close,
+                close: last_close,
+                volume: 0,
+            };
+            forward.insert(t, c);
+            t = match t.checked_add(dur) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+
     let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
-    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_with_data })
+    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }

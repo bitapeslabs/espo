@@ -84,7 +84,7 @@ impl EspoModule for AmmData {
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let block_ts = block.block_header.time as u64; // unix seconds
 
-        for transaction in block.transactions {
+        for transaction in block.transactions.clone() {
             // cache for this tx
             let mut tx_cache = crate::modules::ammdata::utils::candles::CandleCache::new();
 
@@ -200,6 +200,11 @@ impl EspoModule for AmmData {
             }
         }
 
+        println!(
+            "[AMMDATA] Finished processing block #{} with {} traces",
+            block.height,
+            block.transactions.len()
+        );
         self.set_index_height(block.height)?;
         Ok(())
     }

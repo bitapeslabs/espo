@@ -89,10 +89,10 @@ async fn main() -> Result<()> {
             let remaining = tip.saturating_sub(next_height) + 1;
             let eta_str = fmt_duration(eta.eta(remaining));
 
-            //eprintln!(
-            //  "[indexer] indexing block #{} ({} left → ETA ~ {})",
-            //  next_height, remaining, eta_str
-            // );
+            eprintln!(
+                "[indexer] indexing block #{} ({} left → ETA ~ {})",
+                next_height, remaining, eta_str
+            );
 
             eta.start_block();
 
