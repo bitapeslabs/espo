@@ -27,18 +27,28 @@ pub struct SchemaMarketDefs {
     pub quote_alkane_id: SchemaAlkaneId,
     pub pool_alkane_id: SchemaAlkaneId,
 }
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum TradeSide {
+    Sell,
+    Buy,
+}
 
 #[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
 pub struct SchemaTradeV1 {
     pub timestamp: u64,
     pub txid: [u8; 32],
     pub address: String,
-    pub base_in: u128,
-    pub base_out: u128,
-    pub quote_in: u128,
-    pub quote_out: u128,
-    pub price_after: u128,
+    pub xpubkey: [u8; 32],
+    pub base_inflow: i128,
+    pub quote_inflow: i128,
 }
+
+#[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
+pub struct SchemaFullTradeV1 {
+    pub base_trade: SchemaTradeV1,
+    pub quote_trade: SchemaTradeV1,
+}
+
 impl SchemaCandleV1 {
     pub fn from_price_and_vol(
         open: u128,

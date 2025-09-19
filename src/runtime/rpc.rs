@@ -3,7 +3,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -133,7 +133,7 @@ async fn handle_single_request(
             methods.iter().any(|m| m == method)
         };
         if !method_exists {
-            // MUST NOT reply to a notification (even if unknown), per spec.
+            // MUST NOT reply to a notification (even if unknown)
             return None;
         }
         // Fire-and-forget invoke
@@ -178,6 +178,11 @@ pub async fn run_rpc(registry: RpcRegistry, addr: SocketAddr) -> anyhow::Result<
     Ok(())
 }
 
+#[inline]
+fn json_ok(body: Vec<u8>) -> Response {
+    (StatusCode::OK, [(CONTENT_TYPE, "application/json")], body).into_response()
+}
+
 async fn handle_rpc(State(state): State<Arc<RpcState>>, body: Bytes) -> Response {
     // 1) Try to parse raw JSON (to distinguish -32700 from other errors)
     let parsed: serde_json::Result<Value> = serde_json::from_slice(&body);
@@ -187,7 +192,7 @@ async fn handle_rpc(State(state): State<Arc<RpcState>>, body: Bytes) -> Response
         Err(_) => {
             let resp = parse_error();
             let body = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
-            return (StatusCode::OK, body).into_response();
+            return json_ok(body);
         }
     };
 
@@ -198,7 +203,7 @@ async fn handle_rpc(State(state): State<Arc<RpcState>>, body: Bytes) -> Response
             if items.is_empty() {
                 let resp = invalid_request();
                 let body = serde_json::to_vec(&resp).unwrap();
-                return (StatusCode::OK, body).into_response();
+                return json_ok(body);
             }
 
             // Process each element; invalid entries produce individual -32600
@@ -223,25 +228,23 @@ async fn handle_rpc(State(state): State<Arc<RpcState>>, body: Bytes) -> Response
             }
 
             let body = serde_json::to_vec(&responses).unwrap();
-            (StatusCode::OK, body).into_response()
+            json_ok(body)
         }
-        Value::Object(obj) => {
-            match handle_single_request(&state, &obj).await {
-                Some(resp) => {
-                    let body = serde_json::to_vec(&resp).unwrap();
-                    (StatusCode::OK, body).into_response()
-                }
-                None => {
-                    // Valid notification → no content, no body
-                    StatusCode::NO_CONTENT.into_response()
-                }
+        Value::Object(obj) => match handle_single_request(&state, &obj).await {
+            Some(resp) => {
+                let body = serde_json::to_vec(&resp).unwrap();
+                json_ok(body)
             }
-        }
+            None => {
+                // Valid notification → no content, no body
+                StatusCode::NO_CONTENT.into_response()
+            }
+        },
         _ => {
             // Non-object, non-array top-level → invalid request
             let resp = invalid_request();
             let body = serde_json::to_vec(&resp).unwrap();
-            (StatusCode::OK, body).into_response()
+            json_ok(body)
         }
     }
 }
