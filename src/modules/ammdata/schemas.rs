@@ -1,5 +1,6 @@
 use crate::schemas::SchemaAlkaneId;
 use borsh::{BorshDeserialize, BorshSerialize};
+use std::collections::BTreeMap;
 
 #[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Copy)]
 pub struct SchemaCandleV1 {
@@ -90,4 +91,20 @@ impl Timeframe {
 }
 pub fn active_timeframes() -> Vec<Timeframe> {
     vec![Timeframe::M10, Timeframe::H1, Timeframe::D1, Timeframe::W1, Timeframe::M1]
+}
+/// One entry per pool: latest reserves + the token IDs,
+/// so callers never need to hit /pools to learn base/quote.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default)]
+pub struct SchemaPoolSnapshot {
+    pub base_reserve: u128,
+    pub quote_reserve: u128,
+    pub base_id: SchemaAlkaneId,
+    pub quote_id: SchemaAlkaneId,
+}
+
+/// Entire “all pools” snapshot in a single key.
+/// BTreeMap gives deterministic ordering for stable encoding.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default)]
+pub struct SchemaReservesSnapshot {
+    pub entries: BTreeMap<SchemaAlkaneId, SchemaPoolSnapshot>,
 }

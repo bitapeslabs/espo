@@ -1,12 +1,9 @@
-use anyhow::{Context, Result, anyhow};
-use bitcoin::Network;
-use borsh::BorshDeserialize;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-
-use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
+use super::schemas::{SchemaPoolSnapshot, SchemaReservesSnapshot};
+use super::utils::candles::CandleCache;
+use super::utils::trades::{TradeIndexAcc, TradeWriteAcc};
+use crate::alkanes::trace::EspoBlock;
 use crate::modules::ammdata::consts::ammdata_genesis_block;
-use crate::modules::ammdata::schemas::active_timeframes;
+use crate::modules::ammdata::schemas::{SchemaMarketDefs, active_timeframes};
 use crate::modules::ammdata::utils::candles::{price_base_per_quote, price_quote_per_base};
 use crate::modules::ammdata::utils::reserves::{
     extract_new_pools_from_espo_transaction, extract_reserves_from_espo_transaction,
@@ -15,41 +12,32 @@ use crate::modules::ammdata::utils::trades::create_trade_v1;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
+use anyhow::{Result, anyhow};
+use bitcoin::Network;
+use borsh::BorshDeserialize;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use super::rpc::register_rpc;
 
-/* ---------- helpers for /pools storage ---------- */
-
-use crate::modules::ammdata::schemas::SchemaMarketDefs;
-
-// Key format: /pools/{block:U32BE}{tx:U64BE}   (RELATIVE key)
-fn pools_key(pool: &SchemaAlkaneId) -> Vec<u8> {
-    let mut k = Vec::with_capacity(7 + 4 + 8);
-    k.extend_from_slice(b"/pools/");
-    k.extend_from_slice(&pool.block.to_be_bytes());
-    k.extend_from_slice(&pool.tx.to_be_bytes());
-    k
+// Relative RocksDB key holding the entire reserves snapshot (BORSH)
+#[inline]
+fn reserves_snapshot_key() -> &'static [u8] {
+    b"/reserves_snapshot_v1" // v1 as agreed
 }
 
-fn encode_defs(defs: &SchemaMarketDefs) -> Result<Vec<u8>> {
-    borsh::to_vec(defs).context("borsh serialize SchemaMarketDefs")
+// Encode Snapshot -> BORSH (deterministic order via BTreeMap)
+fn encode_reserves_snapshot(map: &HashMap<SchemaAlkaneId, SchemaPoolSnapshot>) -> Result<Vec<u8>> {
+    let ordered: BTreeMap<SchemaAlkaneId, SchemaPoolSnapshot> =
+        map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    let snap = SchemaReservesSnapshot { entries: ordered };
+    Ok(borsh::to_vec(&snap)?)
 }
 
-fn decode_defs(bytes: &[u8]) -> Result<SchemaMarketDefs> {
-    SchemaMarketDefs::try_from_slice(bytes).context("borsh deserialize SchemaMarketDefs")
-}
-
-fn parse_hex_u32(s: &str) -> Result<u32> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    Ok(u32::from_str_radix(s, 16)?)
-}
-fn parse_hex_u64(s: &str) -> Result<u64> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    Ok(u64::from_str_radix(s, 16)?)
-}
-
-fn schema_id_from_short_hex(block_hex: &str, tx_hex: &str) -> Result<SchemaAlkaneId> {
-    Ok(SchemaAlkaneId { block: parse_hex_u32(block_hex)?, tx: parse_hex_u64(tx_hex)? })
+// Decode BORSH -> Snapshot
+fn decode_reserves_snapshot(bytes: &[u8]) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
+    let snap = SchemaReservesSnapshot::try_from_slice(bytes)?;
+    Ok(snap.entries.into_iter().collect())
 }
 
 /* ---------- module ---------- */
@@ -98,73 +86,6 @@ impl AmmData {
         *self.index_height.write().unwrap() = Some(new_height);
         Ok(())
     }
-
-    /// Scan a block to collect **all pools** we will touch:
-    ///  - Pools created (Create events)
-    ///  - Pools that serve getReserves (delegatecall 0x61)
-    fn collect_pools_in_block(&self, block: &EspoBlock) -> HashSet<SchemaAlkaneId> {
-        let mut set: HashSet<SchemaAlkaneId> = HashSet::new();
-
-        for tx in &block.transactions {
-            let trace = tx.sandshrew_trace.clone();
-
-            // Created pools
-            for ev in &trace.events {
-                if let EspoSandshrewLikeTraceEvent::Create(c) = ev {
-                    if let Ok(pool) =
-                        schema_id_from_short_hex(&c.new_alkane.block, &c.new_alkane.tx)
-                    {
-                        set.insert(pool);
-                    }
-                }
-            }
-
-            // Pools responding to delegatecall 0x61 (used by reserve extractor anchors)
-            for ev in &trace.events {
-                if let EspoSandshrewLikeTraceEvent::Invoke(inv) = ev {
-                    let is_get_reserves = inv.typ == "delegatecall"
-                        && inv.context.inputs.len() == 1
-                        && inv.context.inputs[0].as_str() == "0x61";
-                    if is_get_reserves {
-                        if let Ok(pool) = schema_id_from_short_hex(
-                            &inv.context.myself.block,
-                            &inv.context.myself.tx,
-                        ) {
-                            set.insert(pool);
-                        }
-                    }
-                }
-            }
-        }
-
-        set
-    }
-
-    /// Single read to load all /pools/* that we’ll need for this block.
-    fn load_pools_map(
-        &self,
-        set: &HashSet<SchemaAlkaneId>,
-    ) -> Result<HashMap<SchemaAlkaneId, SchemaMarketDefs>> {
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(set.len());
-        let mut order: Vec<SchemaAlkaneId> = Vec::with_capacity(set.len());
-        for id in set.iter() {
-            keys.push(pools_key(id));
-            order.push(*id);
-        }
-
-        // Prefer multi_get if exposed by your Mdb wrapper
-        let values = self.mdb().multi_get(&keys)?; // Vec<Option<Vec<u8>>>
-
-        let mut out = HashMap::with_capacity(order.len());
-        for (i, opt) in values.into_iter().enumerate() {
-            if let Some(buf) = opt {
-                if let Ok(defs) = decode_defs(&buf) {
-                    out.insert(order[i], defs);
-                }
-            }
-        }
-        Ok(out)
-    }
 }
 
 impl Default for AmmData {
@@ -196,34 +117,58 @@ impl EspoModule for AmmData {
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let block_ts = block.block_header.time as u64; // unix seconds
 
-        /* ---------- pre-scan pools & prefetch defs in one read ---------- */
-        let pools_in_block = self.collect_pools_in_block(&block);
-        let mut pools_map: HashMap<SchemaAlkaneId, SchemaMarketDefs> =
-            self.load_pools_map(&pools_in_block)?;
+        // ---- Load existing snapshot of ALL latest pools (single DB read) ----
+        let mut reserves_snapshot: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> =
+            if let Some(bytes) = self.mdb().get(reserves_snapshot_key())? {
+                match decode_reserves_snapshot(&bytes) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("[AMMDATA] WARNING: failed to decode reserves snapshot: {e:?}");
+                        HashMap::new()
+                    }
+                }
+            } else {
+                HashMap::new()
+            };
 
-        /* ---------- accumulators for this block ---------- */
-        let mut candle_cache = crate::modules::ammdata::utils::candles::CandleCache::new();
-        let mut trade_acc = crate::modules::ammdata::utils::trades::TradeWriteAcc::new();
-        let mut index_acc = crate::modules::ammdata::utils::trades::TradeIndexAcc::new();
+        // Build an in-memory "pools_map" compatible with your extractor
+        // from the snapshot (pool -> SchemaMarketDefs), then add any newly created pools.
+        let mut pools_map: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
+        for (pool, snap) in reserves_snapshot.iter() {
+            pools_map.insert(
+                *pool,
+                SchemaMarketDefs {
+                    pool_alkane_id: *pool,
+                    base_alkane_id: snap.base_id,
+                    quote_alkane_id: snap.quote_id,
+                },
+            );
+        }
 
-        // Buffer for new /pools/* upserts (RELATIVE keys)
-        let mut new_pool_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut candle_cache = CandleCache::new();
+        let mut trade_acc = TradeWriteAcc::new();
+        let mut index_acc = TradeIndexAcc::new();
+
+        // Keep track of NEW/UPDATED entries for THIS block to merge into snapshot at end
+        let mut reserves_map_delta: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = HashMap::new();
 
         for transaction in block.transactions.clone() {
-            /* -------- NEW POOLS: detect, UPSERT, log -------- */
+            // Discover newly created pools in this tx and insert them into BOTH:
+            //  (1) the in-memory pools_map (for extractors),
+            //  (2) the snapshot (with zero reserves until first update).
             if let Ok(new_pools) = extract_new_pools_from_espo_transaction(&transaction) {
                 for (_pid, defs) in new_pools {
                     let pool = defs.pool_alkane_id;
                     let base = defs.base_alkane_id;
                     let quote = defs.quote_alkane_id;
 
-                    // Upsert to /pools/{SchemaAlkaneId} (borsh)
-                    let k_rel = pools_key(&pool);
-                    let v = encode_defs(&defs)?;
-                    new_pool_writes.push((k_rel, v));
-
-                    // Update in-memory map so later txs in this same block can use it
                     pools_map.insert(pool, defs);
+                    reserves_snapshot.entry(pool).or_insert(SchemaPoolSnapshot {
+                        base_reserve: 0,
+                        quote_reserve: 0,
+                        base_id: base,
+                        quote_id: quote,
+                    });
 
                     println!(
                         "[AMMDATA] New pool created @ block #{blk}, ts={ts}\n\
@@ -242,7 +187,7 @@ impl EspoModule for AmmData {
                 }
             }
 
-            /* -------- TRADES / RESERVE UPDATES -------- */
+            // reserves updates (using pools_map built from snapshot + new pools)
             match extract_reserves_from_espo_transaction(&transaction, &pools_map) {
                 Ok(reserve_data_vec) => {
                     if reserve_data_vec.is_empty() {
@@ -250,28 +195,38 @@ impl EspoModule for AmmData {
                     }
 
                     for rd in reserve_data_vec {
-                        // Pool id (hex -> decimal) just for logging + keys
                         let pool_block_dec =
                             u32::from_str_radix(rd.pool.block.trim_start_matches("0x"), 16)
                                 .unwrap_or_default();
                         let pool_tx_dec =
                             u64::from_str_radix(rd.pool.tx.trim_start_matches("0x"), 16)
                                 .unwrap_or_default();
+
                         let pool_schema = SchemaAlkaneId { block: pool_block_dec, tx: pool_tx_dec };
+
+                        // Lookup base/quote IDs from pools_map (must exist by now)
+                        if let Some(defs) = pools_map.get(&pool_schema) {
+                            reserves_map_delta.insert(
+                                pool_schema,
+                                SchemaPoolSnapshot {
+                                    base_reserve: rd.new_reserves.0,
+                                    quote_reserve: rd.new_reserves.1,
+                                    base_id: defs.base_alkane_id,
+                                    quote_id: defs.quote_alkane_id,
+                                },
+                            );
+                        }
+
                         let pool_id_dec = format!("{}:{}", pool_block_dec, pool_tx_dec);
 
-                        // Reserves (base, quote) oriented by extractor
                         let (prev_base, prev_quote) = rd.prev_reserves;
                         let (new_base, new_quote) = rd.new_reserves;
 
-                        // Prices derived from NEW reserves
                         let p_q_per_b = price_quote_per_base(new_base, new_quote); // quote/base
                         let p_b_per_q = price_base_per_quote(new_base, new_quote); // base/quote
 
-                        // Volumes from extractor (base_in, quote_out)
                         let (vol_base_in, vol_quote_out) = rd.volume;
 
-                        // ----- accumulate CANDLES into the block-level cache -----
                         candle_cache.apply_trade_for_frames(
                             block_ts,
                             pool_schema,
@@ -282,20 +237,16 @@ impl EspoModule for AmmData {
                             vol_quote_out,
                         );
 
-                        // ----- build & queue TRADE into the block-level trade accumulator -----
                         if let Some(full_trade) =
                             create_trade_v1(block_ts, &block.prevouts, &transaction, &rd)
                         {
-                            // per (pool, ts) sequencing handled inside TradeWriteAcc
                             if let Ok(seq) =
                                 trade_acc.push(pool_schema, block_ts, full_trade.clone())
                             {
-                                // queue secondary index entries using same (pool, ts, seq)
                                 index_acc.add(&pool_schema, block_ts, seq, &full_trade);
                             }
                         }
 
-                        // ----- OPTIONAL LOGGING -----
                         let d_base = (new_base as i128) - (prev_base as i128);
                         let d_quote = (new_quote as i128) - (prev_quote as i128);
                         let k_ratio_str = rd
@@ -345,14 +296,14 @@ impl EspoModule for AmmData {
             }
         }
 
-        /* ---------- one atomic DB write (candles + trades + indexes + new pools) ---------- */
+        /* ---------- one atomic DB write (candles + trades + indexes + reserves snapshot) ---------- */
         let candle_writes = candle_cache.into_writes(self.mdb())?; // likely FULL keys
         let trade_writes = trade_acc.into_writes(); // RELATIVE keys
         let idx_delta = index_acc.clone().per_pool_delta(); // counts per pool
         let mut index_writes = index_acc.into_writes(); // RELATIVE keys
 
         // Update per-pool index counts (RELATIVE)
-        let mut count_updates = 0usize;
+        //let mut count_updates = 0usize;
         for ((blk_id, tx_id), delta) in idx_delta {
             let pool = SchemaAlkaneId { block: blk_id, tx: tx_id };
             let count_k_rel = crate::modules::ammdata::utils::trades::idx_count_key(&pool);
@@ -368,30 +319,34 @@ impl EspoModule for AmmData {
                 count_k_rel,
                 crate::modules::ammdata::utils::trades::encode_u64_be(newv).to_vec(),
             ));
-            count_updates += 1;
+            //count_updates += 1;
         }
 
-        // Stats + sample key preview before writing
+        // Merge this block’s deltas into the loaded snapshot and serialize it
+        for (pool, latest) in reserves_map_delta.into_iter() {
+            reserves_snapshot.insert(pool, latest);
+        }
+        let reserves_blob = encode_reserves_snapshot(&reserves_snapshot)?;
+        let reserves_key_rel = reserves_snapshot_key();
+
+        // Stats
         let c_cnt = candle_writes.len();
         let t_cnt = trade_writes.len();
         let i_cnt = index_writes.len();
-        let p_cnt = new_pool_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, trades={t_cnt}, indexes+counts={i_cnt}, new_pools={p_cnt} (count-updates={cu})",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, trades={t_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
             t_cnt = t_cnt,
             i_cnt = i_cnt,
-            p_cnt = p_cnt,
-            cu = count_updates
         );
 
         // Persist atomically; ALWAYS pass RELATIVE keys to wb.put (MdbBatch will prefix once).
         if !candle_writes.is_empty()
             || !trade_writes.is_empty()
             || !index_writes.is_empty()
-            || !new_pool_writes.is_empty()
+            || !reserves_blob.is_empty()
         {
             let db_prefix = self.mdb().prefix().to_vec(); // used just to strip if candles came FULL
             let _ = self.mdb().bulk_write(|wb| {
@@ -412,10 +367,8 @@ impl EspoModule for AmmData {
                 for (k_rel, v) in index_writes.iter() {
                     wb.put(k_rel, v);
                 }
-                // new pools: RELATIVE
-                for (k_rel, v) in new_pool_writes.iter() {
-                    wb.put(k_rel, v);
-                }
+                // reserves snapshot: RELATIVE (single key)
+                wb.put(reserves_key_rel, &reserves_blob);
             });
         }
 

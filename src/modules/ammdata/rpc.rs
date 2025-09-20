@@ -1,8 +1,11 @@
 use crate::schemas::SchemaAlkaneId;
+use borsh::BorshDeserialize;
+use serde_json::map::Map;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::schemas::Timeframe;
+use super::schemas::{SchemaPoolSnapshot, SchemaReservesSnapshot, Timeframe};
 use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::utils::candles::{PriceSide, read_candles_v1};
 use crate::modules::ammdata::utils::trades::{
@@ -12,12 +15,19 @@ use crate::modules::ammdata::utils::trades::{
 use crate::modules::defs::RpcNsRegistrar;
 use crate::runtime::mdb::Mdb;
 
+// === NEW: pathfinder ===
+use crate::modules::ammdata::utils::pathfinder::{
+    DEFAULT_FEE_BPS, plan_exact_in_default_fee, plan_exact_out_default_fee,
+    plan_implicit_default_fee, plan_swap_exact_tokens_for_tokens,
+    plan_swap_exact_tokens_for_tokens_implicit, plan_swap_tokens_for_exact_tokens,
+};
+
 fn now_ts() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-/// Parse pool id string like "2:68441" (decimal) or "0x2:0x10b59" (hex).
-fn parse_pool_from_str(s: &str) -> Option<SchemaAlkaneId> {
+/// Parse pool/token id string like "2:68441" (decimal) or "0x2:0x10b59" (hex).
+fn parse_id_from_str(s: &str) -> Option<SchemaAlkaneId> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 {
         return None;
@@ -125,6 +135,22 @@ fn map_sort(side: PriceSide, token: Option<&str>) -> (TradeSortKey, &'static str
     (TradeSortKey::Timestamp, "ts")
 }
 
+/* ---------- tiny helpers for this file ---------- */
+
+fn parse_u128_arg(v: Option<&Value>) -> Option<u128> {
+    match v {
+        Some(Value::String(s)) => s.parse::<u128>().ok(),
+        Some(Value::Number(n)) => n.as_u64().map(|x| x as u128), // accept small numeric for convenience
+        _ => None,
+    }
+}
+
+fn id_str(id: &SchemaAlkaneId) -> String {
+    format!("{}:{}", id.block, id.tx)
+}
+
+/* ================================================================================ */
+
 #[allow(dead_code)]
 pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
     eprintln!("[RPC_AMMDATA] registering RPC handlers…");
@@ -142,7 +168,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         .and_then(parse_timeframe)
                         .unwrap_or(Timeframe::H1);
 
-                    // support legacy "size" as alias of limit
+                    // legacy "size" alias
                     let legacy_size = payload.get("size").and_then(|v| v.as_u64()).map(|n| n as usize);
                     let limit = payload.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize)
                         .or(legacy_size).unwrap_or(120);
@@ -153,7 +179,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
 
                     let now = payload.get("now").and_then(|v| v.as_u64()).unwrap_or_else(now_ts);
 
-                    let pool = match payload.get("pool").and_then(|v| v.as_str()).and_then(parse_pool_from_str) {
+                    let pool = match payload.get("pool").and_then(|v| v.as_str()).and_then(parse_id_from_str) {
                         Some(p) => p,
                         None => {
                             eprintln!("[RPC:get_candles] invalid pool, payload={payload:?}");
@@ -170,21 +196,12 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         Ok(slice) => {
                             let total = slice.candles_newest_first.len();
 
-                            eprintln!(
-                                "[RPC:get_candles] pool={}:{} tf={} side={:?} page={} limit={} total={}",
-                                pool.block, pool.tx, tf.code(), side, page, limit, total
-                            );
-
                             let dur = tf.duration_secs();
                             let newest_ts = slice.newest_ts;
 
                             let offset = limit.saturating_mul(page.saturating_sub(1));
                             let end = (offset + limit).min(total);
-                            let page_slice = if offset >= total {
-                                &[][..]
-                            } else {
-                                &slice.candles_newest_first[offset..end]
-                            };
+                            let page_slice = if offset >= total { &[][..] } else { &slice.candles_newest_first[offset..end] };
 
                             let arr: Vec<Value> = page_slice.iter().enumerate().map(|(i, c)| {
                                 let global_idx = offset + i;
@@ -201,7 +218,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
 
                             json!({
                                 "ok": true,
-                                "pool": format!("{}:{}", pool.block, pool.tx),
+                                "pool": id_str(&pool),
                                 "timeframe": tf.code(),
                                 "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
                                 "page": page,
@@ -211,13 +228,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                                 "candles": arr
                             })
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "[RPC:get_candles] pool={}:{} tf={} side={:?} ERROR={}",
-                                pool.block, pool.tx, tf.code(), side, e
-                            );
-                            json!({ "ok": false, "error": format!("read_failed: {e}") })
-                        }
+                        Err(e) => json!({ "ok": false, "error": format!("read_failed: {e}") }),
                     }
                 }
             })
@@ -225,12 +236,6 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
     });
 
     /* -------------------- get_trades -------------------- */
-    // Params:
-    //   side:         "base" | "quote"                        (default "base")
-    //   filter_side:  "buy" | "sell" | "all"                  (default "all")
-    //   sort:         "ts" | "amount" | "side" | "absb"|"absq" (single token; default "ts")
-    //   dir:          "asc" | "desc"                          (default "desc")
-    //   page, limit
     let mdb_trades = mdb.clone();
     let reg_trades = reg.clone();
     tokio::spawn(async move {
@@ -251,7 +256,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                     let dir = parse_sort_dir(payload.get("dir").or_else(|| payload.get("direction")));
                     let (sort_key, sort_code) = map_sort(side, sort_token.as_deref());
 
-                    let pool = match payload.get("pool").and_then(|v| v.as_str()).and_then(parse_pool_from_str) {
+                    let pool = match payload.get("pool").and_then(|v| v.as_str()).and_then(parse_id_from_str) {
                         Some(p) => p,
                         None => {
                             eprintln!("[RPC:get_trades] invalid pool, payload={payload:?}");
@@ -263,13 +268,12 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         }
                     };
 
-                    // Use sorted path if sort provided OR a side filter other than "all" is provided.
                     if sort_token.is_some() || !matches!(filter_side, TradeSideFilter::All) {
                         match read_trades_for_pool_sorted(&mdb, pool, page, limit, side, sort_key, dir, filter_side) {
                             Ok(TradePage { trades, total }) => {
                                 json!({
                                     "ok": true,
-                                    "pool": format!("{}:{}", pool.block, pool.tx),
+                                    "pool": id_str(&pool),
                                     "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
                                     "filter_side": match filter_side { TradeSideFilter::All => "all", TradeSideFilter::Buy => "buy", TradeSideFilter::Sell => "sell" },
                                     "sort": sort_code,
@@ -281,18 +285,14 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                                     "trades": trades
                                 })
                             }
-                            Err(e) => {
-                                eprintln!("[RPC:get_trades] pool={}:{} SORTED ERROR={}", pool.block, pool.tx, e);
-                                json!({ "ok": false, "error": format!("read_failed: {e}") })
-                            }
+                            Err(e) => json!({ "ok": false, "error": format!("read_failed: {e}") }),
                         }
                     } else {
-                        // Default legacy behavior: timestamp desc (latest first), no filter
                         match read_trades_for_pool(&mdb, pool, page, limit, side) {
                             Ok(TradePage { trades, total }) => {
                                 json!({
                                     "ok": true,
-                                    "pool": format!("{}:{}", pool.block, pool.tx),
+                                    "pool": id_str(&pool),
                                     "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
                                     "filter_side": "all",
                                     "sort": "ts",
@@ -304,11 +304,230 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                                     "trades": trades
                                 })
                             }
+                            Err(e) => json!({ "ok": false, "error": format!("read_failed: {e}") }),
+                        }
+                    }
+                }
+            })
+            .await;
+    });
+
+    /* -------------------- get_pools (MAP format) -------------------- */
+    let mdb_pools = mdb.clone();
+    let reg_pools = reg.clone();
+    tokio::spawn(async move {
+        reg_pools
+            .register("get_pools", move |_cx, payload| {
+                let mdb = mdb_pools.clone();
+                async move {
+                    const SNAP_KEY: &[u8] = b"/reserves_snapshot_v1";
+
+                    // read snapshot (BTreeMap)
+                    let snapshot_btree = match mdb.get(SNAP_KEY) {
+                        Ok(Some(bytes)) => match SchemaReservesSnapshot::try_from_slice(&bytes) {
+                            Ok(snap) => snap.entries,
                             Err(e) => {
-                                eprintln!("[RPC:get_trades] pool={}:{} ERROR={}", pool.block, pool.tx, e);
-                                json!({ "ok": false, "error": format!("read_failed: {e}") })
+                                eprintln!("[RPC:get_pools] decode snapshot failed: {e:?}");
+                                Default::default()
+                            }
+                        },
+                        Ok(None) => Default::default(),
+                        Err(e) => {
+                            eprintln!("[RPC:get_pools] read snapshot failed: {e:?}");
+                            Default::default()
+                        }
+                    };
+
+                    // page
+                    let rows: Vec<(&SchemaAlkaneId, &SchemaPoolSnapshot)> =
+                        snapshot_btree.iter().collect();
+                    let total = rows.len();
+                    let limit = payload
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .unwrap_or(total.max(1))
+                        .clamp(1, 20_000);
+                    let page = payload
+                        .get("page")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .unwrap_or(1)
+                        .max(1);
+                    let offset = limit.saturating_mul(page.saturating_sub(1));
+                    let end = (offset + limit).min(total);
+                    let window = if offset >= total { &[][..] } else { &rows[offset..end] };
+                    let has_more = end < total;
+
+                    let mut pools_obj: Map<String, Value> = Map::with_capacity(window.len());
+                    for (pool, snap) in window.iter().copied() {
+                        let pool_id = id_str(pool);
+                        let base_id = id_str(&snap.base_id);
+                        let quote_id = id_str(&snap.quote_id);
+                        pools_obj.insert(
+                            pool_id,
+                            json!({
+                                "base": base_id,
+                                "quote": quote_id,
+                                "base_reserve":  snap.base_reserve.to_string(),
+                                "quote_reserve": snap.quote_reserve.to_string(),
+                            }),
+                        );
+                    }
+
+                    json!({
+                        "ok": true,
+                        "page": page,
+                        "limit": limit,
+                        "total": total,
+                        "has_more": has_more,
+                        "pools": Value::Object(pools_obj)
+                    })
+                }
+            })
+            .await;
+    });
+
+    /* -------------------- find_best_swap_path (NEW) -------------------- */
+    // Params:
+    // {
+    //   "mode": "exact_in" | "exact_out" | "implicit",
+    //   "token_in": "b:tx",
+    //   "token_out": "b:tx",
+    //   "amount_in": "<u128-dec>",          // for exact_in
+    //   "amount_out_min": "<u128-dec>",     // for exact_in | implicit
+    //   "amount_out": "<u128-dec>",         // for exact_out
+    //   "amount_in_max": "<u128-dec>",      // for exact_out
+    //   "fee_bps": 50,                      // optional (default 50 = 0.5%)
+    //   "max_hops": 3                       // optional (default 3)
+    // }
+    // Returns: best path with hops and totals (amounts as decimal strings)
+    let mdb_path = mdb.clone();
+    let reg_path = reg.clone();
+    tokio::spawn(async move {
+        reg_path
+            .register("find_best_swap_path", move |_cx, payload| {
+                let mdb = mdb_path.clone();
+                async move {
+                    const SNAP_KEY: &[u8] = b"/reserves_snapshot_v1";
+
+                    // Load snapshot into a HashMap (for the pathfinder)
+                    let snapshot_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = match mdb.get(SNAP_KEY) {
+                        Ok(Some(bytes)) => match SchemaReservesSnapshot::try_from_slice(&bytes) {
+                            Ok(snap) => snap.entries.into_iter().collect(),
+                            Err(e) => {
+                                eprintln!("[RPC:find_best_swap_path] decode snapshot failed: {e:?}");
+                                HashMap::new()
+                            }
+                        },
+                        Ok(None) => HashMap::new(),
+                        Err(e) => {
+                            eprintln!("[RPC:find_best_swap_path] read snapshot failed: {e:?}");
+                            HashMap::new()
+                        }
+                    };
+
+                    if snapshot_map.is_empty() {
+                        return json!({
+                            "ok": false,
+                            "error": "no_liquidity",
+                            "hint": "reserves snapshot is empty"
+                        });
+                    }
+
+                    // Parse core params
+                    let mode = payload.get("mode").and_then(|v| v.as_str()).unwrap_or("exact_in").to_ascii_lowercase();
+                    let token_in = match payload.get("token_in").and_then(|v| v.as_str()).and_then(parse_id_from_str) {
+                        Some(t) => t,
+                        None => return json!({"ok": false, "error": "missing_or_invalid_token_in"}),
+                    };
+                    let token_out = match payload.get("token_out").and_then(|v| v.as_str()).and_then(parse_id_from_str) {
+                        Some(t) => t,
+                        None => return json!({"ok": false, "error": "missing_or_invalid_token_out"}),
+                    };
+                    if token_in == token_out {
+                        return json!({"ok": false, "error": "identical_tokens"});
+                    }
+
+                    let fee_bps = payload.get("fee_bps").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(DEFAULT_FEE_BPS);
+                    let max_hops = payload.get("max_hops").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(3).max(1).min(6);
+
+                    // Run planner by mode
+                    let plan = match mode.as_str() {
+                        // amount_in (req), amount_out_min (optional → default 0)
+                        "exact_in" => {
+                            let amount_in  = match parse_u128_arg(payload.get("amount_in")) {
+                                Some(v) => v,
+                                None => return json!({"ok": false, "error": "missing_or_invalid_amount_in"}),
+                            };
+                            let min_out = parse_u128_arg(payload.get("amount_out_min")).unwrap_or(0u128);
+
+                            if let Some(bps) = payload.get("fee_bps").and_then(|v| v.as_u64()) {
+                                plan_swap_exact_tokens_for_tokens(&snapshot_map, token_in, token_out, amount_in, min_out, bps as u32, max_hops)
+                            } else {
+                                plan_exact_in_default_fee(&snapshot_map, token_in, token_out, amount_in, min_out, max_hops)
                             }
                         }
+
+                        // amount_out (req), amount_in_max (optional → u128::MAX)
+                        "exact_out" => {
+                            let amount_out = match parse_u128_arg(payload.get("amount_out")) {
+                                Some(v) => v,
+                                None => return json!({"ok": false, "error": "missing_or_invalid_amount_out"}),
+                            };
+                            let in_max = parse_u128_arg(payload.get("amount_in_max")).unwrap_or(u128::MAX);
+
+                            if let Some(bps) = payload.get("fee_bps").and_then(|v| v.as_u64()) {
+                                plan_swap_tokens_for_exact_tokens(&snapshot_map, token_in, token_out, amount_out, in_max, bps as u32, max_hops)
+                            } else {
+                                plan_exact_out_default_fee(&snapshot_map, token_in, token_out, amount_out, in_max, max_hops)
+                            }
+                        }
+
+                        // available_in (req), amount_out_min (optional → 0)
+                        "implicit" => {
+                            let available_in = match parse_u128_arg(payload.get("amount_in").or_else(|| payload.get("available_in"))) {
+                                Some(v) => v,
+                                None => return json!({"ok": false, "error": "missing_or_invalid_amount_in"}),
+                            };
+                            let min_out = parse_u128_arg(payload.get("amount_out_min")).unwrap_or(0u128);
+
+                            if let Some(bps) = payload.get("fee_bps").and_then(|v| v.as_u64()) {
+                                plan_swap_exact_tokens_for_tokens_implicit(&snapshot_map, token_in, token_out, available_in, min_out, bps as u32, max_hops)
+                            } else {
+                                plan_implicit_default_fee(&snapshot_map, token_in, token_out, available_in, min_out, max_hops)
+                            }
+                        }
+
+                        _ => return json!({"ok": false, "error": "invalid_mode", "hint": "use exact_in | exact_out | implicit"}),
+                    };
+
+                    match plan {
+                        Some(pq) => {
+                            // Hops array
+                            let hops: Vec<Value> = pq.hops.iter().map(|h| {
+                                json!({
+                                    "pool":       id_str(&h.pool),
+                                    "token_in":   id_str(&h.token_in),
+                                    "token_out":  id_str(&h.token_out),
+                                    "amount_in":  h.amount_in.to_string(),
+                                    "amount_out": h.amount_out.to_string(),
+                                })
+                            }).collect();
+
+                            json!({
+                                "ok": true,
+                                "mode": mode,
+                                "token_in":  id_str(&token_in),
+                                "token_out": id_str(&token_out),
+                                "fee_bps": fee_bps,
+                                "max_hops": max_hops,
+                                "amount_in":  pq.amount_in.to_string(),
+                                "amount_out": pq.amount_out.to_string(),
+                                "hops": hops
+                            })
+                        }
+                        None => json!({"ok": false, "error": "no_path_found"}),
                     }
                 }
             })

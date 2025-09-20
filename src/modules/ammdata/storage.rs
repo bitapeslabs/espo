@@ -52,3 +52,11 @@ pub fn candle_key(pool: &SchemaAlkaneId, tf: Timeframe, bucket_ts: u64) -> Vec<u
     k.extend_from_slice(bucket_ts.to_string().as_bytes());
     k
 }
+
+pub fn pools_key(pool: &SchemaAlkaneId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(7 + 4 + 8);
+    k.extend_from_slice(b"/pools/");
+    k.extend_from_slice(&pool.block.to_be_bytes());
+    k.extend_from_slice(&pool.tx.to_be_bytes());
+    k
+}

@@ -4,7 +4,17 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use protobuf::SpecialFields;
 
 #[derive(
-    BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Copy, Eq, PartialOrd, Ord, Hash,
+    BorshSerialize,
+    BorshDeserialize,
+    PartialEq,
+    Debug,
+    Clone,
+    Copy,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
 )]
 pub struct SchemaAlkaneId {
     pub block: u32,
