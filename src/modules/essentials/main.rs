@@ -6,6 +6,7 @@ use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
+use bitcoin::hashes::Hash;
 use std::sync::Arc;
 
 pub struct Essentials {
@@ -60,17 +61,8 @@ impl Essentials {
         b"/index_height"
     }
 
-    // 0x03 | block_be(4) | tx_be(8)
-    #[inline]
-    pub(crate) fn k_dir(alk: &SchemaAlkaneId) -> [u8; 1 + 4 + 8] {
-        let mut k = [0u8; 1 + 4 + 8];
-        k[0] = 0x03;
-        k[1..5].copy_from_slice(&alk.block.to_be_bytes());
-        k[5..13].copy_from_slice(&alk.tx.to_be_bytes());
-        k
-    }
-
-    // 0x01 | block_be(4) | tx_be(8) | key_len_be(2) | key_bytes
+    /// Value row:
+    ///   0x01 | block_be(4) | tx_be(8) | key_len_be(2) | key_bytes  ->  value_bytes
     #[inline]
     pub(crate) fn k_kv(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
         let mut v = Vec::with_capacity(1 + 4 + 8 + 2 + skey.len());
@@ -87,52 +79,22 @@ impl Essentials {
         v
     }
 
-    pub(crate) fn enc_dir(keys: &Vec<Vec<u8>>) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + keys.iter().map(|k| 4 + k.len()).sum::<usize>());
-        out.extend_from_slice(&(keys.len() as u32).to_be_bytes());
-        for k in keys {
-            out.extend_from_slice(&(k.len() as u32).to_be_bytes());
-            out.extend_from_slice(k);
+    /// Directory marker row (idempotent; duplicates ok):
+    ///   0x03 | block_be(4) | tx_be(8) | key_len_be(2) | key_bytes  ->  []
+    #[inline]
+    pub(crate) fn k_dir_entry(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(1 + 4 + 8 + 2 + skey.len());
+        v.push(0x03);
+        v.extend_from_slice(&alk.block.to_be_bytes());
+        v.extend_from_slice(&alk.tx.to_be_bytes());
+        let len = u16::try_from(skey.len()).unwrap_or(u16::MAX);
+        v.extend_from_slice(&len.to_be_bytes());
+        if len as usize != skey.len() {
+            v.extend_from_slice(&skey[..(len as usize)]);
+        } else {
+            v.extend_from_slice(skey);
         }
-        out
-    }
-
-    pub(crate) fn dec_dir(bytes: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
-        let mut off = 0usize;
-        let rd_u32 = |b: &[u8], off: &mut usize| -> anyhow::Result<u32> {
-            if *off + 4 > b.len() {
-                anyhow::bail!("[ESSENTIALS] dir decode: truncated u32");
-            }
-            let mut arr = [0u8; 4];
-            arr.copy_from_slice(&b[*off..*off + 4]);
-            *off += 4;
-            Ok(u32::from_be_bytes(arr))
-        };
-        let cnt = rd_u32(bytes, &mut off)? as usize;
-        let mut v = Vec::with_capacity(cnt);
-        for _ in 0..cnt {
-            let n = rd_u32(bytes, &mut off)? as usize;
-            if off + n > bytes.len() {
-                anyhow::bail!("[ESSENTIALS] dir decode: truncated key");
-            }
-            v.push(bytes[off..off + n].to_vec());
-            off += n;
-        }
-        Ok(v)
-    }
-
-    pub(crate) fn dir_merge(
-        mut existing: Vec<Vec<u8>>,
-        new_keys: impl Iterator<Item = Vec<u8>>,
-    ) -> Vec<Vec<u8>> {
-        use std::collections::HashSet;
-        let mut seen: HashSet<Vec<u8>> = existing.iter().cloned().collect();
-        for k in new_keys {
-            if seen.insert(k.clone()) {
-                existing.push(k);
-            }
-        }
-        existing
+        v
     }
 }
 
@@ -158,43 +120,46 @@ impl EspoModule for Essentials {
         }
     }
 
-    fn get_genesis_block(&self, _network: Network) -> u32 {
-        essentials_genesis_block(_network)
+    fn get_genesis_block(&self, network: Network) -> u32 {
+        essentials_genesis_block(network)
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let mdb = self.mdb();
         let mut total_pairs = 0usize;
 
+        // Pure write-only path: for every (alk, key)->value change
+        //   - put value row
+        //   - put directory marker row
         let _ = mdb.bulk_write(|wb| {
             for tx in block.transactions.iter() {
                 for (alk, kvs) in tx.storage_changes.iter() {
-                    let mut new_keys: Vec<Vec<u8>> = Vec::with_capacity(kvs.len());
-                    for (skey, v) in kvs.iter() {
+                    for (skey, (txid, value)) in kvs.iter() {
                         let k_kv = Essentials::k_kv(alk, skey);
-                        wb.put(&k_kv, v);
-                        new_keys.push(skey.clone());
+
+                        // EXPECT: `txid` is 32 bytes (raw)
+                        // Value layout: [ txid (32) | value (...) ]
+                        let mut buf = Vec::with_capacity(32 + value.len());
+                        buf.extend_from_slice(&txid.to_byte_array());
+                        buf.extend_from_slice(value);
+
+                        wb.put(&k_kv, &buf);
+
+                        // dir marker: no read/merge; duplicates are fine
+                        let k_dir = Essentials::k_dir_entry(alk, skey);
+                        wb.put(&k_dir, &[]);
+
+                        // dir marker: no read/merge; duplicates are fine
+                        let k_dir = Essentials::k_dir_entry(alk, skey);
+                        wb.put(&k_dir, &[]);
+
                         total_pairs += 1;
                     }
-
-                    let k_dir = Essentials::k_dir(alk);
-                    let mut merged: Vec<Vec<u8>> =
-                        if let Some(prev) = mdb.get(&k_dir).unwrap_or(None) {
-                            Essentials::dec_dir(&prev).unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-
-                    merged = Essentials::dir_merge(merged, new_keys.into_iter());
-                    wb.put(&k_dir, &Essentials::enc_dir(&merged));
                 }
             }
         });
 
-        eprintln!(
-            "[ESSENENTIALS] block #{} indexed {} key/value updates",
-            block.height, total_pairs
-        );
+        eprintln!("[ESSENTIALS] block #{} indexed {} key/value updates", block.height, total_pairs);
         self.set_index_height(block.height)?;
         Ok(())
     }

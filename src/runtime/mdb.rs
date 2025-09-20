@@ -189,6 +189,43 @@ impl Mdb {
             )
             .map(|res| res.map(|(k, v)| (k.to_vec(), v.to_vec())))
     }
+    pub fn scan_prefix(&self, rel_prefix: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+        use rocksdb::{Direction, IteratorMode, ReadOptions};
+        let mut start = self.prefix().to_vec();
+        start.extend_from_slice(rel_prefix);
+
+        // compute upper bound
+        let mut ub = start.clone();
+        for i in (0..ub.len()).rev() {
+            if ub[i] != 0xff {
+                ub[i] += 1;
+                ub.truncate(i + 1);
+                break;
+            }
+            if i == 0 {
+                ub.clear();
+            } // no UB; iterate all, we will break by prefix
+        }
+
+        let mut ro = ReadOptions::default();
+        if !ub.is_empty() {
+            ro.set_iterate_upper_bound(ub);
+        }
+        ro.set_total_order_seek(true);
+
+        let it = self.db.iterator_opt(IteratorMode::From(&start, Direction::Forward), ro);
+        let mut keys = Vec::new();
+        for kv in it {
+            let (k_full, _v) = kv?;
+            if !k_full.starts_with(&start) {
+                break;
+            }
+            // Strip module prefix to return RELATIVE keys:
+            let rel = &k_full[self.prefix().len()..];
+            keys.push(rel.to_vec());
+        }
+        Ok(keys)
+    }
 
     #[inline]
     pub fn inner_db(&self) -> &DB {

@@ -123,73 +123,60 @@ pub struct EspoBlock {
 }
 
 /// Map of AlkaneId -> (key -> value), last-write-wins per key within a single trace.
-pub type AlkaneStorageChanges = HashMap<SchemaAlkaneId, HashMap<Vec<u8>, Vec<u8>>>;
-
-/// Frame carries only the *active storage owner* (codeId is irrelevant for attribution here)
-#[derive(Clone, Copy, Debug)]
-struct Frame {
-    storage_owner: SchemaAlkaneId,
-}
+pub type AlkaneStorageChanges = HashMap<SchemaAlkaneId, HashMap<Vec<u8>, (Txid, Vec<u8>)>>;
 
 /// Extract last-write-wins storage mutations per Alkane from a single protobuf trace.
-pub fn extract_alkane_storage(trace: &alkanes::AlkanesTrace) -> Result<AlkaneStorageChanges> {
+pub fn extract_alkane_storage(
+    trace: &alkanes::AlkanesTrace,
+    transaction: &Transaction,
+) -> anyhow::Result<AlkaneStorageChanges> {
+    // AlkaneStorageChanges = HashMap<SchemaAlkaneId, HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>>
+    // where inner value is (txid_le, raw_value)
     let mut out: AlkaneStorageChanges = HashMap::new();
-    let mut stack: Vec<Frame> = Vec::with_capacity(16);
 
+    // stack of "frames" — each frame carries the 'myself' alkane id for that call depth
+    let mut stack: Vec<SchemaAlkaneId> = Vec::with_capacity(16);
+
+    // precompute txid (we store LE bytes; RPC flips to BE for display)
+    let txid: Txid = transaction.compute_txid();
+
+    use alkanes::alkanes_trace_event::Event;
     for ev in &trace.events {
-        use alkanes::alkanes_trace_event::Event;
         if let Some(evt) = &ev.event {
             match evt {
                 Event::EnterContext(enter) => {
-                    let ctx = match enter.context.as_ref() {
-                        Some(c) => c,
-                        None => continue,
-                    };
-                    let inner = match ctx.inner.as_ref() {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                    let myself = match inner.myself.as_ref() {
-                        Some(m) => m,
-                        None => continue,
-                    };
-
-                    // Determine storage owner based on call type
-
-                    stack.push(Frame { storage_owner: myself.clone().try_into()? });
+                    // push this frame's 'myself' so the matching Exit uses it
+                    if let Some(ctx) = enter.context.as_ref() {
+                        if let Some(inner) = ctx.inner.as_ref() {
+                            if let Some(myself) = inner.myself.as_ref() {
+                                // pair calls/returns strictly by nesting; delegate/static don't matter here
+                                let owner: SchemaAlkaneId = myself.clone().try_into()?;
+                                stack.push(owner);
+                            }
+                        }
+                    }
                 }
 
                 Event::ExitContext(exit) => {
-                    // Peek or pop depending on your policy
-                    let frame = match stack.last().copied() {
-                        Some(f) => f,
-                        None => continue,
-                    };
+                    // pop the frame that this return corresponds to; if stack’s empty, skip
+                    let Some(owner) = stack.pop() else { continue };
 
                     if let Some(resp) = exit.response.as_ref() {
-                        // `resp.storage` is the repeated KeyValuePair
+                        // last-write-wins per key within this single trace
+                        let entry = out.entry(owner).or_insert_with(HashMap::new);
                         for kv in &resp.storage {
-                            let k = kv.key.clone();
-                            let v = kv.value.clone();
-
-                            out.entry(frame.storage_owner)
-                                .or_insert_with(HashMap::new)
-                                .insert(k, v); // last write wins
+                            let k = kv.key.clone(); // raw key bytes (already bytes in proto)
+                            let v = kv.value.clone(); // raw value bytes
+                            entry.insert(k, (txid, v));
                         }
                     }
-
-                    // If you know your traces are 1:1 enter/exit, use:
-                    // let _ = stack.pop();
                 }
 
                 Event::CreateAlkane(_create) => {
-                    // Creation doesn’t by itself mutate storage in the return payload we process here.
-                    // If you want to mark new alkanes, you could precreate an empty map entry.
+                    // no storage attribution here
                 }
 
-                &_ => {
-                    continue;
-                }
+                _ => {}
             }
         }
     }
@@ -574,7 +561,7 @@ pub fn get_espo_block(block: u64) -> Result<EspoBlock> {
 
         let outpoint = EspoOutpoint { txid: txid_be, vout };
 
-        let storage_changes = extract_alkane_storage(&p.protobuf_trace)?;
+        let storage_changes = extract_alkane_storage(&p.protobuf_trace, &transaction)?;
         /*
                 for (id, kvs) in &storage_changes {
                     let alkane_hex = format!("0x{:x}:0x{:x}", id.block, id.tx); // e.g., 0x4:0xfff2
