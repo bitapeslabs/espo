@@ -3,13 +3,14 @@ use std::collections::{HashMap, HashSet};
 use crate::config::{get_electrum_client, get_metashrew_sdb};
 use crate::consts::TRACES_BY_BLOCK_PREFIX;
 use crate::runtime::sdb::SDB;
+use crate::schemas::SchemaAlkaneId;
 use alkanes_support::proto::alkanes;
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result};
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 use bitcoin::{Transaction, Txid};
-use electrum_client::{ElectrumApi};
+use electrum_client::ElectrumApi;
 use protobuf::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,7 @@ pub struct PartialEspoTrace {
 pub struct EspoAlkanesTransaction {
     pub sandshrew_trace: EspoSandshrewLikeTrace,
     pub protobuf_trace: AlkanesTrace,
+    pub storage_changes: AlkaneStorageChanges,
     pub outpoint: EspoOutpoint,
     pub transaction: Transaction,
 }
@@ -119,6 +121,111 @@ pub struct EspoBlock {
     pub transactions: Vec<EspoAlkanesTransaction>,
     //All related prevouts for this block
     pub prevouts: HashMap<Txid, Transaction>,
+}
+
+/// Map of AlkaneId -> (key -> value), last-write-wins per key within a single trace.
+pub type AlkaneStorageChanges = HashMap<SchemaAlkaneId, HashMap<Vec<u8>, Vec<u8>>>;
+
+/// Convert proto uint128 to (hi, lo) as u128
+fn u128_from_proto(x: &alkanes::Uint128) -> u128 {
+    ((x.hi as u128) << 64) | (x.lo as u128)
+}
+
+/// Convert proto AlkaneId (uint128 fields) into your SchemaAlkaneId (u32, u64).
+/// Truncates safely assuming values fit (hi==0 for both fields). If not, we clamp.
+fn schema_id_from_proto(id: &alkanes::AlkaneId) -> SchemaAlkaneId {
+    let b = id.block.as_ref().map(u128_from_proto).unwrap_or(0);
+    let t = id.tx.as_ref().map(u128_from_proto).unwrap_or(0);
+    // Truncate with saturation (you can assert if you want strictness)
+    SchemaAlkaneId { block: (b as u64) as u32, tx: t as u64 }
+}
+
+/// Frame carries only the *active storage owner* (codeId is irrelevant for attribution here)
+#[derive(Clone, Copy, Debug)]
+struct Frame {
+    storage_owner: SchemaAlkaneId,
+}
+
+/// Extract last-write-wins storage mutations per Alkane from a single protobuf trace.
+pub fn extract_alkane_storage(trace: &alkanes::AlkanesTrace) -> AlkaneStorageChanges {
+    let mut out: AlkaneStorageChanges = HashMap::new();
+    let mut stack: Vec<Frame> = Vec::with_capacity(16);
+
+    for ev in &trace.events {
+        use alkanes::alkanes_trace_event::Event;
+        if let Some(evt) = &ev.event {
+            match evt {
+                Event::EnterContext(enter) => {
+                    let call_ty = enter.call_type.enum_value_or_default();
+                    let ctx = match enter.context.as_ref() {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let inner = match ctx.inner.as_ref() {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    let myself = match inner.myself.as_ref() {
+                        Some(m) => m,
+                        None => continue,
+                    };
+
+                    // Determine storage owner based on call type
+                    let owner = match call_ty {
+                        alkanes::AlkanesTraceCallType::CALL => schema_id_from_proto(myself),
+                        alkanes::AlkanesTraceCallType::DELEGATECALL
+                        | alkanes::AlkanesTraceCallType::STATICCALL => {
+                            // inherit from parent if any, otherwise default to self
+                            stack
+                                .last()
+                                .map(|f| f.storage_owner)
+                                .unwrap_or_else(|| schema_id_from_proto(myself))
+                        }
+                        _ => {
+                            // Unknown/none: default to self
+                            schema_id_from_proto(myself)
+                        }
+                    };
+
+                    stack.push(Frame { storage_owner: owner });
+                }
+
+                Event::ExitContext(exit) => {
+                    // Peek or pop depending on your policy
+                    let frame = match stack.last().copied() {
+                        Some(f) => f,
+                        None => continue,
+                    };
+
+                    if let Some(resp) = exit.response.as_ref() {
+                        // `resp.storage` is the repeated KeyValuePair
+                        for kv in &resp.storage {
+                            let k = kv.key.clone();
+                            let v = kv.value.clone();
+
+                            out.entry(frame.storage_owner)
+                                .or_insert_with(HashMap::new)
+                                .insert(k, v); // last write wins
+                        }
+                    }
+
+                    // If you know your traces are 1:1 enter/exit, use:
+                    // let _ = stack.pop();
+                }
+
+                Event::CreateAlkane(_create) => {
+                    // Creation doesn’t by itself mutate storage in the return payload we process here.
+                    // If you want to mark new alkanes, you could precreate an empty map entry.
+                }
+
+                &_ => {
+                    continue;
+                }
+            }
+        }
+    }
+
+    out
 }
 
 fn trace_block_prefix(block: &u64) -> Vec<u8> {
@@ -498,9 +605,24 @@ pub fn get_espo_block(block: u64) -> Result<EspoBlock> {
 
         let outpoint = EspoOutpoint { txid: txid_be, vout };
 
+        let storage_changes = extract_alkane_storage(&p.protobuf_trace);
+        /*
+                for (id, kvs) in &storage_changes {
+                    let alkane_hex = format!("0x{:x}:0x{:x}", id.block, id.tx); // e.g., 0x4:0xfff2
+                    for (k, v) in kvs {
+                        println!(
+                            "[indexer_debug] storage change {} => {} on {}",
+                            fmt_bytes_hex(k),
+                            fmt_bytes_hex(v),
+                            alkane_hex
+                        );
+                    }
+                }
+        */
         txs.push(EspoAlkanesTransaction {
             sandshrew_trace,
             protobuf_trace: p.protobuf_trace,
+            storage_changes,
             outpoint,
             transaction,
         });

@@ -118,6 +118,25 @@ impl Mdb {
         self.db.get(self.prefixed(k))
     }
 
+    pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, RocksError> {
+        // Apply DB prefix to each RELATIVE key
+        let prefixed: Vec<Vec<u8>> = keys.iter().map(|k| self.prefixed(k)).collect();
+
+        // rocksdb::DB::multi_get returns Vec<Result<Option<DBPinnableSlice>, Error>>
+        let results = self.db.multi_get(prefixed);
+
+        // Map to Result<Vec<Option<Vec<u8>>>, Error>, preserving order
+        let mut out = Vec::with_capacity(results.len());
+        for r in results {
+            match r {
+                Ok(Some(slice)) => out.push(Some(slice.to_vec())),
+                Ok(None) => out.push(None),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
     pub fn put(&self, k: &[u8], v: &[u8]) -> Result<(), RocksError> {
         self.db.put(self.prefixed(k), v)
     }

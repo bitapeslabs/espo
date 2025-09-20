@@ -5,7 +5,9 @@ impl AmmData {
         KEY_INDEX_HEIGHT
     }
 }
-use crate::modules::ammdata::schemas::{SchemaAlkaneId, SchemaFullCandleV1, Timeframe};
+use crate::schemas::SchemaAlkaneId;
+
+use crate::modules::ammdata::schemas::{SchemaFullCandleV1, Timeframe};
 use borsh::BorshSerialize;
 
 /// Hex without "0x", lowercase

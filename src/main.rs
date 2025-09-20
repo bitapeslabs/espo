@@ -3,6 +3,7 @@ pub mod config;
 pub mod consts;
 pub mod modules;
 pub mod runtime;
+pub mod schemas;
 pub mod types;
 pub mod utils;
 
@@ -11,6 +12,7 @@ use std::time::Duration;
 
 //modules
 use crate::modules::ammdata::main::AmmData;
+use crate::modules::essentials::main::Essentials;
 use crate::utils::{EtaTracker, fmt_duration};
 
 use anyhow::{Context, Result};
@@ -30,6 +32,7 @@ async fn main() -> Result<()> {
     // Build module registry with the global ESPO DB
     let mut mods = ModuleRegistry::with_db(get_espo_db());
     mods.register_module(AmmData::new());
+    //mods.register_module(Essentials::new());
     // mods.register_module(TracesData::new());
 
     // Start RPC server

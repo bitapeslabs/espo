@@ -1,8 +1,14 @@
-use crate::alkanes::trace::{
-    EspoAlkanesTransaction, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
-    EspoSandshrewLikeTraceShortId,
+use crate::schemas::SchemaAlkaneId;
+use crate::{
+    alkanes::trace::{
+        EspoAlkanesTransaction, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
+        EspoSandshrewLikeTraceShortId,
+    },
+    modules::ammdata::schemas::SchemaMarketDefs,
 };
 use anyhow::{Context, Result, anyhow};
+use bitcoin::hashes::hash160::Hash;
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -23,27 +29,34 @@ pub struct ReserveExtraction {
 
 const K_TOLERANCE: f64 = 0.001; // 0.1%
 
-pub fn extract_reserves_from_espo_transaction(
+pub fn extract_new_pools_from_espo_transaction(
     transaction: &EspoAlkanesTransaction,
-) -> Result<Vec<ReserveExtraction>> {
+) -> Result<Vec<(SchemaAlkaneId, SchemaMarketDefs)>> {
     /* ---------- helpers ---------- */
-
     let trace: EspoSandshrewLikeTrace = transaction.sandshrew_trace.clone();
 
     fn strip_0x(s: &str) -> &str {
         s.strip_prefix("0x").unwrap_or(s)
     }
 
-    fn id_key(id: &EspoSandshrewLikeTraceShortId) -> String {
-        format!("{}/{}", id.block.to_lowercase(), id.tx.to_lowercase())
+    fn parse_hex_u32(s: &str) -> Result<u32> {
+        let v = u128::from_str_radix(strip_0x(s), 16).context("hex->u128 failed (u32)")?;
+        if v > u32::MAX as u128 {
+            return Err(anyhow!("u32 overflow when parsing hex"));
+        }
+        Ok(v as u32)
     }
 
-    fn hex_u128_be(s: &str) -> Result<u128> {
-        u128::from_str_radix(strip_0x(s), 16).context("hex->u128 (BE) failed")
+    fn parse_hex_u64(s: &str) -> Result<u64> {
+        let v = u128::from_str_radix(strip_0x(s), 16).context("hex->u128 failed (u64)")?;
+        if v > u64::MAX as u128 {
+            return Err(anyhow!("u64 overflow when parsing hex"));
+        }
+        Ok(v as u64)
     }
 
-    fn u128_to_i128(x: u128) -> Result<i128> {
-        if x > i128::MAX as u128 { Err(anyhow!("value won't fit in i128")) } else { Ok(x as i128) }
+    fn schema_id_from_short(id: &EspoSandshrewLikeTraceShortId) -> Result<SchemaAlkaneId> {
+        Ok(SchemaAlkaneId { block: parse_hex_u32(&id.block)?, tx: parse_hex_u64(&id.tx)? })
     }
 
     fn le_u128_pair_from_32b_hex(h: &str) -> Result<(u128, u128)> {
@@ -54,314 +67,371 @@ pub fn extract_reserves_from_espo_transaction(
         let bytes = hex::decode(hex).context("hex decode failed")?;
         let read_le_u128 = |b: &[u8]| -> u128 {
             let mut v: u128 = 0;
-            for &byte in b.iter().rev() {
-                v = (v << 8) | (byte as u128);
+            // interpret as little-endian
+            for (i, byte) in b.iter().enumerate() {
+                v |= (*byte as u128) << (8 * i as u32);
             }
             v
         };
         Ok((read_le_u128(&bytes[0..16]), read_le_u128(&bytes[16..32])))
     }
 
-    fn find_matching_return_index(
-        events: &[EspoSandshrewLikeTraceEvent],
-        start: usize,
-    ) -> Option<usize> {
-        let mut depth = 1i32;
-        for i in start + 1..events.len() {
-            match &events[i] {
-                EspoSandshrewLikeTraceEvent::Invoke(_) => depth += 1,
-                EspoSandshrewLikeTraceEvent::Return(_) => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
+    fn schema_id_from_storage_val_32b(h: &str) -> Result<SchemaAlkaneId> {
+        let (block_le, tx_le) =
+            le_u128_pair_from_32b_hex(h).context("decode (block, tx) LE u128 pair")?;
+        if block_le > u32::MAX as u128 || tx_le > u64::MAX as u128 {
+            return Err(anyhow!("id parts overflow target sizes"));
+        }
+        Ok(SchemaAlkaneId { block: block_le as u32, tx: tx_le as u64 })
+    }
+
+    /* ---------- collect IDs created in this tx ---------- */
+    let mut created_ids: HashSet<(String, String)> = HashSet::new();
+    for ev in &trace.events {
+        if let EspoSandshrewLikeTraceEvent::Create(c) = ev {
+            // keep as hex-strings for quick comparison with call-stack ids
+            created_ids.insert((c.new_alkane.block.clone(), c.new_alkane.tx.clone()));
+        }
+    }
+
+    if created_ids.is_empty() {
+        // No contracts created -> no new pools
+        return Ok(Vec::new());
+    }
+
+    /* ---------- walk the call stack; detect pool init writes ---------- */
+    let mut stack: VecDeque<EspoSandshrewLikeTraceShortId> = VecDeque::new();
+    let mut results: Vec<(SchemaAlkaneId, SchemaMarketDefs)> = Vec::new();
+    let mut seen_pools: HashSet<(u32, u64)> = HashSet::new(); // dedupe if multiple returns
+
+    for ev in &trace.events {
+        match ev {
+            EspoSandshrewLikeTraceEvent::Invoke(inv) => {
+                stack.push_back(inv.context.myself.clone());
+            }
+            EspoSandshrewLikeTraceEvent::Return(ret) => {
+                let leaving = match stack.pop_back() {
+                    Some(x) => x,
+                    None => continue,
+                };
+
+                // Only consider returns from contracts created in this same transaction.
+                if !created_ids.contains(&(leaving.block.clone(), leaving.tx.clone())) {
+                    continue;
+                }
+
+                // Look for both /alkane/0 and /alkane/1 in storage.
+                if ret.response.storage.is_empty() {
+                    continue;
+                }
+
+                let mut alk0: Option<&str> = None;
+                let mut alk1: Option<&str> = None;
+                for kv in &ret.response.storage {
+                    match kv.key.as_str() {
+                        "/alkane/0" => alk0 = Some(kv.value.as_str()),
+                        "/alkane/1" => alk1 = Some(kv.value.as_str()),
+                        _ => {}
                     }
                 }
-                _ => {}
+
+                let (Some(v0), Some(v1)) = (alk0, alk1) else { continue };
+
+                // Decode base/quote from the 32-byte LE encoded (block, tx) pairs.
+                let base_id =
+                    schema_id_from_storage_val_32b(v0).context("decode /alkane/0 failed")?;
+                let quote_id =
+                    schema_id_from_storage_val_32b(v1).context("decode /alkane/1 failed")?;
+
+                let pool_id =
+                    schema_id_from_short(&leaving).context("decode created pool id (leaving)")?;
+
+                // Deduplicate in case multiple returns write the same keys.
+                if !seen_pools.insert((pool_id.block, pool_id.tx)) {
+                    continue;
+                }
+
+                results.push((
+                    pool_id,
+                    SchemaMarketDefs {
+                        base_alkane_id: base_id,
+                        quote_alkane_id: quote_id,
+                        pool_alkane_id: pool_id,
+                    },
+                ));
+            }
+            EspoSandshrewLikeTraceEvent::Create(_c) => {
+                // already captured above; nothing to do during streaming walk
             }
         }
-        None
     }
 
-    #[derive(Debug, Clone)]
-    struct Anchor {
-        pool: EspoSandshrewLikeTraceShortId,
-        prev_reserves_token_order: (u128, u128), // (token0, token1)
-        seg_start: usize,                        // inclusive
-        seg_end: usize,                          // exclusive
+    Ok(results)
+}
+pub fn extract_reserves_from_espo_transaction(
+    transaction: &EspoAlkanesTransaction,
+    pools: &HashMap<SchemaAlkaneId, SchemaMarketDefs>,
+) -> Result<Vec<ReserveExtraction>> {
+    use crate::alkanes::trace::{
+        EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
+    };
+    use anyhow::{Context, anyhow};
+    use std::collections::HashMap;
+
+    /* ---------- helpers ---------- */
+
+    let trace: EspoSandshrewLikeTrace = transaction.sandshrew_trace.clone();
+
+    #[inline]
+    fn strip_0x(s: &str) -> &str {
+        s.strip_prefix("0x").unwrap_or(s)
     }
 
-    let mut tails: Vec<(EspoSandshrewLikeTraceShortId, (u128, u128), usize)> = Vec::new();
+    /// Parse a 32-byte hex string as two little-endian u128s: (base, quote).
+    #[inline]
+    fn le_u128_pair_from_32b_hex(h: &str) -> Result<(u128, u128)> {
+        let hex = strip_0x(h);
+        if hex.len() != 64 {
+            return Err(anyhow!("expected 32-byte hex payload for reserves"));
+        }
+        let bytes = hex::decode(hex).context("hex decode failed")?;
+        let read_le_u128 = |b: &[u8]| -> u128 {
+            let mut v: u128 = 0;
+            for (i, byte) in b.iter().enumerate() {
+                v |= (*byte as u128) << (8 * i as u32);
+            }
+            v
+        };
+        Ok((read_le_u128(&bytes[0..16]), read_le_u128(&bytes[16..32])))
+    }
 
-    for i in 0..trace.events.len() {
-        let EspoSandshrewLikeTraceEvent::Invoke(inv) = &trace.events[i] else { continue };
-        let is_get_reserves = inv.typ == "delegatecall"
+    #[inline]
+    fn parse_hex_u32(s: &str) -> Result<u32> {
+        Ok(u32::from_str_radix(strip_0x(s), 16)?)
+    }
+    #[inline]
+    fn parse_hex_u64(s: &str) -> Result<u64> {
+        Ok(u64::from_str_radix(strip_0x(s), 16)?)
+    }
+
+    #[inline]
+    fn short_to_schema(id: &EspoSandshrewLikeTraceShortId) -> Result<SchemaAlkaneId> {
+        Ok(SchemaAlkaneId { block: parse_hex_u32(&id.block)?, tx: parse_hex_u64(&id.tx)? })
+    }
+    #[inline]
+    fn schema_to_short(id: &SchemaAlkaneId) -> EspoSandshrewLikeTraceShortId {
+        EspoSandshrewLikeTraceShortId {
+            block: format!("0x{:x}", id.block),
+            tx: format!("0x{:x}", id.tx),
+        }
+    }
+
+    /// Next Return index at or after `start`.
+    #[inline]
+    fn next_return_idx(evs: &[EspoSandshrewLikeTraceEvent], start: usize) -> Option<usize> {
+        (start..evs.len()).find(|&i| matches!(&evs[i], EspoSandshrewLikeTraceEvent::Return(_)))
+    }
+
+    /// The specific reserve anchor we want:
+    /// - delegatecall
+    /// - calldata == 0x61
+    /// - caller == factory (0x4/0xfff2)
+    #[inline]
+    fn is_anchor(inv: &crate::alkanes::trace::EspoSandshrewLikeTraceInvokeData) -> bool {
+        inv.typ == "delegatecall"
             && inv.context.inputs.len() == 1
-            && inv.context.inputs[0].as_str() == "0x61";
-        if !is_get_reserves {
+            && inv.context.inputs[0].as_str() == "0x61"
+            && inv.context.caller.block.eq_ignore_ascii_case("0x4")
+            && inv.context.caller.tx.eq_ignore_ascii_case("0xfff2")
+    }
+
+    #[inline]
+    fn ids_equal(a: &EspoSandshrewLikeTraceShortId, b: &EspoSandshrewLikeTraceShortId) -> bool {
+        a.block.eq_ignore_ascii_case(&b.block) && a.tx.eq_ignore_ascii_case(&b.tx)
+    }
+
+    #[inline]
+    fn parse_hex_u128_be(s: &str) -> Result<u128> {
+        Ok(u128::from_str_radix(strip_0x(s), 16)?)
+    }
+
+    const K_TOLERANCE: f64 = 0.001; // 0.1%
+
+    let evs = &trace.events;
+    let mut results: Vec<ReserveExtraction> = Vec::new();
+    let mut i = 0usize;
+
+    while i < evs.len() {
+        // 1) find the anchor
+        let inv = match &evs[i] {
+            EspoSandshrewLikeTraceEvent::Invoke(x) if is_anchor(x) => x,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // pool identity + schema id
+        let pool_short = inv.context.myself.clone();
+        let pool_schema = short_to_schema(&pool_short).context("pool id parse failed")?;
+
+        // authoritative base/quote ids from preloaded map
+        let defs = match pools.get(&pool_schema) {
+            Some(d) => *d,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let base_sid = schema_to_short(&defs.base_alkane_id);
+        let quote_sid = schema_to_short(&defs.quote_alkane_id);
+
+        // 2) the next two Return events must be identical (prev reserves)
+        let r1 =
+            next_return_idx(evs, i + 1).ok_or_else(|| anyhow!("missing first reserves return"))?;
+        let r2 = next_return_idx(evs, r1 + 1)
+            .ok_or_else(|| anyhow!("missing second reserves return"))?;
+
+        let (d1, d2) = match (&evs[r1], &evs[r2]) {
+            (EspoSandshrewLikeTraceEvent::Return(a), EspoSandshrewLikeTraceEvent::Return(b)) => {
+                (a.response.data.as_str(), b.response.data.as_str())
+            }
+            _ => {
+                i = r2 + 1;
+                continue;
+            }
+        };
+        if d1 != d2 || strip_0x(d1).len() != 64 {
+            i = r2 + 1;
             continue;
         }
 
-        let r1 = find_matching_return_index(&trace.events, i)
-            .ok_or_else(|| anyhow!("reserve extraction failure: none value @ r1"))?;
-        let r2 = find_matching_return_index(&trace.events, r1)
-            .ok_or_else(|| anyhow!("reserve extraction failure: none value @ r2"))?;
-        let (d1, d2) = match (&trace.events[r1], &trace.events[r2]) {
-            (
-                EspoSandshrewLikeTraceEvent::Return(ret1),
-                EspoSandshrewLikeTraceEvent::Return(ret2),
-            ) => (ret1.response.data.as_str(), ret2.response.data.as_str()),
-            _ => continue,
-        };
-        if d1 == d2 && strip_0x(d1).len() == 64 {
-            let (a, b) =
-                le_u128_pair_from_32b_hex(d1).context("failed to parse reserves (LE u128 pair)")?;
-            tails.push((inv.context.myself.clone(), (a, b), r2 + 1));
-        }
-    }
+        // PRE-SWAP reserves (base, quote)
+        let (prev_base, prev_quote) =
+            le_u128_pair_from_32b_hex(d1).context("parse prev reserves")?;
 
-    if tails.is_empty() {
-        return Err(anyhow!("no_prev_reserves"));
-    }
-
-    let mut anchors: Vec<Anchor> = Vec::new();
-    for (idx, (pool, prev_reserves, seg_start)) in tails.iter().enumerate() {
-        let seg_end = if idx + 1 < tails.len() { tails[idx + 1].2 } else { trace.events.len() };
-        anchors.push(Anchor {
-            pool: pool.clone(),
-            prev_reserves_token_order: *prev_reserves,
-            seg_start: *seg_start,
-            seg_end,
-        });
-    }
-
-    #[derive(Default, Clone, Debug)]
-    struct Flow {
-        total_in: u128,
-        total_out: u128,
-        net_to_pool: i128, // signed: in - out
-    }
-
-    fn push_incoming(
-        flows: &mut HashMap<String, Flow>,
-        token_key: String,
-        amount_u: u128,
-    ) -> Result<()> {
-        let amount_i = u128_to_i128(amount_u)?;
-        let e = flows.entry(token_key).or_default();
-        e.total_in = e.total_in.saturating_add(amount_u);
-        e.net_to_pool = e.net_to_pool.saturating_add(amount_i);
-        Ok(())
-    }
-
-    fn push_outgoing(
-        flows: &mut HashMap<String, Flow>,
-        token_key: String,
-        amount_u: u128,
-    ) -> Result<()> {
-        let amount_i = u128_to_i128(amount_u)?;
-        let e = flows.entry(token_key).or_default();
-        e.total_out = e.total_out.saturating_add(amount_u);
-        e.net_to_pool = e.net_to_pool.saturating_sub(amount_i);
-        Ok(())
-    }
-
-    fn try_mapping(
-        prev0: u128,
-        prev1: u128,
-        d0_i: i128,
-        d1_i: i128,
-    ) -> Option<((u128, u128), f64)> {
-        let n0 = if d0_i >= 0 {
-            prev0.checked_add(d0_i as u128)?
-        } else {
-            prev0.checked_sub((-d0_i) as u128)?
-        };
-        let n1 = if d1_i >= 0 {
-            prev1.checked_add(d1_i as u128)?
-        } else {
-            prev1.checked_sub((-d1_i) as u128)?
-        };
-        if n0 == 0 || n1 == 0 {
-            return None;
-        }
-        let k_prev = (prev0 as f64) * (prev1 as f64);
-        let k_new = (n0 as f64) * (n1 as f64);
-        let ratio =
-            if k_prev.is_finite() && k_prev != 0.0 { k_new / k_prev } else { f64::INFINITY };
-        Some(((n0, n1), ratio))
-    }
-
-    let mut results: Vec<ReserveExtraction> = Vec::new();
-
-    for anchor in anchors {
-        let pool_key = id_key(&anchor.pool);
-
-        let mut flows: HashMap<String, Flow> = HashMap::new();
-        let mut call_stack: Vec<String> = Vec::new();
+        // 3) scan right after twins: first pool Invoke(call) gives the amount entering the POOL.
+        //    Only accept if *exactly one* of {base, quote} appears in incomingAlkanes (swap).
+        //    If both or none match → add-liquidity or unknown → skip.
+        let mut j = r2 + 1;
         let mut pool_depth: i32 = 0;
-        let mut capture_next_return_as_outflow = false;
-        let mut seen_in_dedup: HashSet<String> = HashSet::new();
+        let mut base_in: u128 = 0;
+        let mut quote_in: u128 = 0;
+        let mut saw_candidate_call = false;
+        let mut valid_swap = false;
 
-        for ev in &trace.events[anchor.seg_start..anchor.seg_end] {
-            match ev {
-                EspoSandshrewLikeTraceEvent::Invoke(inv) => {
-                    let self_key = id_key(&inv.context.myself);
-                    call_stack.push(self_key.clone());
-
-                    if self_key == pool_key {
+        while j < evs.len() {
+            match &evs[j] {
+                EspoSandshrewLikeTraceEvent::Invoke(v) => {
+                    if ids_equal(&v.context.myself, &pool_short) {
                         pool_depth += 1;
-                        if pool_depth == 1 {
-                            seen_in_dedup.clear();
-                        }
-                        if inv.typ == "call" {
-                            for inc in &inv.context.incoming_alkanes {
-                                let token_key = id_key(&inc.id);
-                                let val_hex = inc.value.clone();
-                                let amount = hex_u128_be(&val_hex)?;
-                                let sig = format!("{}:{}", token_key, val_hex);
-                                if seen_in_dedup.insert(sig) {
-                                    push_incoming(&mut flows, token_key, amount)?;
+
+                        if v.typ == "call" && !saw_candidate_call {
+                            // Count how many of the incoming match base/quote, and capture their amounts.
+                            let mut matches = 0usize;
+                            let mut tmp_base_in: u128 = 0;
+                            let mut tmp_quote_in: u128 = 0;
+
+                            for inc in &v.context.incoming_alkanes {
+                                if ids_equal(&inc.id, &base_sid) {
+                                    matches += 1;
+                                    tmp_base_in =
+                                        parse_hex_u128_be(&inc.value).context("parse base_in")?;
+                                } else if ids_equal(&inc.id, &quote_sid) {
+                                    matches += 1;
+                                    tmp_quote_in =
+                                        parse_hex_u128_be(&inc.value).context("parse quote_in")?;
                                 }
+                            }
+
+                            saw_candidate_call = true;
+
+                            // Accept only if *exactly one* matches (pure swap).
+                            if matches == 1 {
+                                base_in = tmp_base_in;
+                                quote_in = tmp_quote_in;
+                                valid_swap = true;
+                            } else {
+                                // matches == 0 (no swap) or matches >= 2 (add-liquidity)
+                                // Mark invalid and break once we exit the pool frame.
+                                valid_swap = false;
                             }
                         }
                     }
                 }
-                EspoSandshrewLikeTraceEvent::Return(ret) => {
-                    let leaving_key = call_stack.pop().unwrap_or_default();
-                    if leaving_key == pool_key {
-                        if ret.response.storage.is_empty() {
-                            for out in &ret.response.alkanes {
-                                let token_key = id_key(&out.id);
-                                let amount = hex_u128_be(&out.value)?;
-                                push_outgoing(&mut flows, token_key, amount)?;
-                            }
-                        } else {
-                            capture_next_return_as_outflow = true;
+                EspoSandshrewLikeTraceEvent::Return(_) => {
+                    if pool_depth > 0 {
+                        pool_depth -= 1;
+                        if pool_depth == 0 {
+                            break; // finished this pool frame slice
                         }
-                        pool_depth = (pool_depth - 1).max(0);
-                    } else if capture_next_return_as_outflow {
-                        for out in &ret.response.alkanes {
-                            let token_key = id_key(&out.id);
-                            let amount = hex_u128_be(&out.value)?;
-                            push_outgoing(&mut flows, token_key, amount)?;
-                        }
-                        capture_next_return_as_outflow = false;
                     }
                 }
                 EspoSandshrewLikeTraceEvent::Create(_) => {}
             }
+            j += 1;
         }
 
-        if flows.len() < 2 {
+        if !valid_swap {
+            // no single-sided input observed; skip this anchor
+            i = r2 + 1;
             continue;
         }
 
-        // Rank by |net| + in + out
-        let mut ranked: Vec<(String, Flow, u128)> = flows
-            .into_iter()
-            .map(|(k, f)| {
-                let abs_net = if f.net_to_pool >= 0 {
-                    f.net_to_pool as u128
-                } else {
-                    (-f.net_to_pool) as u128
-                };
-                let score = abs_net.saturating_add(f.total_in).saturating_add(f.total_out);
-                (k, f, score)
-            })
-            .collect();
-        ranked.sort_by(|a, b| b.2.cmp(&a.2));
+        // 4) constant-product solve using *opposite* side as OUT:
+        //    - base_in = a:  (b + a) * (q - y) = b*q  => y = q - floor( (b*q)/(b+a) )
+        //    - quote_in = a: (b - x) * (q + a) = b*q  => x = b - floor( (b*q)/(q+a) )
+        let k_prev = (prev_base as u128)
+            .checked_mul(prev_quote as u128)
+            .ok_or_else(|| anyhow!("k overflow"))?;
 
-        let (t1_id, t1_flow, _) = ranked[0].clone();
-        let (t2_id, t2_flow, _) = ranked[1].clone();
-
-        // Clean swap: one net in (>0), the other net out (<0)
-        let is_clean_swap = (t1_flow.net_to_pool > 0 && t2_flow.net_to_pool < 0)
-            || (t1_flow.net_to_pool < 0 && t2_flow.net_to_pool > 0);
-        if !is_clean_swap {
-            continue;
-        }
-
-        // Define base/quote by direction:
-        // base = token sent *into* the pool (net_to_pool > 0)
-        // quote = token sent *out* of the pool (net_to_pool < 0)
-        let (base_id_str, base_flow, quote_id_str, quote_flow) = if t1_flow.net_to_pool > 0 {
-            (t1_id.clone(), t1_flow.clone(), t2_id.clone(), t2_flow.clone())
+        let (new_base, new_quote, base_in_res, quote_out_res) = if base_in > 0 {
+            // base_in → quote_out
+            let nb = prev_base.checked_add(base_in).ok_or_else(|| anyhow!("base add overflow"))?;
+            let nq = if nb == 0 { 0 } else { k_prev / nb }; // floor
+            if nq > prev_quote {
+                i = r2 + 1;
+                continue;
+            } // sanity
+            let y = prev_quote - nq; // quote_out
+            (nb, nq, base_in, y)
         } else {
-            (t2_id.clone(), t2_flow.clone(), t1_id.clone(), t1_flow.clone())
+            // quote_in → base_out
+            let nq =
+                prev_quote.checked_add(quote_in).ok_or_else(|| anyhow!("quote add overflow"))?;
+            let nb = if nq == 0 { 0 } else { k_prev / nq }; // floor
+            if nb > prev_base {
+                i = r2 + 1;
+                continue;
+            } // sanity
+            let _x = prev_base - nb; // base_out (not part of volume per (base_in, quote_out) schema)
+            // volume stays (0,0) in this branch
+            (nb, nq, 0u128, 0u128)
         };
 
-        let (prev_token0, prev_token1) = anchor.prev_reserves_token_order;
-
-        // We still need to align flows (which are per-token) with token0/token1 order to compute new reserves,
-        // then re-orient the final reserves to (base, quote).
-        let d_first = if base_id_str == t1_id { t1_flow.net_to_pool } else { t2_flow.net_to_pool };
-        let d_second = if base_id_str == t1_id { t2_flow.net_to_pool } else { t1_flow.net_to_pool };
-
-        let cand1 = try_mapping(prev_token0, prev_token1, d_first, d_second); // first → token0, second → token1
-        let cand2 = try_mapping(prev_token0, prev_token1, d_second, d_first); // second → token0, first → token1
-
-        // Choose mapping with K closest to constant
-        enum ChosenMap {
-            FirstToToken0,
-            SecondToToken0,
-        }
-        let (chosen_map, new_token_order, k_ratio) = match (cand1, cand2) {
-            (Some((n1, r1)), Some((n2, r2))) => {
-                if (r1 - 1.0).abs() <= (r2 - 1.0).abs() {
-                    (ChosenMap::FirstToToken0, n1, Some(r1))
-                } else {
-                    (ChosenMap::SecondToToken0, n2, Some(r2))
-                }
-            }
-            (Some((n, r)), None) => (ChosenMap::FirstToToken0, n, Some(r)),
-            (None, Some((n, r))) => (ChosenMap::SecondToToken0, n, Some(r)),
-            _ => continue,
+        // sanity: K ratio (should be ~1 within tolerance)
+        let k_ratio = if prev_base != 0 && prev_quote != 0 {
+            ((new_base as f64) * (new_quote as f64)) / ((prev_base as f64) * (prev_quote as f64))
+        } else {
+            f64::INFINITY
         };
-
-        // Filter by K tolerance
-        let pass_k = k_ratio.map(|r| (r - 1.0).abs() <= K_TOLERANCE).unwrap_or(false);
-        if !pass_k {
+        if (k_ratio - 1.0).abs() > K_TOLERANCE {
+            i = r2 + 1;
             continue;
         }
 
-        // Convert prev/new reserves from (token0, token1) into (base, quote)
-        // Figure out which logical token ("base" or "quote") mapped to token0.
-        let base_is_token0 = match chosen_map {
-            ChosenMap::FirstToToken0 => base_id_str == t1_id,
-            ChosenMap::SecondToToken0 => base_id_str == t2_id,
-        };
-
-        let prev_base_quote =
-            if base_is_token0 { (prev_token0, prev_token1) } else { (prev_token1, prev_token0) };
-        let new_base_quote = if base_is_token0 {
-            (new_token_order.0, new_token_order.1)
-        } else {
-            (new_token_order.1, new_token_order.0)
-        };
-
-        // Volumes: base_in (>0), quote_out (>0)
-        let base_in =
-            (if base_flow.net_to_pool > 0 { base_flow.net_to_pool as i128 } else { 0 }) as u128;
-        let quote_out =
-            (if quote_flow.net_to_pool < 0 { (-quote_flow.net_to_pool) as i128 } else { 0 })
-                as u128;
-
-        let parse_id = |s: &str| -> EspoSandshrewLikeTraceShortId {
-            let (block, tx) = s.split_once('/').unwrap_or(("", ""));
-            EspoSandshrewLikeTraceShortId { block: block.to_string(), tx: tx.to_string() }
-        };
-
+        // 5) emit result in strict (base, quote) order; volume=(base_in, quote_out)
         results.push(ReserveExtraction {
-            pool: anchor.pool.clone(),
-            token_ids: ReserveTokens {
-                base: parse_id(&base_id_str),
-                quote: parse_id(&quote_id_str),
-            },
-            prev_reserves: prev_base_quote,
-            new_reserves: new_base_quote,
-            volume: (base_in, quote_out),
-            k_ratio_approx: k_ratio.filter(|r| r.is_finite()),
+            pool: pool_short.clone(),
+            token_ids: ReserveTokens { base: base_sid.clone(), quote: quote_sid.clone() },
+            prev_reserves: (prev_base, prev_quote),
+            new_reserves: (new_base, new_quote),
+            volume: (base_in_res, quote_out_res),
+            k_ratio_approx: if k_ratio.is_finite() { Some(k_ratio) } else { None },
         });
+
+        // continue after this anchor’s twin returns
+        i = r2 + 1;
     }
 
     if results.is_empty() {

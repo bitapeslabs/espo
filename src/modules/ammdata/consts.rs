@@ -1,7 +1,6 @@
+use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
-
-use crate::modules::ammdata::schemas::SchemaAlkaneId;
 
 pub fn ammdata_genesis_block(network: Network) -> u32 {
     match network {

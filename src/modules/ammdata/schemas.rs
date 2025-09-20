@@ -1,10 +1,5 @@
+use crate::schemas::SchemaAlkaneId;
 use borsh::{BorshDeserialize, BorshSerialize};
-
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Copy, Eq, PartialOrd, Ord)]
-pub struct SchemaAlkaneId {
-    pub block: u32,
-    pub tx: u64,
-}
 
 #[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Copy)]
 pub struct SchemaCandleV1 {
@@ -27,6 +22,7 @@ pub struct SchemaMarketDefs {
     pub quote_alkane_id: SchemaAlkaneId,
     pub pool_alkane_id: SchemaAlkaneId,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum TradeSide {
     Sell,

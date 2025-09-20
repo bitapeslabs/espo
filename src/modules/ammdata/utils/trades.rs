@@ -1,3 +1,4 @@
+use crate::schemas::SchemaAlkaneId;
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
@@ -7,7 +8,7 @@ use bitcoin::{
 };
 use borsh::{BorshDeserialize, to_vec};
 
-use crate::modules::ammdata::schemas::{SchemaAlkaneId, SchemaTradeV1};
+use crate::modules::ammdata::schemas::SchemaTradeV1;
 use crate::modules::ammdata::utils::candles::PriceSide;
 use crate::runtime::mdb::Mdb;
 

@@ -1,7 +1,7 @@
 use crate::modules::ammdata::consts::PRICE_SCALE;
-use crate::modules::ammdata::schemas::{
-    SchemaAlkaneId, SchemaCandleV1, SchemaFullCandleV1, Timeframe,
-};
+use crate::modules::ammdata::schemas::{SchemaCandleV1, SchemaFullCandleV1, Timeframe};
+use crate::schemas::SchemaAlkaneId;
+
 use crate::modules::ammdata::storage::{
     candle_key, candle_ns_prefix, decode_full_candle_v1, encode_full_candle_v1,
 };
