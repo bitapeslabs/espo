@@ -19,17 +19,16 @@ pub struct Mdb {
     db: Arc<DB>,
     prefix: Vec<u8>,
     // Keep the cache alive as long as this handle is alive (important!)
-    cache: Option<Cache>,
 }
 
 impl Mdb {
-    fn from_parts(db: Arc<DB>, prefix: impl AsRef<[u8]>, cache: Option<Cache>) -> Self {
-        Self { db, prefix: prefix.as_ref().to_vec(), cache }
+    fn from_parts(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {
+        Self { db, prefix: prefix.as_ref().to_vec() }
     }
 
     pub fn from_db(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {
         // Back-compat constructor (no custom options)
-        Self::from_parts(db, prefix, None)
+        Self::from_parts(db, prefix)
     }
 
     pub fn open(path: impl AsRef<Path>, prefix: impl AsRef<[u8]>) -> Result<Self, RocksError> {
@@ -53,7 +52,7 @@ impl Mdb {
 
         let db = DB::open(&opts, path)?;
 
-        let mdb = Self::from_parts(Arc::new(db), prefix, Some(cache));
+        let mdb = Self::from_parts(Arc::new(db), prefix);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace(); // best-effort
         }
@@ -77,7 +76,7 @@ impl Mdb {
         opts.set_block_based_table_factory(&table);
 
         let db = DB::open_for_read_only(&opts, path, error_if_log_file_exist)?;
-        let mdb = Self::from_parts(Arc::new(db), prefix, Some(cache));
+        let mdb = Self::from_parts(Arc::new(db), prefix);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace();
         }

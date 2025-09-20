@@ -1,3 +1,4 @@
+use super::super::consts::K_TOLERANCE;
 use crate::schemas::SchemaAlkaneId;
 use crate::{
     alkanes::trace::{
@@ -7,7 +8,6 @@ use crate::{
     modules::ammdata::schemas::SchemaMarketDefs,
 };
 use anyhow::{Context, Result, anyhow};
-use bitcoin::hashes::hash160::Hash;
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 
@@ -26,8 +26,6 @@ pub struct ReserveExtraction {
     pub volume: (u128, u128),        // (base_in, quote_out)
     pub k_ratio_approx: Option<f64>, // best-effort diagnostic
 }
-
-const K_TOLERANCE: f64 = 0.001; // 0.1%
 
 pub fn extract_new_pools_from_espo_transaction(
     transaction: &EspoAlkanesTransaction,
@@ -172,14 +170,6 @@ pub fn extract_reserves_from_espo_transaction(
     transaction: &EspoAlkanesTransaction,
     pools: &HashMap<SchemaAlkaneId, SchemaMarketDefs>,
 ) -> Result<Vec<ReserveExtraction>> {
-    use crate::alkanes::trace::{
-        EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
-    };
-    use anyhow::{Context, anyhow};
-    use std::collections::HashMap;
-
-    /* ---------- helpers ---------- */
-
     let trace: EspoSandshrewLikeTrace = transaction.sandshrew_trace.clone();
 
     #[inline]
@@ -254,8 +244,6 @@ pub fn extract_reserves_from_espo_transaction(
     fn parse_hex_u128_be(s: &str) -> Result<u128> {
         Ok(u128::from_str_radix(strip_0x(s), 16)?)
     }
-
-    const K_TOLERANCE: f64 = 0.001; // 0.1%
 
     let evs = &trace.events;
     let mut results: Vec<ReserveExtraction> = Vec::new();

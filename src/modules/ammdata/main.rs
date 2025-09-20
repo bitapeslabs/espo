@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use bitcoin::Network;
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshDeserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

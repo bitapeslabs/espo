@@ -1,5 +1,3 @@
-use std::collections::{HashMap, HashSet};
-
 use crate::config::{get_electrum_client, get_metashrew_sdb};
 use crate::consts::TRACES_BY_BLOCK_PREFIX;
 use crate::runtime::sdb::SDB;
@@ -15,6 +13,7 @@ use protobuf::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,20 +125,6 @@ pub struct EspoBlock {
 /// Map of AlkaneId -> (key -> value), last-write-wins per key within a single trace.
 pub type AlkaneStorageChanges = HashMap<SchemaAlkaneId, HashMap<Vec<u8>, Vec<u8>>>;
 
-/// Convert proto uint128 to (hi, lo) as u128
-fn u128_from_proto(x: &alkanes::Uint128) -> u128 {
-    ((x.hi as u128) << 64) | (x.lo as u128)
-}
-
-/// Convert proto AlkaneId (uint128 fields) into your SchemaAlkaneId (u32, u64).
-/// Truncates safely assuming values fit (hi==0 for both fields). If not, we clamp.
-fn schema_id_from_proto(id: &alkanes::AlkaneId) -> SchemaAlkaneId {
-    let b = id.block.as_ref().map(u128_from_proto).unwrap_or(0);
-    let t = id.tx.as_ref().map(u128_from_proto).unwrap_or(0);
-    // Truncate with saturation (you can assert if you want strictness)
-    SchemaAlkaneId { block: (b as u64) as u32, tx: t as u64 }
-}
-
 /// Frame carries only the *active storage owner* (codeId is irrelevant for attribution here)
 #[derive(Clone, Copy, Debug)]
 struct Frame {
@@ -147,7 +132,7 @@ struct Frame {
 }
 
 /// Extract last-write-wins storage mutations per Alkane from a single protobuf trace.
-pub fn extract_alkane_storage(trace: &alkanes::AlkanesTrace) -> AlkaneStorageChanges {
+pub fn extract_alkane_storage(trace: &alkanes::AlkanesTrace) -> Result<AlkaneStorageChanges> {
     let mut out: AlkaneStorageChanges = HashMap::new();
     let mut stack: Vec<Frame> = Vec::with_capacity(16);
 
@@ -156,7 +141,6 @@ pub fn extract_alkane_storage(trace: &alkanes::AlkanesTrace) -> AlkaneStorageCha
         if let Some(evt) = &ev.event {
             match evt {
                 Event::EnterContext(enter) => {
-                    let call_ty = enter.call_type.enum_value_or_default();
                     let ctx = match enter.context.as_ref() {
                         Some(c) => c,
                         None => continue,
@@ -171,23 +155,8 @@ pub fn extract_alkane_storage(trace: &alkanes::AlkanesTrace) -> AlkaneStorageCha
                     };
 
                     // Determine storage owner based on call type
-                    let owner = match call_ty {
-                        alkanes::AlkanesTraceCallType::CALL => schema_id_from_proto(myself),
-                        alkanes::AlkanesTraceCallType::DELEGATECALL
-                        | alkanes::AlkanesTraceCallType::STATICCALL => {
-                            // inherit from parent if any, otherwise default to self
-                            stack
-                                .last()
-                                .map(|f| f.storage_owner)
-                                .unwrap_or_else(|| schema_id_from_proto(myself))
-                        }
-                        _ => {
-                            // Unknown/none: default to self
-                            schema_id_from_proto(myself)
-                        }
-                    };
 
-                    stack.push(Frame { storage_owner: owner });
+                    stack.push(Frame { storage_owner: myself.clone().try_into()? });
                 }
 
                 Event::ExitContext(exit) => {
@@ -225,7 +194,7 @@ pub fn extract_alkane_storage(trace: &alkanes::AlkanesTrace) -> AlkaneStorageCha
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn trace_block_prefix(block: &u64) -> Vec<u8> {
@@ -605,7 +574,7 @@ pub fn get_espo_block(block: u64) -> Result<EspoBlock> {
 
         let outpoint = EspoOutpoint { txid: txid_be, vout };
 
-        let storage_changes = extract_alkane_storage(&p.protobuf_trace);
+        let storage_changes = extract_alkane_storage(&p.protobuf_trace)?;
         /*
                 for (id, kvs) in &storage_changes {
                     let alkane_hex = format!("0x{:x}:0x{:x}", id.block, id.tx); // e.g., 0x4:0xfff2

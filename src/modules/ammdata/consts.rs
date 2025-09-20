@@ -4,7 +4,7 @@ use bitcoin::Network;
 
 pub fn ammdata_genesis_block(network: Network) -> u32 {
     match network {
-        Network::Bitcoin => 908_367,
+        Network::Bitcoin => 904_648,
         _ => 0,
     }
 }
@@ -20,3 +20,4 @@ pub const KEY_INDEX_HEIGHT: &[u8] = b"/index_height";
 pub const GET_RESERVES_OPCODE: u8 = 0x61;
 pub const DEPLOY_AMM_OPCODE: u8 = 0x01;
 pub const PRICE_SCALE: u128 = 100_000_000; // 1e18
+pub const K_TOLERANCE: f64 = 0.001; // 0.1%
