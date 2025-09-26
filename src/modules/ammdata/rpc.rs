@@ -1,3 +1,5 @@
+use crate::modules::ammdata::schemas::SchemaMarketDefs;
+use crate::modules::ammdata::utils::live_reserves::fetch_latest_reserves_for_pools;
 use crate::schemas::SchemaAlkaneId;
 use borsh::BorshDeserialize;
 use serde_json::map::Map;
@@ -17,7 +19,7 @@ use crate::runtime::mdb::Mdb;
 
 // === NEW: pathfinder ===
 use crate::modules::ammdata::utils::pathfinder::{
-    DEFAULT_FEE_BPS, plan_exact_in_default_fee, plan_exact_out_default_fee,
+    DEFAULT_FEE_BPS, plan_best_mev_swap, plan_exact_in_default_fee, plan_exact_out_default_fee,
     plan_implicit_default_fee, plan_swap_exact_tokens_for_tokens,
     plan_swap_exact_tokens_for_tokens_implicit, plan_swap_tokens_for_exact_tokens,
 };
@@ -311,97 +313,114 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
             })
             .await;
     });
-
-    /* -------------------- get_pools (MAP format) -------------------- */
     let mdb_pools = mdb.clone();
     let reg_pools = reg.clone();
     tokio::spawn(async move {
         reg_pools
-            .register("get_pools", move |_cx, payload| {
-                let mdb = mdb_pools.clone();
-                async move {
-                    const SNAP_KEY: &[u8] = b"/reserves_snapshot_v1";
+        .register("get_pools", move |_cx, payload| {
+            let mdb = mdb_pools.clone();
+            async move {
+                const SNAP_KEY: &[u8] = b"/reserves_snapshot_v1";
 
-                    // read snapshot (BTreeMap)
-                    let snapshot_btree = match mdb.get(SNAP_KEY) {
-                        Ok(Some(bytes)) => match SchemaReservesSnapshot::try_from_slice(&bytes) {
-                            Ok(snap) => snap.entries,
-                            Err(e) => {
-                                eprintln!("[RPC:get_pools] decode snapshot failed: {e:?}");
-                                Default::default()
-                            }
-                        },
-                        Ok(None) => Default::default(),
+                // 1) Read persisted snapshot (Borsh, ordered)
+                let snapshot_btree = match mdb.get(SNAP_KEY) {
+                    Ok(Some(bytes)) => match SchemaReservesSnapshot::try_from_slice(&bytes) {
+                        Ok(snap) => snap.entries,
                         Err(e) => {
-                            eprintln!("[RPC:get_pools] read snapshot failed: {e:?}");
+                            eprintln!("[RPC:get_pools] decode snapshot failed: {e:?}");
                             Default::default()
                         }
-                    };
-
-                    // page
-                    let rows: Vec<(&SchemaAlkaneId, &SchemaPoolSnapshot)> =
-                        snapshot_btree.iter().collect();
-                    let total = rows.len();
-                    let limit = payload
-                        .get("limit")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize)
-                        .unwrap_or(total.max(1))
-                        .clamp(1, 20_000);
-                    let page = payload
-                        .get("page")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize)
-                        .unwrap_or(1)
-                        .max(1);
-                    let offset = limit.saturating_mul(page.saturating_sub(1));
-                    let end = (offset + limit).min(total);
-                    let window = if offset >= total { &[][..] } else { &rows[offset..end] };
-                    let has_more = end < total;
-
-                    let mut pools_obj: Map<String, Value> = Map::with_capacity(window.len());
-                    for (pool, snap) in window.iter().copied() {
-                        let pool_id = id_str(pool);
-                        let base_id = id_str(&snap.base_id);
-                        let quote_id = id_str(&snap.quote_id);
-                        pools_obj.insert(
-                            pool_id,
-                            json!({
-                                "base": base_id,
-                                "quote": quote_id,
-                                "base_reserve":  snap.base_reserve.to_string(),
-                                "quote_reserve": snap.quote_reserve.to_string(),
-                            }),
-                        );
+                    },
+                    Ok(None) => Default::default(),
+                    Err(e) => {
+                        eprintln!("[RPC:get_pools] read snapshot failed: {e:?}");
+                        Default::default()
                     }
+                };
 
-                    json!({
-                        "ok": true,
-                        "page": page,
-                        "limit": limit,
-                        "total": total,
-                        "has_more": has_more,
-                        "pools": Value::Object(pools_obj)
-                    })
+                // 2) Build pools_map (pool -> {base,quote}) for live fetch
+                let mut pools_map: HashMap<SchemaAlkaneId, SchemaMarketDefs> =
+                    HashMap::with_capacity(snapshot_btree.len());
+                for (pool, snap) in snapshot_btree.iter() {
+                    pools_map.insert(
+                        *pool,
+                        SchemaMarketDefs {
+                            pool_alkane_id: *pool,
+                            base_alkane_id: snap.base_id,
+                            quote_alkane_id: snap.quote_id,
+                        },
+                    );
                 }
-            })
-            .await;
+
+                // 3) Try to fetch LIVE reserves; if it fails, we’ll fall back to snapshot only
+                let live_overrides = match fetch_latest_reserves_for_pools(&pools_map) {
+                    Ok(m) => {
+                        eprintln!("[RPC:get_pools] live reserves available for {} pools", m.len());
+                        m
+                    }
+                    Err(e) => {
+                        eprintln!("[RPC:get_pools] live reserves fetch failed: {e:?} (falling back to snapshot)");
+                        HashMap::new()
+                    }
+                };
+
+                // 4) Pagination over the ORDERED pool list from snapshot
+                let rows: Vec<(&SchemaAlkaneId, &SchemaPoolSnapshot)> =
+                    snapshot_btree.iter().collect();
+                let total = rows.len();
+
+                // default page size: all (bounded), same as before
+                let limit = payload
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(total.max(1))
+                    .clamp(1, 20_000);
+
+                let page = payload
+                    .get("page")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(1)
+                    .max(1);
+
+                let offset = limit.saturating_mul(page.saturating_sub(1));
+                let end = (offset + limit).min(total);
+                let window = if offset >= total { &[][..] } else { &rows[offset..end] };
+                let has_more = end < total;
+
+                // 5) Build response, **preferring LIVE** when available, else snapshot
+                let mut pools_obj: Map<String, Value> = Map::with_capacity(window.len());
+                for (pool, snap) in window.iter().copied() {
+                    let effective = live_overrides.get(pool).unwrap_or(snap);
+
+                    pools_obj.insert(
+                        format!("{}:{}", pool.block, pool.tx),
+                        json!({
+                            "base":          format!("{}:{}", effective.base_id.block,  effective.base_id.tx),
+                            "quote":         format!("{}:{}", effective.quote_id.block, effective.quote_id.tx),
+                            "base_reserve":  effective.base_reserve.to_string(),
+                            "quote_reserve": effective.quote_reserve.to_string(),
+                            // optional: report whether this row came from live or snapshot
+                            "source": if live_overrides.contains_key(pool) { "live" } else { "snapshot" },
+                        }),
+                    );
+                }
+
+                json!({
+                    "ok": true,
+                    "page": page,
+                    "limit": limit,
+                    "total": total,
+                    "has_more": has_more,
+                    "pools": Value::Object(pools_obj)
+                })
+            }
+        })
+        .await;
     });
 
-    /* -------------------- find_best_swap_path (NEW) -------------------- */
-    // Params:
-    // {
-    //   "mode": "exact_in" | "exact_out" | "implicit",
-    //   "token_in": "b:tx",
-    //   "token_out": "b:tx",
-    //   "amount_in": "<u128-dec>",          // for exact_in
-    //   "amount_out_min": "<u128-dec>",     // for exact_in | implicit
-    //   "amount_out": "<u128-dec>",         // for exact_out
-    //   "amount_in_max": "<u128-dec>",      // for exact_out
-    //   "fee_bps": 50,                      // optional (default 50 = 0.5%)
-    //   "max_hops": 3                       // optional (default 3)
-    // }
-    // Returns: best path with hops and totals (amounts as decimal strings)
+    /* -------------------- find_best_swap_path -------------------- */
     let mdb_path = mdb.clone();
     let reg_path = reg.clone();
     tokio::spawn(async move {
@@ -445,9 +464,6 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         Some(t) => t,
                         None => return json!({"ok": false, "error": "missing_or_invalid_token_out"}),
                     };
-                    if token_in == token_out {
-                        return json!({"ok": false, "error": "identical_tokens"});
-                    }
 
                     let fee_bps = payload.get("fee_bps").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(DEFAULT_FEE_BPS);
                     let max_hops = payload.get("max_hops").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(3).max(1).min(6);
@@ -528,6 +544,82 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                             })
                         }
                         None => json!({"ok": false, "error": "no_path_found"}),
+                    }
+                }
+            })
+            .await;
+    });
+
+    /* -------------------- get_best_mev_swap (NEW) -------------------- */
+    // Params:
+    // {
+    //   "token": "b:tx",            // required; start=end token for the cycle
+    //   "fee_bps": 50,              // optional; default DEFAULT_FEE_BPS
+    //   "max_hops": 3               // optional; default 3 (2..=6 enforced)
+    // }
+    // Returns: best profitable cycle with optimal amount_in maximizing (amount_out - amount_in).
+    let mdb_mev = mdb.clone();
+    let reg_mev = reg.clone();
+    tokio::spawn(async move {
+        reg_mev
+            .register("get_best_mev_swap", move |_cx, payload| {
+                let mdb = mdb_mev.clone();
+                async move {
+                    const SNAP_KEY: &[u8] = b"/reserves_snapshot_v1";
+
+                    // Load snapshot into a HashMap
+                    let snapshot_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = match mdb.get(SNAP_KEY) {
+                        Ok(Some(bytes)) => match SchemaReservesSnapshot::try_from_slice(&bytes) {
+                            Ok(snap) => snap.entries.into_iter().collect(),
+                            Err(e) => {
+                                eprintln!("[RPC:get_best_mev_swap] decode snapshot failed: {e:?}");
+                                HashMap::new()
+                            }
+                        },
+                        Ok(None) => HashMap::new(),
+                        Err(e) => {
+                            eprintln!("[RPC:get_best_mev_swap] read snapshot failed: {e:?}");
+                            HashMap::new()
+                        }
+                    };
+
+                    if snapshot_map.is_empty() {
+                        return json!({"ok": false, "error": "no_liquidity", "hint": "reserves snapshot is empty"});
+                    }
+
+                    // Parse params
+                    let token = match payload.get("token").and_then(|v| v.as_str()).and_then(parse_id_from_str) {
+                        Some(t) => t,
+                        None => return json!({"ok": false, "error": "missing_or_invalid_token"}),
+                    };
+                    let fee_bps = payload.get("fee_bps").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(DEFAULT_FEE_BPS);
+                    let max_hops = payload.get("max_hops").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(3);
+                    let max_hops = max_hops.clamp(2, 6); // cycles require at least 2 hops
+
+                    match plan_best_mev_swap(&snapshot_map, token, fee_bps, max_hops) {
+                        Some(pq) => {
+                            let hops: Vec<Value> = pq.hops.iter().map(|h| {
+                                json!({
+                                    "pool":       id_str(&h.pool),
+                                    "token_in":   id_str(&h.token_in),
+                                    "token_out":  id_str(&h.token_out),
+                                    "amount_in":  h.amount_in.to_string(),
+                                    "amount_out": h.amount_out.to_string(),
+                                })
+                            }).collect();
+
+                            json!({
+                                "ok": true,
+                                "token":   id_str(&token),
+                                "fee_bps": fee_bps,
+                                "max_hops": max_hops,
+                                "amount_in":  pq.amount_in.to_string(),
+                                "amount_out": pq.amount_out.to_string(),
+                                "profit": (pq.amount_out as i128 - pq.amount_in as i128).to_string(),
+                                "hops": hops
+                            })
+                        }
+                        None => json!({"ok": false, "error": "no_profitable_cycle"}),
                     }
                 }
             })

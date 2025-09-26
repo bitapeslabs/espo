@@ -1,121 +1,86 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# ---- usage ----
-if [[ $# -lt 3 ]]; then
-  echo "Usage: $0 <DB_PATH> <POOL_BLOCK_DEC> <POOL_TX_DEC>"
-  echo "Example: $0 ./db/espo 2 68441"
-  exit 1
+DB="/data/.metashrew/mainnetnew884"
+OUT="./dump.txt"
+
+# ASCII "/alkanes/" and "/balances/" in hex (lowercase, no 0x)
+HEX_ALKANES="2f616c6b616e65732f"
+HEX_BALANCES="2f62616c616e6365732f"
+
+# ---------------------------
+# AlkaneId(2,16) and (2,61993)
+# Two candidate encodings: VARINT64 and FIXED64 (little-endian)
+# ---------------------------
+
+# --- VARINT64 encoding we tried before ---
+# block=2 -> 0a04 08 00 10 02
+# tx=16   -> 12 04 08 00 10 10
+WHAT_HEX_VAR="0a0408001002120408001010"
+
+# block=2 -> 0a04 08 00 10 02
+# tx=61993 (0xF229 varint = a9 e4 03) -> 12 06 08 00 10 a9 e4 03
+WHO_HEX_VAR="0a04080010021206080010a9e403"
+
+# --- FIXED64 encoding (wire-type 1) ---
+# For Uint128 { hi: fixed64, lo: fixed64 } inside a nested message:
+# field tags: hi -> 0x09, lo -> 0x11
+# submessage length = 1+8 + 1+8 = 18 (0x12)
+# block=2 => hi=0, lo=2 -> lo bytes (LE) = 02 00 00 00 00 00 00 00
+# tx=16   => lo bytes (LE) = 10 00 00 00 00 00 00 00
+# tx=61993=> 61993=0xF229 -> LE 29 f2 00 00 00 00 00 00
+
+ZERO8="0000000000000000"
+LO2_LE="0200000000000000"
+LO16_LE="1000000000000000"
+LO61993_LE="29f2000000000000"
+
+BLOCK_FIXED="0a12""09${ZERO8}""11${LO2_LE}"
+TX16_FIXED="1212""09${ZERO8}""11${LO16_LE}"
+TX61993_FIXED="1212""09${ZERO8}""11${LO61993_LE}"
+
+WHAT_HEX_FIX="${BLOCK_FIXED}${TX16_FIXED}"
+WHO_HEX_FIX="${BLOCK_FIXED}${TX61993_FIXED}"
+
+# Build keys/prefixes for both encodings (ldb expects 0x with --key_hex)
+KEY_VAR="0x${HEX_ALKANES}${WHAT_HEX_VAR}${HEX_BALANCES}${WHO_HEX_VAR}"
+PFX_VAR="0x${HEX_ALKANES}${WHAT_HEX_VAR}${HEX_BALANCES}"
+TO_VAR="${PFX_VAR}ff"
+
+KEY_FIX="0x${HEX_ALKANES}${WHAT_HEX_FIX}${HEX_BALANCES}${WHO_HEX_FIX}"
+PFX_FIX="0x${HEX_ALKANES}${WHAT_HEX_FIX}${HEX_BALANCES}"
+TO_FIX="${PFX_FIX}ff"
+
+echo "== Trying EXACT GET (VARINT encoding) =="
+echo "Key: $KEY_VAR"
+ldb --db="$DB" get --key_hex "$KEY_VAR" --hex | tee "$OUT"
+if grep -qi "key not found" "$OUT"; then
+  echo
+  echo "== Range scan (VARINT) =="
+  echo "Range: [$PFX_VAR , $TO_VAR)"
+  if ! ldb --db="$DB" scan --hex --from="$PFX_VAR" --to="$TO_VAR" | tee -a "$OUT" | grep -qi "${PFX_VAR#0x}"; then
+    echo "== Fallback full scan + grep (VARINT) ==" | tee -a "$OUT"
+    ldb --db="$DB" scan --hex | grep -i "${PFX_VAR#0x}" | tee -a "$OUT" || true
+  fi
+else
+  echo "Found exact VARINT key (see $OUT)."
 fi
 
-DB="$1"
-PBLK="$2"
-PTX="$3"
-
-if ! command -v ldb >/dev/null 2>&1; then
-  echo "[!] 'ldb' not found. Install RocksDB tools (often package 'rocksdb-tools')."
-  exit 2
+echo
+echo "== Trying EXACT GET (FIXED64 encoding) =="
+echo "Key: $KEY_FIX"
+ldb --db="$DB" get --key_hex "$KEY_FIX" --hex | tee -a "$OUT"
+if grep -qi "key not found" "$OUT"; then
+  echo
+  echo "== Range scan (FIXED64) =="
+  echo "Range: [$PFX_FIX , $TO_FIX)"
+  if ! ldb --db="$DB" scan --hex --from="$PFX_FIX" --to="$TO_FIX" | tee -a "$OUT" | grep -qi "${PFX_FIX#0x}"; then
+    echo "== Fallback full scan + grep (FIXED64) ==" | tee -a "$OUT"
+    ldb --db="$DB" scan --hex | grep -i "${PFX_FIX#0x}" | tee -a "$OUT" || true
+  fi
+else
+  echo "Found exact FIXED64 key (see $OUT)."
 fi
 
-TS="$(date +%s)"
-OUT="rocksprobe_${PBLK}_${PTX}_${TS}"
-mkdir -p "$OUT"
-
-log() { echo "[i] $*"; }
-
-# ---- helpers ----
-asc2hex() { echo -n "$1" | xxd -p -c 999 | tr -d '\n' | tr 'a-f' 'A-F'; }
-range_to() { echo -n "${1}FF"; }   # append 0xFF sentinel to build open range
-
-scan_range() {
-  local title="$1"; local from_hex="$2"; local to_hex="$3"; local out="$4"
-  log "$title"
-  echo "[from]=0x${from_hex}"   > "$out"
-  echo "[to  ]=0x${to_hex}"    >> "$out"
-  ldb --db="$DB" scan --hex --from="0x${from_hex}" --to="0x${to_hex}" >> "$out" 2>>"$OUT/_errors.log" || true
-  local cnt
-  cnt=$(grep -c '==>' "$out" || true)
-  log "  -> ${cnt} entries  (file: $out)"
-}
-
-scan_prefix() {
-  local title="$1"; local prefix_ascii="$2"; local out="$3"
-  local phex; phex="$(asc2hex "$prefix_ascii")"
-  local tohex; tohex="$(range_to "$phex")"
-  scan_range "$title [$prefix_ascii]" "$phex" "$tohex" "$out"
-}
-
-# ---- namespaces (RELATIVE vs FULL) ----
-# Reader/writer now expect RELATIVE ("trades:*"), with DB layer adding "ammdata:" once.
-BASE_NS="ammdata:"
-TR_REL="trades:v1:${PBLK}:${PTX}:"
-IDX_REL="trades:idx:v1:${PBLK}:${PTX}:"
-
-TR_FULL="${BASE_NS}${TR_REL}"
-IDX_FULL="${BASE_NS}${IDX_REL}"
-
-# Also probe for the accidental double prefix form:
-TR_DBL="${BASE_NS}${BASE_NS}${TR_REL}"
-IDX_DBL="${BASE_NS}${BASE_NS}${IDX_REL}"
-
-log "DB=$DB"
-log "Pool (dec): ${PBLK}:${PTX}"
-log "Output dir : ${OUT}"
 echo
-
-# ---- global head sample (first 200 keys) ----
-log "[probe] first 200 keys (global) → ${OUT}/db_head.raw.txt"
-ldb --db="$DB" scan --hex --max_keys=200 > "${OUT}/db_head.raw.txt" 2>>"$OUT/_errors.log" || true
-echo
-
-# ---- primaries ----
-scan_prefix "[primary FULL]"    "${TR_FULL}" "${OUT}/primary_full.raw.txt"
-scan_prefix "[primary REL]"     "${TR_REL}"  "${OUT}/primary_rel.raw.txt"
-scan_prefix "[primary DOUBLE]"  "${TR_DBL}"  "${OUT}/primary_double.raw.txt"
-
-# ---- secondaries: all flavors (FULL / REL / DOUBLE) ----
-for flavor in ts absb absq sb_absb sq_absq sb_ts sq_ts; do
-  scan_prefix "[idx ${flavor} FULL]"   "${IDX_FULL}${flavor}:"   "${OUT}/idx_${flavor}_full.raw.txt"
-  scan_prefix "[idx ${flavor} REL]"    "${IDX_REL}${flavor}:"    "${OUT}/idx_${flavor}_rel.raw.txt"
-  scan_prefix "[idx ${flavor} DOUBLE]" "${IDX_DBL}${flavor}:"    "${OUT}/idx_${flavor}_double.raw.txt"
-done
-
-# ---- __count keys (FULL / REL / DOUBLE) ----
-COUNT_REL="${IDX_REL}__count"
-COUNT_FULL="${IDX_FULL}__count"
-COUNT_DBL="${IDX_DBL}__count"
-
-scan_prefix "[count FULL]"   "${COUNT_FULL}"   "${OUT}/count_full.raw.txt"
-scan_prefix "[count REL]"    "${COUNT_REL}"    "${OUT}/count_rel.raw.txt"
-scan_prefix "[count DOUBLE]" "${COUNT_DBL}"    "${OUT}/count_double.raw.txt"
-
-# ---- simple summary ----
-summ() {
-  local label="$1"; local path="$2"
-  local n=0
-  [[ -f "$path" ]] && n=$(grep -c '==>' "$path" || true)
-  printf "  %-28s %6d  %s\n" "$label" "$n" "$path"
-}
-
-echo
-echo "[summary] entries per dump:"
-summ "primary_full"        "${OUT}/primary_full.raw.txt"
-summ "primary_rel"         "${OUT}/primary_rel.raw.txt"
-summ "primary_double"      "${OUT}/primary_double.raw.txt"
-
-for flavor in ts absb absq sb_absb sq_absq sb_ts sq_ts; do
-  summ "idx_${flavor}_full"   "${OUT}/idx_${flavor}_full.raw.txt"
-  summ "idx_${flavor}_rel"    "${OUT}/idx_${flavor}_rel.raw.txt"
-  summ "idx_${flavor}_double" "${OUT}/idx_${flavor}_double.raw.txt"
-done
-
-summ "count_full"          "${OUT}/count_full.raw.txt"
-summ "count_rel"           "${OUT}/count_rel.raw.txt"
-summ "count_double"        "${OUT}/count_double.raw.txt"
-
-echo
-log "Done. Attach these files if anything is zero where it shouldn't be:"
-echo "  - ${OUT}/primary_full.raw.txt"
-echo "  - ${OUT}/idx_ts_full.raw.txt (and one of absb/absq)"
-echo "  - ${OUT}/count_full.raw.txt"
-echo "Also include ${OUT}/db_head.raw.txt (first 200 keys)."
+echo "Done. Full results -> $OUT"

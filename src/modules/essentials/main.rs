@@ -2,12 +2,15 @@ use crate::alkanes::trace::EspoBlock;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::consts::essentials_genesis_block;
 use crate::modules::essentials::rpc;
-use crate::runtime::mdb::Mdb;
+use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
 use bitcoin::hashes::Hash;
 use std::sync::Arc;
+
+// ✅ bring in balances bulk updater
+use crate::modules::essentials::utils::balances::bulk_update_balances_for_block;
 
 pub struct Essentials {
     mdb: Option<Arc<Mdb>>,
@@ -131,10 +134,18 @@ impl EspoModule for Essentials {
         // Pure write-only path: for every (alk, key)->value change
         //   - put value row
         //   - put directory marker row
-        let _ = mdb.bulk_write(|wb| {
+        let res = mdb.bulk_write(|wb: &mut MdbBatch<'_>| {
             for tx in block.transactions.iter() {
-                for (alk, kvs) in tx.storage_changes.iter() {
+                let storage_changes = match tx.traces.clone() {
+                    Some(traces) => {
+                        traces.iter().flat_map(|trace| trace.storage_changes.clone()).collect()
+                    }
+                    None => vec![],
+                };
+
+                for (alk, kvs) in storage_changes.iter() {
                     for (skey, (txid, value)) in kvs.iter() {
+                        // /values row
                         let k_kv = Essentials::k_kv(alk, skey);
 
                         // EXPECT: `txid` is 32 bytes (raw)
@@ -142,12 +153,7 @@ impl EspoModule for Essentials {
                         let mut buf = Vec::with_capacity(32 + value.len());
                         buf.extend_from_slice(&txid.to_byte_array());
                         buf.extend_from_slice(value);
-
                         wb.put(&k_kv, &buf);
-
-                        // dir marker: no read/merge; duplicates are fine
-                        let k_dir = Essentials::k_dir_entry(alk, skey);
-                        wb.put(&k_dir, &[]);
 
                         // dir marker: no read/merge; duplicates are fine
                         let k_dir = Essentials::k_dir_entry(alk, skey);
@@ -158,6 +164,20 @@ impl EspoModule for Essentials {
                 }
             }
         });
+
+        if let Err(e) = res {
+            eprintln!("[ESSENTIALS] bulk_write failed at block #{}: {e}", block.height);
+            return Err(e.into());
+        }
+
+        // ✅ also update alkane balances/holders for this block
+        if let Err(e) = bulk_update_balances_for_block(mdb, &block) {
+            eprintln!(
+                "[ESSENTIALS] bulk_update_balances_for_block failed at block #{}: {e}",
+                block.height
+            );
+            return Err(e);
+        }
 
         eprintln!("[ESSENTIALS] block #{} indexed {} key/value updates", block.height, total_pairs);
         self.set_index_height(block.height)?;

@@ -2,6 +2,8 @@ use alkanes_support::proto::alkanes::{AlkaneId, Uint128};
 use anyhow::{Context, Result, anyhow};
 use borsh::{BorshDeserialize, BorshSerialize};
 use protobuf::SpecialFields;
+use protorune_support::balance_sheet::IntoString;
+use std::fmt;
 
 #[derive(
     BorshSerialize,
@@ -87,5 +89,31 @@ impl TryFrom<SchemaAlkaneId> for AlkaneId {
             tx: protobuf::MessageField::some(tx_u),
             special_fields: SpecialFields::new(),
         })
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Eq, Hash, Default)]
+pub struct EspoOutpoint {
+    pub txid: Vec<u8>, // BE bytes
+    pub vout: u32,
+}
+
+impl EspoOutpoint {
+    pub fn as_outpoint_string(&self) -> String {
+        let mut reversed_txid_bytes = self.txid.clone();
+        reversed_txid_bytes.reverse();
+        format!("{}:{}", reversed_txid_bytes.to_str(), self.vout)
+    }
+}
+
+impl fmt::Display for EspoOutpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.txid.to_str(), self.vout)
+    }
+}
+impl fmt::Display for SchemaAlkaneId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // format as "block:tx" (decimal), e.g. "2:0"
+        write!(f, "{}:{}", self.block, self.tx)
     }
 }

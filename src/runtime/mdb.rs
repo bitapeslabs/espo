@@ -106,7 +106,7 @@ impl Mdb {
     }
 
     #[inline]
-    fn prefixed(&self, k: &[u8]) -> Vec<u8> {
+    pub fn prefixed(&self, k: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.prefix.len() + k.len());
         out.extend_from_slice(&self.prefix);
         out.extend_from_slice(k);

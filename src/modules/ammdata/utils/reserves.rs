@@ -1,9 +1,9 @@
 use super::super::consts::K_TOLERANCE;
+use crate::alkanes::trace::EspoTrace;
 use crate::schemas::SchemaAlkaneId;
 use crate::{
     alkanes::trace::{
-        EspoAlkanesTransaction, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
-        EspoSandshrewLikeTraceShortId,
+        EspoAlkanesTransaction, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
     },
     modules::ammdata::schemas::SchemaMarketDefs,
 };
@@ -31,7 +31,10 @@ pub fn extract_new_pools_from_espo_transaction(
     transaction: &EspoAlkanesTransaction,
 ) -> Result<Vec<(SchemaAlkaneId, SchemaMarketDefs)>> {
     /* ---------- helpers ---------- */
-    let trace: EspoSandshrewLikeTrace = transaction.sandshrew_trace.clone();
+    let traces: &Vec<EspoTrace> = match &transaction.traces {
+        Some(t) => t,
+        None => return Ok(vec![]), // 👈 bail early with empty Vec
+    };
 
     fn strip_0x(s: &str) -> &str {
         s.strip_prefix("0x").unwrap_or(s)
@@ -83,12 +86,13 @@ pub fn extract_new_pools_from_espo_transaction(
         Ok(SchemaAlkaneId { block: block_le as u32, tx: tx_le as u64 })
     }
 
-    /* ---------- collect IDs created in this tx ---------- */
     let mut created_ids: HashSet<(String, String)> = HashSet::new();
-    for ev in &trace.events {
-        if let EspoSandshrewLikeTraceEvent::Create(c) = ev {
-            // keep as hex-strings for quick comparison with call-stack ids
-            created_ids.insert((c.new_alkane.block.clone(), c.new_alkane.tx.clone()));
+    for trace in traces.clone() {
+        for ev in &trace.sandshrew_trace.events {
+            if let EspoSandshrewLikeTraceEvent::Create(c) = ev {
+                // keep as hex-strings for quick comparison with call-stack ids
+                created_ids.insert((c.new_alkane.block.clone(), c.new_alkane.tx.clone()));
+            }
         }
     }
 
@@ -102,76 +106,80 @@ pub fn extract_new_pools_from_espo_transaction(
     let mut results: Vec<(SchemaAlkaneId, SchemaMarketDefs)> = Vec::new();
     let mut seen_pools: HashSet<(u32, u64)> = HashSet::new(); // dedupe if multiple returns
 
-    for ev in &trace.events {
-        match ev {
-            EspoSandshrewLikeTraceEvent::Invoke(inv) => {
-                stack.push_back(inv.context.myself.clone());
-            }
-            EspoSandshrewLikeTraceEvent::Return(ret) => {
-                let leaving = match stack.pop_back() {
-                    Some(x) => x,
-                    None => continue,
-                };
-
-                // Only consider returns from contracts created in this same transaction.
-                if !created_ids.contains(&(leaving.block.clone(), leaving.tx.clone())) {
-                    continue;
+    for trace in traces {
+        for ev in &trace.sandshrew_trace.events {
+            match ev {
+                EspoSandshrewLikeTraceEvent::Invoke(inv) => {
+                    stack.push_back(inv.context.myself.clone());
                 }
+                EspoSandshrewLikeTraceEvent::Return(ret) => {
+                    let leaving = match stack.pop_back() {
+                        Some(x) => x,
+                        None => continue,
+                    };
 
-                // Look for both /alkane/0 and /alkane/1 in storage.
-                if ret.response.storage.is_empty() {
-                    continue;
-                }
-
-                let mut alk0: Option<&str> = None;
-                let mut alk1: Option<&str> = None;
-                for kv in &ret.response.storage {
-                    match kv.key.as_str() {
-                        "/alkane/0" => alk0 = Some(kv.value.as_str()),
-                        "/alkane/1" => alk1 = Some(kv.value.as_str()),
-                        _ => {}
+                    // Only consider returns from contracts created in this same transaction.
+                    if !created_ids.contains(&(leaving.block.clone(), leaving.tx.clone())) {
+                        continue;
                     }
+
+                    // Look for both /alkane/0 and /alkane/1 in storage.
+                    if ret.response.storage.is_empty() {
+                        continue;
+                    }
+
+                    let mut alk0: Option<&str> = None;
+                    let mut alk1: Option<&str> = None;
+                    for kv in &ret.response.storage {
+                        match kv.key.as_str() {
+                            "/alkane/0" => alk0 = Some(kv.value.as_str()),
+                            "/alkane/1" => alk1 = Some(kv.value.as_str()),
+                            _ => {}
+                        }
+                    }
+
+                    let (Some(v0), Some(v1)) = (alk0, alk1) else { continue };
+
+                    // Decode base/quote from the 32-byte LE encoded (block, tx) pairs.
+                    let base_id =
+                        schema_id_from_storage_val_32b(v0).context("decode /alkane/0 failed")?;
+                    let quote_id =
+                        schema_id_from_storage_val_32b(v1).context("decode /alkane/1 failed")?;
+
+                    let pool_id = schema_id_from_short(&leaving)
+                        .context("decode created pool id (leaving)")?;
+
+                    // Deduplicate in case multiple returns write the same keys.
+                    if !seen_pools.insert((pool_id.block, pool_id.tx)) {
+                        continue;
+                    }
+
+                    results.push((
+                        pool_id,
+                        SchemaMarketDefs {
+                            base_alkane_id: base_id,
+                            quote_alkane_id: quote_id,
+                            pool_alkane_id: pool_id,
+                        },
+                    ));
                 }
-
-                let (Some(v0), Some(v1)) = (alk0, alk1) else { continue };
-
-                // Decode base/quote from the 32-byte LE encoded (block, tx) pairs.
-                let base_id =
-                    schema_id_from_storage_val_32b(v0).context("decode /alkane/0 failed")?;
-                let quote_id =
-                    schema_id_from_storage_val_32b(v1).context("decode /alkane/1 failed")?;
-
-                let pool_id =
-                    schema_id_from_short(&leaving).context("decode created pool id (leaving)")?;
-
-                // Deduplicate in case multiple returns write the same keys.
-                if !seen_pools.insert((pool_id.block, pool_id.tx)) {
-                    continue;
+                EspoSandshrewLikeTraceEvent::Create(_c) => {
+                    // already captured above; nothing to do during streaming walk
                 }
-
-                results.push((
-                    pool_id,
-                    SchemaMarketDefs {
-                        base_alkane_id: base_id,
-                        quote_alkane_id: quote_id,
-                        pool_alkane_id: pool_id,
-                    },
-                ));
-            }
-            EspoSandshrewLikeTraceEvent::Create(_c) => {
-                // already captured above; nothing to do during streaming walk
             }
         }
     }
 
     Ok(results)
 }
-pub fn extract_reserves_from_espo_transaction(
+pub fn extract_reserves_from_espo_transaction<'a>(
     transaction: &EspoAlkanesTransaction,
     pools: &HashMap<SchemaAlkaneId, SchemaMarketDefs>,
 ) -> Result<Vec<ReserveExtraction>> {
-    let trace: EspoSandshrewLikeTrace = transaction.sandshrew_trace.clone();
-
+    let traces: &Vec<EspoTrace> = match &transaction.traces {
+        Some(t) => t,
+        None => return Ok(vec![]), // 👈 bail early with empty Vec
+    };
     #[inline]
     fn strip_0x(s: &str) -> &str {
         s.strip_prefix("0x").unwrap_or(s)
@@ -245,7 +253,11 @@ pub fn extract_reserves_from_espo_transaction(
         Ok(u128::from_str_radix(strip_0x(s), 16)?)
     }
 
-    let evs = &trace.events;
+    let evs: Vec<EspoSandshrewLikeTraceEvent> = traces
+        .into_iter()
+        .flat_map(|trace| trace.sandshrew_trace.events.clone())
+        .collect();
+
     let mut results: Vec<ReserveExtraction> = Vec::new();
     let mut i = 0usize;
 
@@ -276,8 +288,8 @@ pub fn extract_reserves_from_espo_transaction(
 
         // 2) the next two Return events must be identical (prev reserves)
         let r1 =
-            next_return_idx(evs, i + 1).ok_or_else(|| anyhow!("missing first reserves return"))?;
-        let r2 = next_return_idx(evs, r1 + 1)
+            next_return_idx(&evs, i + 1).ok_or_else(|| anyhow!("missing first reserves return"))?;
+        let r2 = next_return_idx(&evs, r1 + 1)
             .ok_or_else(|| anyhow!("missing second reserves return"))?;
 
         let (d1, d2) = match (&evs[r1], &evs[r2]) {

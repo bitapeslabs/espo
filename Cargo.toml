@@ -22,3 +22,7 @@ borsh = { version = "1.5.7", features = ["derive"] }
 futures = "0.3.31"
 tokio-stream = "0.1.17"
 tokio-serde = {version = "0.9.0", features = ["json"]}
+ordinals = { git = "https://github.com/kungfuflex/alkanes-rs" }
+protorune-support = { git = "https://github.com/kungfuflex/alkanes-rs" }
+bitcoincore-rpc = "0.19.0"
+lru = "0.16.1"

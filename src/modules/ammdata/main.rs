@@ -19,6 +19,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use super::rpc::register_rpc;
+// NEW: live reserves util
+use crate::modules::ammdata::utils::live_reserves::fetch_latest_reserves_for_pools;
 
 // Relative RocksDB key holding the entire reserves snapshot (BORSH)
 #[inline]
@@ -132,7 +134,6 @@ impl EspoModule for AmmData {
             };
 
         // Build an in-memory "pools_map" compatible with your extractor
-        // from the snapshot (pool -> SchemaMarketDefs), then add any newly created pools.
         let mut pools_map: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
         for (pool, snap) in reserves_snapshot.iter() {
             pools_map.insert(
@@ -149,13 +150,16 @@ impl EspoModule for AmmData {
         let mut trade_acc = TradeWriteAcc::new();
         let mut index_acc = TradeIndexAcc::new();
 
-        // Keep track of NEW/UPDATED entries for THIS block to merge into snapshot at end
+        // Deltas this block (event-derived updates)
         let mut reserves_map_delta: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = HashMap::new();
 
         for transaction in block.transactions.clone() {
-            // Discover newly created pools in this tx and insert them into BOTH:
-            //  (1) the in-memory pools_map (for extractors),
-            //  (2) the snapshot (with zero reserves until first update).
+            //Useless tx for ammdata
+            if !transaction.traces.is_some() {
+                continue;
+            }
+
+            // Discover newly created pools in this tx
             if let Ok(new_pools) = extract_new_pools_from_espo_transaction(&transaction) {
                 for (_pid, defs) in new_pools {
                     let pool = defs.pool_alkane_id;
@@ -187,7 +191,7 @@ impl EspoModule for AmmData {
                 }
             }
 
-            // reserves updates (using pools_map built from snapshot + new pools)
+            // reserves updates from swap events
             match extract_reserves_from_espo_transaction(&transaction, &pools_map) {
                 Ok(reserve_data_vec) => {
                     if reserve_data_vec.is_empty() {
@@ -204,7 +208,6 @@ impl EspoModule for AmmData {
 
                         let pool_schema = SchemaAlkaneId { block: pool_block_dec, tx: pool_tx_dec };
 
-                        // Lookup base/quote IDs from pools_map (must exist by now)
                         if let Some(defs) = pools_map.get(&pool_schema) {
                             reserves_map_delta.insert(
                                 pool_schema,
@@ -217,13 +220,11 @@ impl EspoModule for AmmData {
                             );
                         }
 
-                        let pool_id_dec = format!("{}:{}", pool_block_dec, pool_tx_dec);
-
                         let (prev_base, prev_quote) = rd.prev_reserves;
                         let (new_base, new_quote) = rd.new_reserves;
 
-                        let p_q_per_b = price_quote_per_base(new_base, new_quote); // quote/base
-                        let p_b_per_q = price_base_per_quote(new_base, new_quote); // base/quote
+                        let p_q_per_b = price_quote_per_base(new_base, new_quote);
+                        let p_b_per_q = price_base_per_quote(new_base, new_quote);
 
                         let (vol_base_in, vol_quote_out) = rd.volume;
 
@@ -265,19 +266,13 @@ impl EspoModule for AmmData {
                         };
 
                         println!(
-                            "[AMMDATA] Trade detected in pool {pool} @ block #{blk}, ts={ts}\n\
-                             [AMMDATA]   Tokens: base={base_id} | quote={quote_id}\n\
-                             [AMMDATA]   Δ: [base={d_base}, quote={d_quote}]\n\
-                             [AMMDATA]   Reserves: prev[base={p0}, quote={p1}] -> new[base={n0}, quote={n1}] | K≈{k}\n\
-                             [AMMDATA]   Volume: base_in={vbin}, quote_out={vqout}\n\
-                             [AMMDATA]   Prices (from NEW reserves): base→quote={pbq} | quote→base={pqb}",
-                            pool = pool_id_dec,
+                            "[AMMDATA] Trade detected in pool {pool}:{tx} @ block #{blk}, ts={ts}\n\
+                             [AMMDATA]   Δ: [base={d_base}, quote={d_quote}]  prev[{p0},{p1}] -> new[{n0},{n1}] | K≈{k}\n\
+                             [AMMDATA]   Prices: base→quote={pbq} | quote→base={pqb}  Volume: base_in={vbin}, quote_out={vqout}",
+                            pool = pool_block_dec,
+                            tx = pool_tx_dec,
                             blk = block.height,
                             ts = block_ts,
-                            base_id =
-                                format!("{}/{}", rd.token_ids.base.block, rd.token_ids.base.tx),
-                            quote_id =
-                                format!("{}/{}", rd.token_ids.quote.block, rd.token_ids.quote.tx),
                             d_base = d_base,
                             d_quote = d_quote,
                             p0 = prev_base,
@@ -285,14 +280,34 @@ impl EspoModule for AmmData {
                             n0 = new_base,
                             n1 = new_quote,
                             k = k_ratio_str,
-                            vbin = vol_base_in,
-                            vqout = vol_quote_out,
                             pbq = p_bq_str,
-                            pqb = p_qb_str
+                            pqb = p_qb_str,
+                            vbin = vol_base_in,
+                            vqout = vol_quote_out
                         );
                     }
                 }
                 Err(_) => continue,
+            }
+        }
+
+        // --- If this is the "latest" tip block: overwrite with real balances from Metashrew ---
+        if block.is_latest {
+            eprintln!("[AMMDATA] is_latest=true -> fetching live reserves from Metashrew…");
+            match fetch_latest_reserves_for_pools(&pools_map) {
+                Ok(live) => {
+                    // Overwrite snapshot + ensure it goes into this block’s delta
+                    for (pool, snap) in live {
+                        reserves_snapshot.insert(pool, snap.clone());
+                        reserves_map_delta.insert(pool, snap);
+                    }
+                    eprintln!("[AMMDATA] live reserves applied for {} pools", pools_map.len());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[AMMDATA] live reserves fetch failed: {e:?} (keeping event-derived state)"
+                    );
+                }
             }
         }
 
@@ -303,7 +318,6 @@ impl EspoModule for AmmData {
         let mut index_writes = index_acc.into_writes(); // RELATIVE keys
 
         // Update per-pool index counts (RELATIVE)
-        //let mut count_updates = 0usize;
         for ((blk_id, tx_id), delta) in idx_delta {
             let pool = SchemaAlkaneId { block: blk_id, tx: tx_id };
             let count_k_rel = crate::modules::ammdata::utils::trades::idx_count_key(&pool);
@@ -319,7 +333,6 @@ impl EspoModule for AmmData {
                 count_k_rel,
                 crate::modules::ammdata::utils::trades::encode_u64_be(newv).to_vec(),
             ));
-            //count_updates += 1;
         }
 
         // Merge this block’s deltas into the loaded snapshot and serialize it

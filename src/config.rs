@@ -6,10 +6,21 @@ use std::{fs, path::Path, sync::OnceLock, time::Duration};
 
 use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB};
 
+// NEW: Bitcoin Core RPC
+use bitcoincore_rpc::bitcoin::Network;
+use bitcoincore_rpc::{Auth, Client as CoreClient};
+
+// NEW: Block fetcher (blk files + RPC fallback)
+use crate::core::blockfetcher::BlkOrRpcBlockSource;
+
 static CONFIG: OnceLock<CliArgs> = OnceLock::new();
 static ELECTRUM_CLIENT: OnceLock<Client> = OnceLock::new();
+static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
 static METASHREW_SDB: OnceLock<std::sync::Arc<SDB>> = OnceLock::new();
 static ESPO_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
+
+// NEW: Global block source
+static BLOCK_SOURCE: OnceLock<BlkOrRpcBlockSource> = OnceLock::new();
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -19,6 +30,22 @@ pub struct CliArgs {
 
     #[arg(short, long)]
     pub electrum_rpc_url: String,
+
+    /// Full HTTP URL to Bitcoin Core's JSON-RPC (e.g. http://127.0.0.1:8332)
+    #[arg(long)]
+    pub bitcoind_rpc_url: String,
+
+    /// RPC username for Bitcoin Core
+    #[arg(long)]
+    pub bitcoind_rpc_user: String,
+
+    /// RPC password for Bitcoin Core
+    #[arg(long)]
+    pub bitcoind_rpc_pass: String,
+
+    /// Directory containing Core's blk*.dat files (e.g. ~/.bitcoin/blocks)
+    #[arg(long, default_value = "~/.bitcoin/blocks")]
+    pub bitcoind_blocks_dir: String,
 
     #[arg(short, long, default_value = "./db/tmp")]
     pub tmp_dbs_dir: String,
@@ -66,6 +93,15 @@ pub fn init_config() -> Result<()> {
         anyhow::bail!("espo_db_path is not a directory: {}", args.espo_db_path);
     }
 
+    // Validate blocks dir exists
+    let blocks_dir = Path::new(&args.bitcoind_blocks_dir);
+    if !blocks_dir.exists() {
+        anyhow::bail!("bitcoind blocks dir does not exist: {}", args.bitcoind_blocks_dir);
+    }
+    if !blocks_dir.is_dir() {
+        anyhow::bail!("bitcoind blocks dir is not a directory: {}", args.bitcoind_blocks_dir);
+    }
+
     if args.sdb_poll_ms == 0 {
         anyhow::bail!("sdb_poll_ms must be greater than 0");
     }
@@ -81,6 +117,15 @@ pub fn init_config() -> Result<()> {
     ELECTRUM_CLIENT
         .set(client)
         .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
+
+    // --- init Bitcoin Core RPC client once ---
+    let core = CoreClient::new(
+        &args.bitcoind_rpc_url,
+        Auth::UserPass(args.bitcoind_rpc_user.clone(), args.bitcoind_rpc_pass.clone()),
+    )?;
+    BITCOIND_CLIENT
+        .set(core)
+        .map_err(|_| anyhow::anyhow!("bitcoind rpc client already initialized"))?;
 
     // --- init Secondary RocksDB (SDB) once ---
     let secondary_path = get_sdb_path_for_metashrew()?;
@@ -104,12 +149,26 @@ pub fn init_config() -> Result<()> {
     Ok(())
 }
 
+/// Call this AFTER `init_config()`, when you know the `Network` (e.g., from `crate::consts::NETWORK`).
+pub fn init_block_source(network: Network) -> Result<()> {
+    let args = get_config();
+    let src = BlkOrRpcBlockSource::new_with_config(&args.bitcoind_blocks_dir, network)?;
+    BLOCK_SOURCE
+        .set(src)
+        .map_err(|_| anyhow::anyhow!("block source already initialized"))?;
+    Ok(())
+}
+
 pub fn get_config() -> &'static CliArgs {
     CONFIG.get().expect("init_config() must be called once at startup")
 }
 
 pub fn get_electrum_client() -> &'static Client {
     ELECTRUM_CLIENT.get().expect("init_config() must be called once at startup")
+}
+
+pub fn get_bitcoind_rpc_client() -> &'static CoreClient {
+    BITCOIND_CLIENT.get().expect("init_config() must be called once at startup")
 }
 
 /// Cloneable handle to the live secondary RocksDB
@@ -127,4 +186,11 @@ pub fn get_espo_db_path() -> &'static str {
 /// Cloneable handle to the global ESPO RocksDB
 pub fn get_espo_db() -> std::sync::Arc<DB> {
     std::sync::Arc::clone(ESPO_DB.get().expect("init_config() must be called once at startup"))
+}
+
+/// Global accessor for the block source (blk files + RPC fallback)
+pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
+    BLOCK_SOURCE
+        .get()
+        .expect("init_block_source() must be called after init_config()")
 }

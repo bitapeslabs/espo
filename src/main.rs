@@ -1,6 +1,7 @@
 pub mod alkanes;
 pub mod config;
 pub mod consts;
+pub mod core;
 pub mod modules;
 pub mod runtime;
 pub mod schemas;
@@ -10,11 +11,11 @@ pub mod utils;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::config::init_block_source;
 //modules
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
 use crate::utils::{EtaTracker, fmt_duration};
-
 use anyhow::{Context, Result};
 
 use crate::{
@@ -27,6 +28,7 @@ use crate::{
 #[tokio::main]
 async fn main() -> Result<()> {
     init_config()?;
+    init_block_source(NETWORK)?;
     let cfg = get_config();
 
     // Build module registry with the global ESPO DB
@@ -99,7 +101,7 @@ async fn main() -> Result<()> {
 
             eta.start_block();
 
-            match get_espo_block(next_height.into())
+            match get_espo_block(next_height.into(), tip.into())
                 .with_context(|| format!("failed to load espo block {next_height}"))
             {
                 Ok(espo_block) => {

@@ -1,20 +1,30 @@
-use crate::config::{get_electrum_client, get_metashrew_sdb};
+use crate::config::{
+    get_bitcoind_rpc_client, // still needed for prevout fallback
+    get_block_source,        // NEW: use BlockSource for full blocks
+    get_electrum_client,
+    get_metashrew_sdb,
+};
 use crate::consts::TRACES_BY_BLOCK_PREFIX;
+use crate::core::blockfetcher::BlockSource;
 use crate::runtime::sdb::SDB;
+use crate::schemas::EspoOutpoint;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::proto::alkanes;
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result};
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
+use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
+use bitcoincore_rpc::RpcApi; // <-- bring trait into scope
+
+// use bitcoincore_rpc::RpcApi; // REMOVED: block fetch now via BlockSource
 use electrum_client::ElectrumApi;
 use protobuf::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EspoSandshrewLikeTrace {
@@ -96,29 +106,34 @@ pub struct EspoSandshrewLikeTraceCreateData {
     #[serde(rename = "newAlkane")]
     pub new_alkane: EspoSandshrewLikeTraceShortId,
 }
+
 #[derive(Clone)]
-pub struct EspoOutpoint {
-    pub txid: Vec<u8>,
-    pub vout: u32,
-}
 pub struct PartialEspoTrace {
     pub protobuf_trace: AlkanesTrace,
-    pub outpoint: Vec<u8>,
+    pub outpoint: Vec<u8>, // [32 txid_le | 4 vout_le]
 }
+
 #[derive(Clone)]
-pub struct EspoAlkanesTransaction {
+pub struct EspoTrace {
     pub sandshrew_trace: EspoSandshrewLikeTrace,
     pub protobuf_trace: AlkanesTrace,
     pub storage_changes: AlkaneStorageChanges,
     pub outpoint: EspoOutpoint,
+}
+
+#[derive(Clone)]
+pub struct EspoAlkanesTransaction {
+    pub traces: Option<Vec<EspoTrace>>,
     pub transaction: Transaction,
 }
+
 #[derive(Clone)]
 pub struct EspoBlock {
+    pub is_latest: bool,
     pub height: u32,
     pub block_header: Header,
     pub transactions: Vec<EspoAlkanesTransaction>,
-    //All related prevouts for this block
+    // All related prevouts for this block
     pub prevouts: HashMap<Txid, Transaction>,
 }
 
@@ -130,14 +145,8 @@ pub fn extract_alkane_storage(
     trace: &alkanes::AlkanesTrace,
     transaction: &Transaction,
 ) -> anyhow::Result<AlkaneStorageChanges> {
-    // AlkaneStorageChanges = HashMap<SchemaAlkaneId, HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>>
-    // where inner value is (txid_le, raw_value)
     let mut out: AlkaneStorageChanges = HashMap::new();
-
-    // stack of "frames" — each frame carries the 'myself' alkane id for that call depth
     let mut stack: Vec<SchemaAlkaneId> = Vec::with_capacity(16);
-
-    // precompute txid (we store LE bytes; RPC flips to BE for display)
     let txid: Txid = transaction.compute_txid();
 
     use alkanes::alkanes_trace_event::Event;
@@ -145,37 +154,27 @@ pub fn extract_alkane_storage(
         if let Some(evt) = &ev.event {
             match evt {
                 Event::EnterContext(enter) => {
-                    // push this frame's 'myself' so the matching Exit uses it
                     if let Some(ctx) = enter.context.as_ref() {
                         if let Some(inner) = ctx.inner.as_ref() {
                             if let Some(myself) = inner.myself.as_ref() {
-                                // pair calls/returns strictly by nesting; delegate/static don't matter here
                                 let owner: SchemaAlkaneId = myself.clone().try_into()?;
                                 stack.push(owner);
                             }
                         }
                     }
                 }
-
                 Event::ExitContext(exit) => {
-                    // pop the frame that this return corresponds to; if stack’s empty, skip
                     let Some(owner) = stack.pop() else { continue };
-
                     if let Some(resp) = exit.response.as_ref() {
-                        // last-write-wins per key within this single trace
                         let entry = out.entry(owner).or_insert_with(HashMap::new);
                         for kv in &resp.storage {
-                            let k = kv.key.clone(); // raw key bytes (already bytes in proto)
-                            let v = kv.value.clone(); // raw value bytes
+                            let k = kv.key.clone();
+                            let v = kv.value.clone();
                             entry.insert(k, (txid, v));
                         }
                     }
                 }
-
-                Event::CreateAlkane(_create) => {
-                    // no storage attribution here
-                }
-
+                Event::CreateAlkane(_create) => {}
                 _ => {}
             }
         }
@@ -191,6 +190,7 @@ fn trace_block_prefix(block: &u64) -> Vec<u8> {
     v.push(b'/');
     v
 }
+
 fn next_prefix(mut p: Vec<u8>) -> Option<Vec<u8>> {
     for i in (0..p.len()).rev() {
         if p[i] != 0xff {
@@ -201,6 +201,7 @@ fn next_prefix(mut p: Vec<u8>) -> Option<Vec<u8>> {
     }
     None
 }
+
 fn is_length_bucket(key: &[u8], prefix: &[u8]) -> bool {
     if key.len() < prefix.len() + 1 + 4 {
         return false;
@@ -208,8 +209,9 @@ fn is_length_bucket(key: &[u8], prefix: &[u8]) -> bool {
     let bucket = &key[prefix.len()..key.len() - 4];
     bucket == b"length"
 }
+
 pub fn collect_outpoints_for_block(db: &SDB, block: &u64) -> Result<Vec<Vec<u8>>> {
-    let prefix = trace_block_prefix(&block);
+    let prefix = trace_block_prefix(block);
     let mut ro = ReadOptions::default();
     if let Some(ub) = next_prefix(prefix.clone()) {
         ro.set_iterate_upper_bound(ub);
@@ -238,13 +240,7 @@ pub fn collect_outpoints_for_block(db: &SDB, block: &u64) -> Result<Vec<Vec<u8>>
 }
 
 pub fn outpoint_bytes_to_key(bytes: &Vec<u8>) -> Vec<u8> {
-    vec![
-        TRACES_BY_BLOCK_PREFIX,
-        &bytes.to_vec(),
-        //extra padding cuz why tf not
-        &vec![0x00, 0x00, 0x00, 0x00],
-    ]
-    .concat()
+    vec![TRACES_BY_BLOCK_PREFIX, &bytes.to_vec(), &vec![0x00, 0x00, 0x00, 0x00]].concat()
 }
 
 fn fmt_u128_hex(u: &alkanes::Uint128) -> String {
@@ -252,7 +248,6 @@ fn fmt_u128_hex(u: &alkanes::Uint128) -> String {
     format!("0x{:x}", v)
 }
 
-/// Bytes -> 0x-hex
 fn fmt_bytes_hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(2 + b.len() * 2);
     s.push_str("0x");
@@ -263,7 +258,6 @@ fn fmt_bytes_hex(b: &[u8]) -> String {
     s
 }
 
-/// Bytes -> String; if not valid UTF-8, fall back to 0x-hex
 fn bytes_to_string_or_hex(b: &[u8]) -> String {
     match std::str::from_utf8(b) {
         Ok(s) => s.to_string(),
@@ -279,8 +273,6 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
             use alkanes::alkanes_trace_event::Event;
             match event {
                 Event::EnterContext(enter) => {
-                    // NOTE: enum wrapper -> unwrap
-
                     let typ = match enter.call_type.enum_value_or_default() {
                         alkanes::AlkanesTraceCallType::CALL => "call",
                         alkanes::AlkanesTraceCallType::DELEGATECALL => "delegatecall",
@@ -301,7 +293,8 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
 
                     let inputs_hex: Vec<String> = inner.inputs.iter().map(fmt_u128_hex).collect();
 
-                    let incoming_alkanes: Vec<Value> = inner.incoming_alkanes
+                    let incoming_alkanes: Vec<Value> = inner
+                        .incoming_alkanes
                         .iter()
                         .map(|t| {
                             let id = t.id.as_ref();
@@ -315,8 +308,7 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                         })
                         .collect();
 
-                    out.push(
-                        json!({
+                    out.push(json!({
                         "event": "invoke",
                         "data": {
                             "type": typ,
@@ -335,8 +327,7 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                             },
                             "fuel": ctx.fuel,
                         }
-                    })
-                    );
+                    }));
                 }
 
                 Event::ExitContext(exit) => {
@@ -354,12 +345,12 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                                 .map(|t| {
                                     let id = t.id.as_ref();
                                     json!({
-                                    "id": {
-                                        "block": id.and_then(|x| x.block.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                        "tx":    id.and_then(|x| x.tx.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                    },
-                                    "value": t.value.as_ref().map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                })
+                                        "id": {
+                                            "block": id.and_then(|x| x.block.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
+                                            "tx":    id.and_then(|x| x.tx.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
+                                        },
+                                        "value": t.value.as_ref().map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
+                                    })
                                 })
                                 .collect()
                         })
@@ -418,6 +409,7 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
 
     Ok(serde_json::to_string(&out).context("serialize normalized events")?)
 }
+
 fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
     let (txid_le, vout_le) = outpoint.split_at(32);
     let mut txid_be = txid_le.to_vec();
@@ -440,7 +432,7 @@ fn parse_trace_maybe_with_trailer(mut bytes: Vec<u8>) -> Option<AlkanesTrace> {
 
 pub fn traces_for_block_as_protobuf(db: &SDB, block: u64) -> Result<Vec<PartialEspoTrace>> {
     let outpoints = collect_outpoints_for_block(db, &block)
-        .with_context(|| format!("collect_outpoints_for_block({block}) failed"))?; // Vec<Vec<u8>>
+        .with_context(|| format!("collect_outpoints_for_block({block}) failed"))?;
 
     let keys: Vec<Vec<u8>> = outpoints.iter().map(|op| outpoint_bytes_to_key(op)).collect();
 
@@ -465,13 +457,12 @@ pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
     let mut entries: Vec<serde_json::Value> = Vec::new();
 
     for partial_trace in partial_traces {
-        // already-JSON string -> Value
         let events_v: serde_json::Value =
             serde_json::from_str(&prettyify_protobuf_trace_json(&partial_trace.protobuf_trace)?)?;
 
         entries.push(json!({
             "outpoint": outpoint_bytes_to_display(&partial_trace.outpoint),
-            "events": events_v, // <-- Value, not a string
+            "events": events_v,
         }));
     }
 
@@ -481,11 +472,23 @@ pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
     Ok(final_json)
 }
 
-fn collect_prevouts_txids_for_block(transactions: &Vec<EspoAlkanesTransaction>) -> Vec<Txid> {
+/// Collect unique prevout txids for all non-coinbase inputs in these transactions.
+/// Only consider txs that have at least one trace (to keep prevout fetch bounded).
+fn collect_prevouts_txids_for_traced_block(
+    transactions: &Vec<EspoAlkanesTransaction>,
+) -> Vec<Txid> {
     let mut prevout_txid_set = HashSet::new();
 
     for transaction in transactions {
+        // only consider txs that have at least one trace
+        if transaction.traces.is_none() {
+            continue;
+        }
         for vin in &transaction.transaction.input {
+            // Skip coinbase/null prevout (txid = 0..0, vout = 0xffffffff)
+            if vin.previous_output.is_null() {
+                continue;
+            }
             prevout_txid_set.insert(vin.previous_output.txid);
         }
     }
@@ -493,104 +496,180 @@ fn collect_prevouts_txids_for_block(transactions: &Vec<EspoAlkanesTransaction>) 
     prevout_txid_set.into_iter().collect()
 }
 
-fn get_bulk_txs_from_electrum(txids: Vec<Txid>) -> Result<HashMap<Txid, Transaction>> {
-    let client = get_electrum_client();
-
-    let raw_txs: Vec<Vec<u8>> = client
-        .batch_transaction_get_raw(&txids)
-        .context("electrum batch_transaction_get_raw failed")?;
-
-    let mut tx_map: HashMap<Txid, Transaction> = HashMap::with_capacity(txids.len());
-    for (i, tx_bytes) in raw_txs.into_iter().enumerate() {
-        let tx: Transaction = deserialize(&tx_bytes).context("deserialize tx")?;
-        tx_map.insert(txids[i], tx);
+/// Robust prevout fetcher:
+/// - Try Electrum in chunks
+/// - If a chunk fails, try per-tx Electrum
+/// - If Electrum still says "missing transaction", fall back to bitcoind RPC (needs txindex=1)
+fn fetch_prevouts(prevout_txids: Vec<Txid>) -> Result<HashMap<Txid, Transaction>> {
+    let mut out: HashMap<Txid, Transaction> = HashMap::with_capacity(prevout_txids.len());
+    if prevout_txids.is_empty() {
+        return Ok(out);
     }
 
-    Ok(tx_map)
-}
+    const CHUNK: usize = 256;
+    let electrum = get_electrum_client();
+    let core = get_bitcoind_rpc_client();
 
-pub fn get_espo_block(block: u64) -> Result<EspoBlock> {
-    let metashrew_sdb = &get_metashrew_sdb();
-    let client = get_electrum_client();
+    #[inline]
+    fn insert_raw_into(
+        out: &mut HashMap<Txid, Transaction>,
+        txid: Txid,
+        raw: Vec<u8>,
+    ) -> Result<()> {
+        let tx: Transaction = deserialize(&raw).context("deserialize prevout tx")?;
+        out.insert(txid, tx);
+        Ok(())
+    }
 
-    let partials = traces_for_block_as_protobuf(metashrew_sdb, block)
-        .with_context(|| format!("failed traces_for_block_as_protobuf({block})"))?;
+    // First pass: try batched Electrum
+    for chunk in prevout_txids.chunks(CHUNK) {
+        match electrum.batch_transaction_get_raw(chunk) {
+            Ok(raws) => {
+                for (i, raw) in raws.into_iter().enumerate() {
+                    let txid = chunk[i];
 
-    let mut uniq_txids: Vec<Txid> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for p in &partials {
-        let (txid_le, _vout_le) = p.outpoint.split_at(32);
-        let mut txid_be = txid_le.to_vec();
-        txid_be.reverse();
-        let txid_hex = hex::encode(txid_be);
-        if seen.insert(txid_hex.clone()) {
-            let txid = Txid::from_str(&txid_hex)
-                .with_context(|| format!("invalid txid hex: {txid_hex}"))?;
-            uniq_txids.push(txid);
+                    if raw.is_empty() {
+                        // Fallback for just this txid
+                        match electrum.transaction_get_raw(&txid) {
+                            Ok(raw2) if !raw2.is_empty() => {
+                                insert_raw_into(&mut out, txid, raw2)?;
+                            }
+                            _ => {
+                                let tx =
+                                    core.get_raw_transaction(&txid, None).with_context(|| {
+                                        format!("bitcoind: getrawtransaction({txid})")
+                                    })?;
+                                out.insert(txid, tx);
+                            }
+                        }
+                    } else {
+                        insert_raw_into(&mut out, txid, raw)?;
+                    }
+                }
+            }
+            Err(_) => {
+                // Fall back to per-tx Electrum, then Core
+                for txid in chunk {
+                    match electrum.transaction_get_raw(txid) {
+                        Ok(raw) if !raw.is_empty() => {
+                            insert_raw_into(&mut out, *txid, raw)?;
+                        }
+                        _ => {
+                            let tx = core
+                                .get_raw_transaction(txid, None)
+                                .with_context(|| format!("bitcoind: getrawtransaction({txid})"))?;
+                            out.insert(*txid, tx);
+                        }
+                    }
+                }
+            }
         }
     }
 
-    let tx_map = get_bulk_txs_from_electrum(uniq_txids)?;
+    Ok(out)
+}
 
-    let block_header: bitcoin::block::Header =
-        client.block_header(block as usize).context("electrum block_header failed")?;
+/// Build a map { txid_be_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
+fn traces_for_block_indexed(
+    db: &SDB,
+    block: u64,
+) -> Result<HashMap<String, Vec<(u32, PartialEspoTrace)>>> {
+    let partials = traces_for_block_as_protobuf(db, block)
+        .with_context(|| format!("failed traces_for_block_as_protobuf({block})"))?;
 
-    let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(partials.len());
+    let mut map: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     for p in partials {
-        // outpoint -> txid (BE hex) + vout
         let (txid_le, vout_le) = p.outpoint.split_at(32);
         let mut txid_be = txid_le.to_vec();
         txid_be.reverse();
         let txid_hex = hex::encode(&txid_be);
-        let txid =
-            Txid::from_str(&txid_hex).with_context(|| format!("invalid txid hex: {txid_hex}"))?;
         let vout = u32::from_le_bytes(vout_le.try_into().expect("vout 4 bytes"));
-
-        let events_json_str = prettyify_protobuf_trace_json(&p.protobuf_trace)?;
-        let events: Vec<EspoSandshrewLikeTraceEvent> =
-            serde_json::from_str(&events_json_str).context("deserialize sandshrew-like events")?;
-
-        let sandshrew_trace =
-            EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
-
-        let transaction = tx_map
-            .get(&txid)
-            .cloned()
-            .with_context(|| format!("missing raw tx for {txid}"))?;
-
-        let outpoint = EspoOutpoint { txid: txid_be, vout };
-
-        let storage_changes = extract_alkane_storage(&p.protobuf_trace, &transaction)?;
-        /*
-                for (id, kvs) in &storage_changes {
-                    let alkane_hex = format!("0x{:x}:0x{:x}", id.block, id.tx); // e.g., 0x4:0xfff2
-                    for (k, v) in kvs {
-                        println!(
-                            "[indexer_debug] storage change {} => {} on {}",
-                            fmt_bytes_hex(k),
-                            fmt_bytes_hex(v),
-                            alkane_hex
-                        );
-                    }
-                }
-        */
-        txs.push(EspoAlkanesTransaction {
-            sandshrew_trace,
-            protobuf_trace: p.protobuf_trace,
-            storage_changes,
-            outpoint,
-            transaction,
-        });
+        map.entry(txid_hex).or_default().push((vout, p));
     }
-    let prevout_txids = collect_prevouts_txids_for_block(&txs);
 
-    let prev_txs_map = get_bulk_txs_from_electrum(prevout_txids)?;
+    for v in map.values_mut() {
+        v.sort_by_key(|(vout, _)| *vout);
+    }
+    Ok(map)
+}
+
+/// Use the BlockSource for the block (header + transactions), Electrum for prevouts.
+/// Traces are now **multiple per transaction** and are stitched in per outpoint (vout).
+pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
+    let metashrew_sdb = &get_metashrew_sdb();
+    let block_source = get_block_source();
+
+    // Use block source instead of direct bitcoind get_block
+    let h32: u32 = block
+        .try_into()
+        .context("block height does not fit into u32 for get_espo_block")?;
+    let tip32: u32 =
+        tip.try_into().context("tip height does not fit into u32 for get_espo_block")?;
+
+    let full_block = block_source
+        .get_block_by_height(h32, tip32)
+        .context("BlockSource: get_block_by_height")?;
+
+    // Header from block source
+    let block_header: Header = full_block.header.clone();
+
+    // 2) Index traces present in DB for this block (by txid hex -> Vec<(vout, Partial)>)
+    let traces_index = traces_for_block_indexed(metashrew_sdb, block)?;
+
+    // 3) Build EspoAlkanesTransaction for **every** tx in this block
+    let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(full_block.txdata.len());
+
+    for tx in full_block.txdata.into_iter() {
+        let txid = tx.compute_txid();
+        let txid_hex = txid.to_string();
+
+        let traces_opt: Option<Vec<EspoTrace>> = if let Some(vouts_partials) =
+            traces_index.get(&txid_hex)
+        {
+            // Collect ALL traces for this tx, one per (vout, partial)
+            let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
+
+            for (vout, partial) in vouts_partials.iter() {
+                // Render Sandshrew-like JSON events from protobuf
+                let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
+                let events: Vec<EspoSandshrewLikeTraceEvent> =
+                    serde_json::from_str(&events_json_str)
+                        .context("deserialize sandshrew-like events")?;
+
+                let sandshrew_trace =
+                    EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
+
+                let storage_changes = extract_alkane_storage(&partial.protobuf_trace, &tx)?;
+
+                let outpoint = EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout: *vout };
+
+                traces_vec.push(EspoTrace {
+                    sandshrew_trace,
+                    protobuf_trace: partial.protobuf_trace.clone(),
+                    storage_changes,
+                    outpoint,
+                });
+            }
+
+            Some(traces_vec)
+        } else {
+            None
+        };
+
+        txs.push(EspoAlkanesTransaction { traces: traces_opt, transaction: tx });
+    }
+
+    // 4) Fetch ALL prevouts referenced by those transactions (skip coinbase) with robust fallback
+    let prevout_txids = collect_prevouts_txids_for_traced_block(&txs);
+    let prevouts = fetch_prevouts(prevout_txids)?;
 
     Ok(EspoBlock {
         block_header,
         transactions: txs,
-        height: block.try_into()?,
-        prevouts: prev_txs_map,
+        height: block
+            .try_into()
+            .context("block height does not fit into u32 for EspoBlock::height")?,
+        prevouts,
+        is_latest: block == tip,
     })
 }
