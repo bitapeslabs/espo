@@ -1,0 +1,42 @@
+Business Source License 1.1
+
+Licensor: Enclo Creations
+
+Licensed Work: Pizza.fun and all associated source code in this repository.
+
+The Licensed Work is licensed under the Business Source License 1.1 (the “License”) provided below.
+
+Purpose: The purpose of this License is to allow the use of the Licensed Work, including for commercial purposes, while **disallowing use by competing products or services**.
+
+Change Date: Four years from the date of first publicly available commit in this repository.
+
+Change License: Apache License, Version 2.0
+
+Terms:
+
+1. **Grant of Rights**
+   Effective on the date the Licensed Work is first made publicly available, you may copy, modify, run, and distribute the Licensed Work, subject to the restrictions below.
+
+2. **Restrictions**
+
+   a. You may not use the Licensed Work, or any part of it, to build or offer a product or service that is **directly competitive with Pizza.fun**.
+
+   b. A product or service is considered **directly competitive** if it facilitates the launch, minting, listing, or sale of tokens on the Bitcoin blockchain using meta-protocols, in a manner substantially similar to Pizza.fun’s purpose, including but not limited to token launchpads, meme coin deployment platforms, or similar services.
+
+   c. This restriction applies even if the competing product is not identical, open source, or commercialized.
+
+3. **Change Date and Conversion**
+
+   On the Change Date, the License will automatically convert to the Change License stated above (Apache 2.0), allowing unrestricted use of the Licensed Work.
+
+4. **Additional Use Grant**
+
+   You may use the Licensed Work for any purpose, including commercial use, provided that such use does **not** violate Section 2.
+
+5. **Termination**
+
+   If you use the Licensed Work in violation of this License, your rights under this License will automatically terminate.
+
+6. **Disclaimer**
+
+   THE LICENSED WORK IS PROVIDED “AS IS” WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. THE LICENSOR DISCLAIMS ALL WARRANTIES INCLUDING, BUT NOT LIMITED TO, MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY DAMAGES RESULTING FROM THE USE OF THE LICENSED WORK.
