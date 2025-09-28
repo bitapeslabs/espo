@@ -56,7 +56,10 @@ fn holders_key(alk: &SchemaAlkaneId) -> Vec<u8> {
     k.extend_from_slice(&alk.tx.to_be_bytes());
     k
 }
-
+#[inline]
+fn tx_has_op_return(tx: &Transaction) -> bool {
+    tx.output.iter().any(|o| is_op_return(&o.script_pubkey))
+}
 // /outpoint_addr/{borsh(EspoOutpoint)} -> address (utf8)
 fn outpoint_addr_key(outp: &EspoOutpoint) -> Result<Vec<u8>> {
     let mut k = b"/outpoint_addr/".to_vec();
@@ -429,24 +432,89 @@ fn apply_transfers_multi(
         }
         let out_idx = u128_to_u32(ed.output)?;
         let rid = schema_id_from_parts(ed.id.block, ed.id.tx)?;
+
+        // ---- SPECIAL: multicast target (output == n_outputs) ----
+        if out_idx == multicast_index {
+            if spendable_vouts.is_empty() {
+                return Ok(());
+            }
+
+            // how much is available on the sheet for this rune
+            let entry = sheet.entry(rid).or_default();
+            let have = *entry;
+            if have == 0 {
+                return Ok(());
+            }
+
+            if ed.amount == 0 {
+                // even split of ALL available (what you already had working)
+                let mut delta = BTreeMap::new();
+                delta.insert(rid, have);
+                // zero it out from the sheet before routing
+                *entry = 0;
+                sheet.remove(&rid);
+
+                route_delta(
+                    out_idx,
+                    &delta,
+                    out_map,
+                    incoming_shadow,
+                    tx,
+                    spendable_vouts,
+                    n_outputs,
+                    multicast_index,
+                    shadow_base,
+                    shadow_end,
+                );
+            } else {
+                // amount > 0 → treat ed.amount as PER-VOUT CAP, and use ALL available
+                let mut remaining = have;
+                let mut used: u128 = 0;
+
+                for v in spendable_vouts {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let give = remaining.min(ed.amount);
+                    if give == 0 {
+                        break;
+                    }
+                    out_map.entry(*v).or_default().push(BalanceEntry { alkane: rid, amount: give });
+                    remaining = remaining.saturating_sub(give);
+                    used = used.saturating_add(give);
+                }
+
+                // subtract only what we actually allocated; leave any leftover on the sheet
+                *entry = entry.saturating_sub(used);
+                if *entry == 0 {
+                    sheet.remove(&rid);
+                }
+            }
+
+            return Ok(());
+        }
+
+        // ---- normal (non-multicast) targets: original behavior ----
         let have = sheet.get(&rid).copied().unwrap_or(0);
         let need = if ed.amount == 0 { have } else { ed.amount.min(have) };
         if need == 0 {
             return Ok(());
         }
 
-        // take
-        let mut delta = BTreeMap::new();
+        // take from sheet
         let entry = sheet.entry(rid).or_default();
         let take = (*entry).min(need);
         *entry = entry.saturating_sub(take);
         if *entry == 0 {
             sheet.remove(&rid);
         }
-        if take > 0 {
-            delta.insert(rid, take);
+        if take == 0 {
+            return Ok(());
         }
 
+        // route normally
+        let mut delta = BTreeMap::new();
+        delta.insert(rid, take);
         route_delta(
             out_idx,
             &delta,
@@ -545,7 +613,7 @@ fn apply_transfers_multi(
                     shadow_base,
                     shadow_end,
                 ) {
-                    eprintln!("[balances] WARN edict apply failed: {e:?}");
+                    eprintln!("[ESSENTIALS::balances] WARN edict apply failed: {e:?}");
                 }
             }
         }
@@ -651,6 +719,82 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             .or_insert(delta);
     };
 
+    // ---------- Pass A: collect block-created outpoints & external inputs ----------
+    let mut block_created_outs: HashSet<String> = HashSet::new();
+    for atx in &block.transactions {
+        let tx = &atx.transaction;
+        if !tx_has_op_return(tx) {
+            continue; // no OP_RETURN → no Alkanes activity on its outputs
+        }
+        let txid = tx.compute_txid();
+        for (vout, _o) in tx.output.iter().enumerate() {
+            let op = EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout: vout as u32 };
+            block_created_outs.insert(op.as_outpoint_string());
+        }
+    }
+
+    // Collect all non-ephemeral vins across the block (dedup)
+    let mut external_inputs_vec: Vec<EspoOutpoint> = Vec::new();
+    let mut external_inputs_set: HashSet<(Vec<u8>, u32)> = HashSet::new();
+
+    for atx in &block.transactions {
+        for input in &atx.transaction.input {
+            let op = EspoOutpoint {
+                txid: input.previous_output.txid.as_byte_array().to_vec(),
+                vout: input.previous_output.vout,
+            };
+            let in_str = op.as_outpoint_string();
+            if !block_created_outs.contains(&in_str) {
+                let key = (op.txid.clone(), op.vout);
+                if external_inputs_set.insert(key) {
+                    external_inputs_vec.push(op);
+                }
+            }
+        }
+    }
+
+    // ---------- Pass B: batch reads once for the whole block ----------
+    let mut balances_by_outpoint: HashMap<(Vec<u8>, u32), Vec<BalanceEntry>> = HashMap::new();
+    let mut addr_by_outpoint: HashMap<(Vec<u8>, u32), String> = HashMap::new();
+    let mut spk_by_outpoint: HashMap<(Vec<u8>, u32), ScriptBuf> = HashMap::new();
+
+    if !external_inputs_vec.is_empty() {
+        let mut k_balances: Vec<Vec<u8>> = Vec::with_capacity(external_inputs_vec.len());
+        let mut k_addr: Vec<Vec<u8>> = Vec::with_capacity(external_inputs_vec.len());
+        let mut k_spk: Vec<Vec<u8>> = Vec::with_capacity(external_inputs_vec.len());
+
+        for op in &external_inputs_vec {
+            k_balances.push(outpoint_balances_key(op)?);
+            k_addr.push(outpoint_addr_key(op)?);
+            k_spk.push(utxo_spk_key(op)?);
+        }
+
+        let v_balances = mdb.multi_get(&k_balances)?;
+        let v_addr = mdb.multi_get(&k_addr)?;
+        let v_spk = mdb.multi_get(&k_spk)?;
+
+        for (i, op) in external_inputs_vec.into_iter().enumerate() {
+            let key = (op.txid.clone(), op.vout);
+
+            if let Some(bytes) = &v_balances[i] {
+                if let Ok(bals) = decode_balances_vec(bytes) {
+                    if !bals.is_empty() {
+                        balances_by_outpoint.insert(key.clone(), bals);
+                    }
+                }
+            }
+            if let Some(addr_bytes) = &v_addr[i] {
+                if let Ok(s) = std::str::from_utf8(addr_bytes) {
+                    addr_by_outpoint.insert(key.clone(), s.to_string());
+                }
+            }
+            if let Some(spk_bytes) = &v_spk[i] {
+                spk_by_outpoint.insert(key, ScriptBuf::from(spk_bytes.clone()));
+            }
+        }
+    }
+
+    // ---------- Main per-tx loop ----------
     for atx in &block.transactions {
         let tx = &atx.transaction;
         let txid = tx.compute_txid();
@@ -658,18 +802,21 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         // Seed from VIN balances only
         let mut seed_unalloc = Unallocated::default();
 
+        // Gather ephemerals for this tx & apply; for externals, use prefetched maps
         for input in &tx.input {
             let in_op = EspoOutpoint {
                 txid: input.previous_output.txid.as_byte_array().to_vec(),
                 vout: input.previous_output.vout,
             };
+            let in_key = (in_op.txid.clone(), in_op.vout);
             let in_str = in_op.as_outpoint_string();
 
             all_input_outpoints.insert(in_op.clone());
 
-            // Ephemeral first
+            // 1) Ephemeral? (created earlier in this same block)
             if let Some(bals) = ephem_outpoint_balances.get(&in_str) {
                 consumed_ephem_outpoints.insert(in_str.clone());
+
                 if let Some(addr) = ephem_outpoint_addr.get(&in_str) {
                     for be in bals {
                         add_holder_delta(be.alkane, addr, -(be.amount as i128));
@@ -679,6 +826,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                             .unwrap_or(0)
                             .saturating_add(be.amount);
                     }
+                    // we only track addr-row deletes for DB-resident rows; ephemerals were not persisted yet
                 }
                 for be in bals {
                     seed_unalloc.add(be.alkane, be.amount);
@@ -686,60 +834,18 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                 continue;
             }
 
-            // outpoint_balances
-            let mut used_bals: Option<Vec<BalanceEntry>> = None;
-            if let Ok(Some(bytes)) = mdb.get(&outpoint_balances_key(&in_op)?) {
-                if let Ok(bals) = decode_balances_vec(&bytes) {
-                    if !bals.is_empty() {
-                        used_bals = Some(bals);
-                    }
-                }
-            }
-
-            // fallback via reverse index
-            let mut resolved_addr: Option<String> = None;
-            if used_bals.is_none() {
-                resolved_addr = match mdb.get(&outpoint_addr_key(&in_op)?) {
-                    Ok(Some(addr_bytes)) => {
-                        std::str::from_utf8(&addr_bytes).ok().map(|s| s.to_string())
-                    }
-                    Ok(None) => match mdb.get(&utxo_spk_key(&in_op)?) {
-                        Ok(Some(spk_bytes)) => {
-                            spk_to_address_str(&ScriptBuf::from(spk_bytes), NETWORK)
-                        }
-                        _ => None,
-                    },
-                    Err(_) => None,
-                };
-
-                if let Some(addr) = resolved_addr.as_ref() {
-                    if let Ok(Some(bytes)) = mdb.get(&balances_key(addr, &in_op)?) {
-                        if let Ok(bals) = decode_balances_vec(&bytes) {
-                            if !bals.is_empty() {
-                                used_bals = Some(bals);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(bals) = used_bals {
+            // 2) External input: resolve from prefetched maps (no DB calls here)
+            if let Some(bals) = balances_by_outpoint.get(&in_key).cloned() {
+                // resolve address: /outpoint_addr first, else /utxo_spk → address
+                let mut resolved_addr = addr_by_outpoint.get(&in_key).cloned();
                 if resolved_addr.is_none() {
-                    resolved_addr = match mdb.get(&outpoint_addr_key(&in_op)?) {
-                        Ok(Some(addr_bytes)) => {
-                            std::str::from_utf8(&addr_bytes).ok().map(|s| s.to_string())
-                        }
-                        Ok(None) => match mdb.get(&utxo_spk_key(&in_op)?) {
-                            Ok(Some(spk_bytes)) => {
-                                spk_to_address_str(&ScriptBuf::from(spk_bytes), NETWORK)
-                            }
-                            _ => None,
-                        },
-                        Err(_) => None,
-                    };
+                    if let Some(spk) = spk_by_outpoint.get(&in_key) {
+                        resolved_addr = spk_to_address_str(spk, NETWORK);
+                    }
                 }
 
                 if let Some(addr) = resolved_addr {
+                    // holders-- and mark legacy addr-row delete
                     spent_map_db_only.insert((addr.clone(), in_op.clone()), bals.clone());
                     for be in &bals {
                         add_holder_delta(be.alkane, &addr, -(be.amount as i128));
@@ -749,55 +855,26 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                             .unwrap_or(0)
                             .saturating_add(be.amount);
                     }
-                } else {
-                    // LAST RESORT: scan /balances/*/{outp}
-                    let bal_prefix = b"/balances/".to_vec();
-                    let outp_bytes = borsh::to_vec(&in_op)?;
-                    for k in mdb.scan_prefix(&bal_prefix)? {
-                        if k.len() >= bal_prefix.len() + 1 + outp_bytes.len()
-                            && &k[k.len() - outp_bytes.len()..] == &outp_bytes[..]
-                        {
-                            if let Some(slash_pos) = k[bal_prefix.len()..]
-                                .iter()
-                                .position(|b| *b == b'/')
-                                .map(|p| p + bal_prefix.len())
-                            {
-                                if let Ok(addr_str) =
-                                    std::str::from_utf8(&k[bal_prefix.len()..slash_pos])
-                                {
-                                    spent_map_db_only.insert(
-                                        (addr_str.to_string(), in_op.clone()),
-                                        bals.clone(),
-                                    );
-                                    for be in &bals {
-                                        add_holder_delta(be.alkane, addr_str, -(be.amount as i128));
-                                        *stat_minus_by_alk.entry(be.alkane).or_default() =
-                                            stat_minus_by_alk
-                                                .get(&be.alkane)
-                                                .copied()
-                                                .unwrap_or(0)
-                                                .saturating_add(be.amount);
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
 
                 for be in bals {
                     seed_unalloc.add(be.alkane, be.amount);
                 }
             }
+            // else: no balances row → nothing to do for this vin
         }
 
-        // parse protostones and per-tx traces
-        let protostones = parse_protostones(tx)?;
-        let traces_for_tx: Vec<EspoTrace> = atx.traces.clone().unwrap_or_default();
-
         // apply transfers with your semantics
-        let allocations = apply_transfers_multi(tx, &protostones, &traces_for_tx, seed_unalloc)?;
-
-        // record outputs ephemerally
+        let allocations = if tx_has_op_return(tx) {
+            let protostones = parse_protostones(tx)?;
+            let traces_for_tx: Vec<EspoTrace> = atx.traces.clone().unwrap_or_default();
+            // apply transfers only when there’s a proto/runestone carrier
+            apply_transfers_multi(tx, &protostones, &traces_for_tx, seed_unalloc)?
+        } else {
+            // No OP_RETURN → no Alkanes allocations (but we already did VIN cleanup/holders--)
+            HashMap::<u32, Vec<BalanceEntry>>::new()
+        };
+        // record outputs ephemerally (for same-block spends)
         for (vout_idx, entries_for_vout) in allocations {
             if entries_for_vout.is_empty() || vout_idx as usize >= tx.output.len() {
                 continue;
@@ -808,6 +885,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             }
 
             if let Some(address_str) = spk_to_address_str(&output.script_pubkey, NETWORK) {
+                // Combine duplicates
                 let mut amounts_by_alkane: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
                 for entry in entries_for_vout {
                     *amounts_by_alkane.entry(entry.alkane).or_default() = amounts_by_alkane
@@ -826,11 +904,13 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                     EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout: vout_idx };
                 let outpoint_str = created_outpoint.as_outpoint_string();
 
+                // cache for same-block spends
                 ephem_outpoint_balances.insert(outpoint_str.clone(), balances_for_outpoint.clone());
                 ephem_outpoint_addr.insert(outpoint_str.clone(), address_str.clone());
                 ephem_outpoint_spk.insert(outpoint_str.clone(), output.script_pubkey.clone());
                 ephem_outpoint_struct.insert(outpoint_str.clone(), created_outpoint.clone());
 
+                // holders++ stats
                 for (alkane_id, delta_amount) in amounts_by_alkane {
                     add_holder_delta(alkane_id, &address_str, delta_amount as i128);
                     *stat_plus_by_alk.entry(alkane_id).or_default() = stat_plus_by_alk
@@ -879,7 +959,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
 
     for (out_str, vec_out) in &ephem_outpoint_balances {
         if consumed_ephem_outpoints.contains(out_str) {
-            continue;
+            continue; // created & spent within block ⇒ don't persist
         }
         let addr = match ephem_outpoint_addr.get(out_str) {
             Some(a) => a.clone(),

@@ -1,7 +1,5 @@
 use crate::config::{
-    get_bitcoind_rpc_client, // still needed for prevout fallback
-    get_block_source,        // NEW: use BlockSource for full blocks
-    get_electrum_client,
+    get_block_source, // NEW: use BlockSource for full blocks
     get_metashrew_sdb,
 };
 use crate::consts::TRACES_BY_BLOCK_PREFIX;
@@ -13,18 +11,15 @@ use alkanes_support::proto::alkanes;
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result};
 use bitcoin::block::Header;
-use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
-use bitcoincore_rpc::RpcApi; // <-- bring trait into scope
 
 // use bitcoincore_rpc::RpcApi; // REMOVED: block fetch now via BlockSource
-use electrum_client::ElectrumApi;
 use protobuf::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EspoSandshrewLikeTrace {
@@ -133,8 +128,6 @@ pub struct EspoBlock {
     pub height: u32,
     pub block_header: Header,
     pub transactions: Vec<EspoAlkanesTransaction>,
-    // All related prevouts for this block
-    pub prevouts: HashMap<Txid, Transaction>,
 }
 
 /// Map of AlkaneId -> (key -> value), last-write-wins per key within a single trace.
@@ -472,103 +465,6 @@ pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
     Ok(final_json)
 }
 
-/// Collect unique prevout txids for all non-coinbase inputs in these transactions.
-/// Only consider txs that have at least one trace (to keep prevout fetch bounded).
-fn collect_prevouts_txids_for_traced_block(
-    transactions: &Vec<EspoAlkanesTransaction>,
-) -> Vec<Txid> {
-    let mut prevout_txid_set = HashSet::new();
-
-    for transaction in transactions {
-        // only consider txs that have at least one trace
-        if transaction.traces.is_none() {
-            continue;
-        }
-        for vin in &transaction.transaction.input {
-            // Skip coinbase/null prevout (txid = 0..0, vout = 0xffffffff)
-            if vin.previous_output.is_null() {
-                continue;
-            }
-            prevout_txid_set.insert(vin.previous_output.txid);
-        }
-    }
-
-    prevout_txid_set.into_iter().collect()
-}
-
-/// Robust prevout fetcher:
-/// - Try Electrum in chunks
-/// - If a chunk fails, try per-tx Electrum
-/// - If Electrum still says "missing transaction", fall back to bitcoind RPC (needs txindex=1)
-fn fetch_prevouts(prevout_txids: Vec<Txid>) -> Result<HashMap<Txid, Transaction>> {
-    let mut out: HashMap<Txid, Transaction> = HashMap::with_capacity(prevout_txids.len());
-    if prevout_txids.is_empty() {
-        return Ok(out);
-    }
-
-    const CHUNK: usize = 256;
-    let electrum = get_electrum_client();
-    let core = get_bitcoind_rpc_client();
-
-    #[inline]
-    fn insert_raw_into(
-        out: &mut HashMap<Txid, Transaction>,
-        txid: Txid,
-        raw: Vec<u8>,
-    ) -> Result<()> {
-        let tx: Transaction = deserialize(&raw).context("deserialize prevout tx")?;
-        out.insert(txid, tx);
-        Ok(())
-    }
-
-    // First pass: try batched Electrum
-    for chunk in prevout_txids.chunks(CHUNK) {
-        match electrum.batch_transaction_get_raw(chunk) {
-            Ok(raws) => {
-                for (i, raw) in raws.into_iter().enumerate() {
-                    let txid = chunk[i];
-
-                    if raw.is_empty() {
-                        // Fallback for just this txid
-                        match electrum.transaction_get_raw(&txid) {
-                            Ok(raw2) if !raw2.is_empty() => {
-                                insert_raw_into(&mut out, txid, raw2)?;
-                            }
-                            _ => {
-                                let tx =
-                                    core.get_raw_transaction(&txid, None).with_context(|| {
-                                        format!("bitcoind: getrawtransaction({txid})")
-                                    })?;
-                                out.insert(txid, tx);
-                            }
-                        }
-                    } else {
-                        insert_raw_into(&mut out, txid, raw)?;
-                    }
-                }
-            }
-            Err(_) => {
-                // Fall back to per-tx Electrum, then Core
-                for txid in chunk {
-                    match electrum.transaction_get_raw(txid) {
-                        Ok(raw) if !raw.is_empty() => {
-                            insert_raw_into(&mut out, *txid, raw)?;
-                        }
-                        _ => {
-                            let tx = core
-                                .get_raw_transaction(txid, None)
-                                .with_context(|| format!("bitcoind: getrawtransaction({txid})"))?;
-                            out.insert(*txid, tx);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(out)
-}
-
 /// Build a map { txid_be_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
 fn traces_for_block_indexed(
     db: &SDB,
@@ -596,29 +492,42 @@ fn traces_for_block_indexed(
 /// Use the BlockSource for the block (header + transactions), Electrum for prevouts.
 /// Traces are now **multiple per transaction** and are stitched in per outpoint (vout).
 pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
+    eprintln!("[TRACE::get_espo_block] start block={block}, tip={tip}");
+
     let metashrew_sdb = &get_metashrew_sdb();
     let block_source = get_block_source();
 
-    // Use block source instead of direct bitcoind get_block
+    // Block height conversions
     let h32: u32 = block
         .try_into()
         .context("block height does not fit into u32 for get_espo_block")?;
     let tip32: u32 =
         tip.try_into().context("tip height does not fit into u32 for get_espo_block")?;
+    eprintln!("[TRACE::get_espo_block] converted block heights h32={h32}, tip32={tip32}");
 
+    // Fetch block
     let full_block = block_source
         .get_block_by_height(h32, tip32)
         .context("BlockSource: get_block_by_height")?;
+    eprintln!(
+        "[TRACE::get_espo_block] got block at height={}, txs={}",
+        h32,
+        full_block.txdata.len()
+    );
 
     // Header from block source
     let block_header: Header = full_block.header.clone();
 
-    // 2) Index traces present in DB for this block (by txid hex -> Vec<(vout, Partial)>)
+    // Index traces
     let traces_index = traces_for_block_indexed(metashrew_sdb, block)?;
+    eprintln!(
+        "[TRACE::get_espo_block] built traces_index for block={} ({} txs with traces)",
+        block,
+        traces_index.len()
+    );
 
-    // 3) Build EspoAlkanesTransaction for **every** tx in this block
+    // Build transactions
     let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(full_block.txdata.len());
-
     for tx in full_block.txdata.into_iter() {
         let txid = tx.compute_txid();
         let txid_hex = txid.to_string();
@@ -626,11 +535,8 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
         let traces_opt: Option<Vec<EspoTrace>> = if let Some(vouts_partials) =
             traces_index.get(&txid_hex)
         {
-            // Collect ALL traces for this tx, one per (vout, partial)
             let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
-
             for (vout, partial) in vouts_partials.iter() {
-                // Render Sandshrew-like JSON events from protobuf
                 let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
                 let events: Vec<EspoSandshrewLikeTraceEvent> =
                     serde_json::from_str(&events_json_str)
@@ -640,7 +546,6 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
                     EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
 
                 let storage_changes = extract_alkane_storage(&partial.protobuf_trace, &tx)?;
-
                 let outpoint = EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout: *vout };
 
                 traces_vec.push(EspoTrace {
@@ -650,7 +555,6 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
                     outpoint,
                 });
             }
-
             Some(traces_vec)
         } else {
             None
@@ -658,18 +562,15 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
 
         txs.push(EspoAlkanesTransaction { traces: traces_opt, transaction: tx });
     }
+    eprintln!("[TRACE::get_espo_block] built {} EspoAlkanesTransaction(s)", txs.len());
 
-    // 4) Fetch ALL prevouts referenced by those transactions (skip coinbase) with robust fallback
-    let prevout_txids = collect_prevouts_txids_for_traced_block(&txs);
-    let prevouts = fetch_prevouts(prevout_txids)?;
-
+    eprintln!("[TRACE::get_espo_block] done block={block}");
     Ok(EspoBlock {
         block_header,
         transactions: txs,
         height: block
             .try_into()
             .context("block height does not fit into u32 for EspoBlock::height")?,
-        prevouts,
         is_latest: block == tip,
     })
 }

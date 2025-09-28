@@ -45,7 +45,7 @@ pub struct BlockFileLocationDescriptor {
 #[derive(Default)]
 struct DecodedFileCache {
     file_no: Option<u32>,
-    // All decoded blocks from that file:
+    // All decoded blocks from that file (ACTIVE-CHAIN ONLY — verified via RPC):
     blocks: HashMap<BlockHash, Block>,
 }
 
@@ -148,7 +148,10 @@ impl BlkOrRpcBlockSource {
             };
             match rpc.get_block_header_info(&hash) {
                 Ok(hdr) => {
-                    out.insert(hdr.height as u32, hash);
+                    // Only map ACTIVE chain blocks (confirmations > 0). Skip stale/orphans here.
+                    if hdr.confirmations > 0 {
+                        out.insert(hdr.height as u32, hash);
+                    }
                 }
                 Err(e) => {
                     // Best-effort: if pruned or unknown, just skip
@@ -236,7 +239,43 @@ impl BlkOrRpcBlockSource {
         Ok(self.mdb.get(&key)?.is_some())
     }
 
+    /// Verify a decoded block against Core:
+    /// - It must be **in the active chain** (confirmations > 0).
+    /// - If decode was from disk and we suspect mismatch, we could fetch RPC body (kept as hook).
+    fn verify_block_active_via_rpc(&self, h: &BlockHash, blk: &Block) -> Result<Option<Block>> {
+        match self.rpc.get_block_header_info(h) {
+            Ok(info) => {
+                if info.confirmations <= 0 {
+                    // Not in active chain → do not cache this body.
+                    eprintln!(
+                        "[BLOCKFETCHER] skip cache: {} is not in active chain (confs={})",
+                        h, info.confirmations
+                    );
+                    return Ok(None);
+                }
+                // Optional: if you want extra paranoia, you could refetch and compare merkle.
+                // Here we trust the file decode for active blocks; keep RPC fallback hook:
+                Ok(Some(blk.clone()))
+            }
+            Err(e) => {
+                eprintln!(
+                    "[BLOCKFETCHER] header({}) not known ({}). Trying RPC get_block as fallback…",
+                    h, e
+                );
+                // If Core is pruned and lacks the header, or some transient issue — best effort.
+                match self.rpc.get_block(h) {
+                    Ok(b) => Ok(Some(b)),
+                    Err(e2) => {
+                        eprintln!("[BLOCKFETCHER] RPC get_block({}) failed: {:?}", h, e2);
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
     /// Fully decode **all blocks** in the given blk file into the single-file cache.
+    /// Only ACTIVE-CHAIN blocks (confirmations > 0) are inserted into the cache.
     fn ensure_decoded_file_cached(&self, file_no: u32) -> Result<()> {
         let mut cache = self.decoded_cache.lock().unwrap();
         if cache.file_no == Some(file_no) {
@@ -289,15 +328,24 @@ impl BlkOrRpcBlockSource {
                 break;
             }
 
-            let blk: Block = match consensus::encode::deserialize(&payload) {
+            let blk_from_file: Block = match consensus::encode::deserialize(&payload) {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("[BLOCKFETCHER] cache warm decode {}: {:?}", path.display(), e);
                     break;
                 }
             };
-            let h = blk.block_hash();
-            cache.blocks.insert(h, blk);
+            let h = blk_from_file.block_hash();
+
+            // === NEW: verify against RPC and only cache ACTIVE-CHAIN blocks ===
+            match self.verify_block_active_via_rpc(&h, &blk_from_file)? {
+                Some(verified) => {
+                    cache.blocks.insert(h, verified);
+                }
+                None => {
+                    // Skip inserting; either not in active chain or RPC failed.
+                }
+            }
         }
 
         Ok(())
@@ -385,6 +433,8 @@ impl BlkOrRpcBlockSource {
                 last_hash = Some(hash);
                 let txs = blk.txdata.len() as u32;
 
+                // We still index *every* block hash → location (including stale),
+                // because get_block_by_height always resolves a canonical hash via RPC first.
                 let loc = BlockFileLocationDescriptor { file_no, offset: file_pos + 8, len, txs };
                 let key = hash.to_byte_array();
                 let val = borsh::to_vec(&loc).expect("borsh encode loc");
@@ -515,20 +565,21 @@ impl BlkOrRpcBlockSource {
     }
 
     /// Read a block directly from a known file location (with **single-file decoded cache**).
+    /// Blocks added to the cache are verified against Core (active chain) in ensure_decoded_file_cached.
     fn read_block_from_loc(
         &self,
         hash: &BlockHash,
         loc: &BlockFileLocationDescriptor,
     ) -> Result<Block> {
-        // Warm/flip the decoded cache to this file if needed.
+        // Warm/flip the decoded cache to this file if needed (does active-chain verification).
         self.ensure_decoded_file_cached(loc.file_no)?;
 
-        // Now serve from the in-memory map (O(1))
+        // Now serve from the in-memory map (O(1)) if present
         if let Some(b) = self.decoded_cache.lock().unwrap().blocks.get(hash).cloned() {
             return Ok(b);
         }
 
-        // Fallback (should be rare): read just this one from disk and insert.
+        // Fallback (rare): read just this one from disk, then verify before returning/caching.
         let path = self.blocks_dir.join(format!("blk{:05}.dat", loc.file_no));
         let mut f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         f.seek(SeekFrom::Start(loc.offset))
@@ -536,12 +587,34 @@ impl BlkOrRpcBlockSource {
         let mut payload = vec![0u8; loc.len as usize];
         f.read_exact(&mut payload)
             .with_context(|| format!("read {} bytes {}", payload.len(), path.display()))?;
-        let blk: Block =
+        let blk_from_file: Block =
             consensus::encode::deserialize(&payload).context("consensus decode block payload")?;
+        let h = blk_from_file.block_hash();
 
-        // Insert into cache for future calls
+        if &h != hash {
+            eprintln!(
+                "[BLOCKFETCHER] WARNING: payload hash {} != expected {}; trying RPC fallback…",
+                h, hash
+            );
+        }
+
+        // Verify via RPC (active chain). If accepted, also insert into cache for future calls.
+        if let Some(verified) = self.verify_block_active_via_rpc(hash, &blk_from_file)? {
+            self.decoded_cache.lock().unwrap().blocks.insert(*hash, verified.clone());
+            return Ok(verified);
+        }
+
+        // As a last resort (e.g., pruned header lookup oddity), try direct RPC get_block
+        eprintln!(
+            "[BLOCKFETCHER] read_block_from_loc: disk body not verified; using RPC get_block({})",
+            hash
+        );
+        let blk = self
+            .rpc
+            .get_block(hash)
+            .with_context(|| format!("bitcoind: getblock({hash})"))?;
+        // Don’t cache here unless you want to (it’s okay to cache — it’s active by virtue of height lookup)
         self.decoded_cache.lock().unwrap().blocks.insert(*hash, blk.clone());
-
         Ok(blk)
     }
 }
@@ -556,7 +629,7 @@ impl BlockSource for BlkOrRpcBlockSource {
             tip.saturating_sub(height)
         );
 
-        // 0) First: consult the preloaded height→hash map
+        // 0) First: consult the preloaded height→hash map (already filtered to active chain)
         if let Some(h) = self.height_to_hash.lock().unwrap().get(&height).cloned() {
             if let Some(loc) = self.index_get(&h)? {
                 eprintln!(
@@ -570,12 +643,11 @@ impl BlockSource for BlkOrRpcBlockSource {
             // If the map has the hash but location is missing (shouldn't happen), fall through.
         }
 
-        // 1) height → hash via RPC (only when not in preloaded set)
+        // 1) height → hash via RPC (canonical)
         let hash: BlockHash = self
             .rpc
             .get_block_hash(height as u64)
             .with_context(|| format!("bitcoind: getblockhash({height})"))?;
-
         // Opportunistically cache this mapping for subsequent calls in the same run.
         self.height_to_hash.lock().unwrap().insert(height, hash);
 

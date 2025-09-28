@@ -68,7 +68,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                         .unwrap_or(true);
 
                     let limit_req = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100);
-                    let limit = limit_req.min(1000).max(1) as usize;
+                    let limit = limit_req as usize;
 
                     let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
 
@@ -195,7 +195,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
 
                     let limit =
                         payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-                    let limit = limit.min(1000).max(1);
+                    let limit = limit as usize;
                     let page =
                         payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
 

@@ -129,45 +129,74 @@ impl EspoModule for Essentials {
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let mdb = self.mdb();
-        let mut total_pairs = 0usize;
 
-        // Pure write-only path: for every (alk, key)->value change
-        //   - put value row
-        //   - put directory marker row
-        let res = mdb.bulk_write(|wb: &mut MdbBatch<'_>| {
-            for tx in block.transactions.iter() {
-                let storage_changes = match tx.traces.clone() {
-                    Some(traces) => {
-                        traces.iter().flat_map(|trace| trace.storage_changes.clone()).collect()
-                    }
-                    None => vec![],
-                };
+        // -------- Phase A: coalesce per-block writes in memory --------
+        // last-write-wins for values:
+        //   k_kv(alk,skey) -> [ txid(32) | value(...) ]
+        use std::collections::{HashMap, HashSet};
 
-                for (alk, kvs) in storage_changes.iter() {
-                    for (skey, (txid, value)) in kvs.iter() {
-                        // /values row
-                        let k_kv = Essentials::k_kv(alk, skey);
+        let mut kv_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        // dedup directory markers:
+        //   k_dir_entry(alk,skey) -> ()
+        let mut dir_rows: HashSet<Vec<u8>> = HashSet::new();
 
-                        // EXPECT: `txid` is 32 bytes (raw)
-                        // Value layout: [ txid (32) | value (...) ]
-                        let mut buf = Vec::with_capacity(32 + value.len());
-                        buf.extend_from_slice(&txid.to_byte_array());
-                        buf.extend_from_slice(value);
-                        wb.put(&k_kv, &buf);
+        let mut total_pairs_dedup = 0usize;
 
-                        // dir marker: no read/merge; duplicates are fine
-                        let k_dir = Essentials::k_dir_entry(alk, skey);
-                        wb.put(&k_dir, &[]);
+        for tx in block.transactions.iter() {
+            // Access traces without cloning big structures if possible
+            let storage_changes_iter = tx
+                .traces
+                .as_ref()
+                .map(|traces| traces.iter())
+                .into_iter()
+                .flatten()
+                .flat_map(|trace| trace.storage_changes.iter());
 
-                        total_pairs += 1;
-                    }
+            for (alk, kvs) in storage_changes_iter {
+                for (skey, (txid, value)) in kvs.iter() {
+                    // Key for value row
+                    let k_v = Essentials::k_kv(alk, skey);
+
+                    // Value layout: [ txid(32) | value(...) ]
+                    let mut buf = Vec::with_capacity(32 + value.len());
+                    buf.extend_from_slice(&txid.to_byte_array());
+                    buf.extend_from_slice(value);
+
+                    // last-write-wins for this key within the block
+                    kv_rows.insert(k_v, buf);
+
+                    // Dir entry is idempotent; one per (alk, skey) is enough
+                    let k_dir = Essentials::k_dir_entry(alk, skey);
+                    dir_rows.insert(k_dir);
+
+                    total_pairs_dedup += 1;
                 }
             }
-        });
+        }
 
-        if let Err(e) = res {
-            eprintln!("[ESSENTIALS] bulk_write failed at block #{}: {e}", block.height);
-            return Err(e.into());
+        // If there’s nothing to write (typical empty block), skip the write-batch
+        if !kv_rows.is_empty() || !dir_rows.is_empty() {
+            // -------- Phase B: write in sorted key order (better LSM locality) --------
+            let mut kv_keys: Vec<Vec<u8>> = kv_rows.keys().cloned().collect();
+            kv_keys.sort_unstable();
+            let mut dir_keys: Vec<Vec<u8>> = dir_rows.into_iter().collect();
+            dir_keys.sort_unstable();
+
+            if let Err(e) = mdb.bulk_write(|wb: &mut MdbBatch<'_>| {
+                // Values first
+                for k in &kv_keys {
+                    if let Some(v) = kv_rows.get(k) {
+                        wb.put(k, v);
+                    }
+                }
+                // Then directory markers
+                for k in &dir_keys {
+                    wb.put(k, &[]);
+                }
+            }) {
+                eprintln!("[ESSENTIALS] bulk_write failed at block #{}: {e}", block.height);
+                return Err(e.into());
+            }
         }
 
         // ✅ also update alkane balances/holders for this block
@@ -179,7 +208,10 @@ impl EspoModule for Essentials {
             return Err(e);
         }
 
-        eprintln!("[ESSENTIALS] block #{} indexed {} key/value updates", block.height, total_pairs);
+        eprintln!(
+            "[ESSENTIALS] block #{} indexed {} key/value updates (deduped)",
+            block.height, total_pairs_dedup
+        );
         self.set_index_height(block.height)?;
         Ok(())
     }
