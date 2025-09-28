@@ -3,8 +3,7 @@
 
 # Espo
 
-### NOTE: 
-A FREE version of ESPO is hosted at https://api.alkanode.com for anyone to use - courtesy of pizza.fun.
+#### 🍕 NOTE: A FREE version of ESPO is hosted at https://api.alkanode.com for anyone to use - courtesy of pizza.fun.
 
 Espo is a production ready, general purpose indexer for Alkanes that builds and serves through its RPC indicies for highly sought after data may not be available through the default Sandshrew api. 
 
@@ -49,5 +48,6 @@ Espo will build indicies for the .blk files in your bitcoin blocks directory and
 This project is mantained by the pizza.fun foundation and opensourced to foster new developments on Alkanes. 
 
 Espo is licensed under the BUSL agreement, which allows personal AND commercial use of the software UNLESS you are building a direct competitor to pizza.fun.
+
 
 
