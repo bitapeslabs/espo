@@ -41,7 +41,8 @@ Espo will build indicies for the .blk files in your bitcoin blocks directory and
 - ESSENTIALS module (balances, holders data, address outpoints, K/V stores for contracts:
   https://github.com/bitapeslabs/espo/tree/main/src/modules/essentials
 
-## Credits
+## Credits and License
 This project is mantained by the pizza.fun foundation and opensourced to foster new developments on Alkanes. 
 
 Espo is licensed under the BUSL agreement, which allows personal AND commercial use of the software UNLESS you are building a direct competitor to pizza.fun.
+
