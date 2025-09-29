@@ -1,6 +1,8 @@
 use super::schemas::{SchemaPoolSnapshot, SchemaReservesSnapshot};
+use super::storage::reserves_snapshot_key;
 use super::utils::candles::CandleCache;
 use super::utils::trades::{TradeIndexAcc, TradeWriteAcc};
+
 use crate::alkanes::trace::EspoBlock;
 
 use crate::config::get_electrum_client;
@@ -23,12 +25,6 @@ use std::sync::Arc;
 use super::rpc::register_rpc;
 // NEW: live reserves util
 use crate::modules::ammdata::utils::live_reserves::fetch_latest_reserves_for_pools;
-
-// Relative RocksDB key holding the entire reserves snapshot (BORSH)
-#[inline]
-fn reserves_snapshot_key() -> &'static [u8] {
-    b"/reserves_snapshot_v1" // v1 as agreed
-}
 
 // Encode Snapshot -> BORSH (deterministic order via BTreeMap)
 fn encode_reserves_snapshot(map: &HashMap<SchemaAlkaneId, SchemaPoolSnapshot>) -> Result<Vec<u8>> {

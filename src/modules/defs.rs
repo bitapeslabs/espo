@@ -50,6 +50,11 @@ pub struct RpcNsRegistrar {
     prefix: String, // e.g., "ammdata."
 }
 
+pub struct RpcCtx {
+    pub registrar: RpcNsRegistrar,
+    pub mdb: Mdb,
+}
+
 impl RpcNsRegistrar {
     pub fn new(inner: RpcRegistry, module_name: &str) -> Self {
         // Always end with a dot

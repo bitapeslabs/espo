@@ -1,5 +1,9 @@
+use super::schemas::{SchemaPoolSnapshot, SchemaReservesSnapshot};
 use crate::modules::ammdata::consts::KEY_INDEX_HEIGHT;
 use crate::modules::ammdata::main::AmmData;
+use anyhow::Result;
+use borsh::BorshDeserialize;
+use std::collections::{BTreeMap, HashMap};
 impl AmmData {
     pub fn get_key_index_height() -> &'static [u8] {
         KEY_INDEX_HEIGHT
@@ -59,4 +63,27 @@ pub fn pools_key(pool: &SchemaAlkaneId) -> Vec<u8> {
     k.extend_from_slice(&pool.block.to_be_bytes());
     k.extend_from_slice(&pool.tx.to_be_bytes());
     k
+}
+
+// Encode Snapshot -> BORSH (deterministic order via BTreeMap)
+pub fn encode_reserves_snapshot(
+    map: &HashMap<SchemaAlkaneId, SchemaPoolSnapshot>,
+) -> Result<Vec<u8>> {
+    let ordered: BTreeMap<SchemaAlkaneId, SchemaPoolSnapshot> =
+        map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    let snap = SchemaReservesSnapshot { entries: ordered };
+    Ok(borsh::to_vec(&snap)?)
+}
+
+// Decode BORSH -> Snapshot
+pub fn decode_reserves_snapshot(
+    bytes: &[u8],
+) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
+    let snap = SchemaReservesSnapshot::try_from_slice(bytes)?;
+    Ok(snap.entries.into_iter().collect())
+}
+
+#[inline]
+pub fn reserves_snapshot_key() -> &'static [u8] {
+    b"/reserves_snapshot_v1" // v1 as agreed
 }
