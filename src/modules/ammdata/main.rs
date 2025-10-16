@@ -1,44 +1,29 @@
-use super::schemas::{SchemaPoolSnapshot, SchemaReservesSnapshot};
+use super::schemas::SchemaPoolSnapshot;
 use super::storage::reserves_snapshot_key;
 use super::utils::candles::CandleCache;
 use super::utils::trades::{TradeIndexAcc, TradeWriteAcc};
-
 use crate::alkanes::trace::EspoBlock;
-
 use crate::config::get_electrum_client;
 use crate::modules::ammdata::consts::ammdata_genesis_block;
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, active_timeframes};
+use crate::modules::ammdata::storage::decode_reserves_snapshot;
+use crate::modules::ammdata::storage::encode_reserves_snapshot;
 use crate::modules::ammdata::utils::candles::{price_base_per_quote, price_quote_per_base};
 use crate::modules::ammdata::utils::reserves::{
     extract_new_pools_from_espo_transaction, extract_reserves_from_espo_transaction,
 };
+
 use crate::modules::ammdata::utils::trades::create_trade_v1;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
-use borsh::BorshDeserialize;
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use super::rpc::register_rpc;
 // NEW: live reserves util
 use crate::modules::ammdata::utils::live_reserves::fetch_latest_reserves_for_pools;
-
-// Encode Snapshot -> BORSH (deterministic order via BTreeMap)
-fn encode_reserves_snapshot(map: &HashMap<SchemaAlkaneId, SchemaPoolSnapshot>) -> Result<Vec<u8>> {
-    let ordered: BTreeMap<SchemaAlkaneId, SchemaPoolSnapshot> =
-        map.iter().map(|(k, v)| (*k, v.clone())).collect();
-    let snap = SchemaReservesSnapshot { entries: ordered };
-    Ok(borsh::to_vec(&snap)?)
-}
-
-// Decode BORSH -> Snapshot
-fn decode_reserves_snapshot(bytes: &[u8]) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
-    let snap = SchemaReservesSnapshot::try_from_slice(bytes)?;
-    Ok(snap.entries.into_iter().collect())
-}
 
 /* ---------- module ---------- */
 

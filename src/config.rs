@@ -1,16 +1,15 @@
+use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB};
 use anyhow::Result;
 use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{DB, Options};
 use std::{fs, path::Path, sync::OnceLock, time::Duration};
 
-use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB};
-
-// NEW: Bitcoin Core RPC
+// Bitcoin Core / bitcoin::Network
 use bitcoincore_rpc::bitcoin::Network;
 use bitcoincore_rpc::{Auth, Client as CoreClient};
 
-// NEW: Block fetcher (blk files + RPC fallback)
+// Block fetcher (blk files + RPC fallback)
 use crate::core::blockfetcher::BlkOrRpcBlockSource;
 
 static CONFIG: OnceLock<CliArgs> = OnceLock::new();
@@ -18,9 +17,18 @@ static ELECTRUM_CLIENT: OnceLock<Client> = OnceLock::new();
 static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
 static METASHREW_SDB: OnceLock<std::sync::Arc<SDB>> = OnceLock::new();
 static ESPO_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
-
-// NEW: Global block source
 static BLOCK_SOURCE: OnceLock<BlkOrRpcBlockSource> = OnceLock::new();
+
+// NEW: Global bitcoin::Network
+static NETWORK: OnceLock<Network> = OnceLock::new();
+
+fn parse_network(s: &str) -> std::result::Result<Network, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "mainnet" => Ok(Network::Bitcoin),
+        "regtest" => Ok(Network::Regtest),
+        _ => Err("invalid value for --network: expected 'mainnet' or 'regtest'".into()),
+    }
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -59,6 +67,10 @@ pub struct CliArgs {
 
     #[arg(short = 'p', long, default_value_t = 8080)]
     pub port: u16,
+
+    /// Bitcoin network: 'mainnet' or 'regtest'
+    #[arg(short, long, value_parser = parse_network, default_value = "mainnet")]
+    pub network: Network,
 }
 
 pub fn init_config() -> Result<()> {
@@ -73,7 +85,6 @@ pub fn init_config() -> Result<()> {
         anyhow::bail!("Database path is not a directory: {}", args.readonly_metashrew_db_dir);
     }
 
-    // Ensure tmp_dbs_dir exists (create if missing)
     let tmp = Path::new(&args.tmp_dbs_dir);
     if !tmp.exists() {
         fs::create_dir_all(tmp).map_err(|e| {
@@ -83,7 +94,6 @@ pub fn init_config() -> Result<()> {
         anyhow::bail!("Temporary dbs dir is not a directory: {}", args.tmp_dbs_dir);
     }
 
-    // Ensure espo_db_path exists (create if missing)
     let espo_dir = Path::new(&args.espo_db_path);
     if !espo_dir.exists() {
         fs::create_dir_all(espo_dir).map_err(|e| {
@@ -93,7 +103,6 @@ pub fn init_config() -> Result<()> {
         anyhow::bail!("espo_db_path is not a directory: {}", args.espo_db_path);
     }
 
-    // Validate blocks dir exists
     let blocks_dir = Path::new(&args.bitcoind_blocks_dir);
     if !blocks_dir.exists() {
         anyhow::bail!("bitcoind blocks dir does not exist: {}", args.bitcoind_blocks_dir);
@@ -110,6 +119,11 @@ pub fn init_config() -> Result<()> {
     CONFIG
         .set(args.clone())
         .map_err(|_| anyhow::anyhow!("config already initialized"))?;
+
+    // NEW: store global Network
+    NETWORK
+        .set(args.network)
+        .map_err(|_| anyhow::anyhow!("network already initialized"))?;
 
     // --- init Electrum client once ---
     let electrum_url = format!("tcp://{}", args.electrum_rpc_url);
@@ -149,9 +163,10 @@ pub fn init_config() -> Result<()> {
     Ok(())
 }
 
-/// Call this AFTER `init_config()`, when you know the `Network` (e.g., from `crate::consts::NETWORK`).
-pub fn init_block_source(network: Network) -> Result<()> {
+// UPDATED: no param; uses global NETWORK
+pub fn init_block_source() -> Result<()> {
     let args = get_config();
+    let network = get_network();
     let src = BlkOrRpcBlockSource::new_with_config(&args.bitcoind_blocks_dir, network)?;
     BLOCK_SOURCE
         .set(src)
@@ -193,4 +208,9 @@ pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
     BLOCK_SOURCE
         .get()
         .expect("init_block_source() must be called after init_config()")
+}
+
+/// NEW: Global accessor for bitcoin::Network
+pub fn get_network() -> Network {
+    *NETWORK.get().expect("init_config() must set NETWORK")
 }

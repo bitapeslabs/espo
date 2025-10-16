@@ -1,4 +1,4 @@
-use crate::consts::NETWORK;
+use crate::config::get_network;
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::main::Essentials; // for Essentials::k_kv
 use crate::runtime::mdb::Mdb;
@@ -26,20 +26,27 @@ fn decode_balances_vec(bytes: &[u8]) -> anyhow::Result<Vec<BalanceEntry>> {
 // Normalize and re-encode the address in the canonical (checked) form for the active NETWORK.
 // This ensures keys under /balances/{address}/… match what we wrote from the indexer.
 fn normalize_address(s: &str) -> Option<String> {
+    let network = get_network();
     Address::from_str(s)
         .ok()
-        .and_then(|a| a.require_network(NETWORK).ok())
+        .and_then(|a| a.require_network(network).ok())
         .map(|a| a.to_string())
 }
 
 /* ---------------- register ---------------- */
 use std::sync::Arc;
 
+/// Tiny helper to standardize RPC logs.
+#[inline]
+fn log_rpc(method: &str, msg: &str) {
+    eprintln!("[RPC::ESSENTIALS] {method} — {msg}");
+}
+
 pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
     // Wrap once; everything else shares this.
     let mdb = Arc::new(mdb);
 
-    eprintln!("[RPC_ESSENTIALS] registering RPC handlers…");
+    eprintln!("[RPC::ESSENTIALS] registering RPC handlers…");
 
     /* -------- existing: get_keys -------- */
     {
@@ -59,6 +66,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                         {
                             Some(a) => a,
                             None => {
+                                log_rpc("get_keys", "missing_or_invalid_alkane");
                                 return json!({
                                     "ok": false,
                                     "error": "missing_or_invalid_alkane",
@@ -78,6 +86,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
 
                         let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
 
+                        log_rpc(
+                            "get_keys",
+                            &format!(
+                                "alkane={}:{}, page={}, limit={}, try_decode_utf8={}",
+                                alk.block, alk.tx, page, limit, try_decode_utf8
+                            ),
+                        );
+
                         // ---- resolve key set
                         let keys_param = payload.get("keys").and_then(|v| v.as_array());
 
@@ -96,7 +112,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             let rel_keys = match mdb.scan_prefix(&scan_pref) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    eprintln!("[RPC:essentials.get_keys] scan_prefix failed: {e:?}");
+                                    log_rpc("get_keys", &format!("scan_prefix failed: {e:?}"));
                                     Vec::new()
                                 }
                             };
@@ -199,6 +215,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                         {
                             Some(a) => a,
                             None => {
+                                log_rpc("get_holders", "missing_or_invalid_alkane");
                                 return json!({"ok": false, "error": "missing_or_invalid_alkane"});
                             }
                         };
@@ -208,10 +225,18 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                         let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
                             as usize;
 
+                        log_rpc(
+                            "get_holders",
+                            &format!(
+                                "alkane={}:{}, page={}, limit={}",
+                                alk.block, alk.tx, page, limit
+                            ),
+                        );
+
                         let (total, slice) = match get_holders_for_alkane(&mdb, alk, page, limit) {
                             Ok(tup) => tup,
                             Err(e) => {
-                                eprintln!("[RPC:essentials.get_holders] failed: {e:?}");
+                                log_rpc("get_holders", &format!("failed: {e:?}"));
                                 return json!({"ok": false, "error": "internal_error"});
                             }
                         };
@@ -249,11 +274,17 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                     async move {
                         let address_raw = match payload.get("address").and_then(|v| v.as_str()) {
                             Some(s) if !s.is_empty() => s.trim(),
-                            _ => return json!({"ok": false, "error": "missing_or_invalid_address"}),
+                            _ => {
+                                log_rpc("get_address_balances", "missing_or_invalid_address");
+                                return json!({"ok": false, "error": "missing_or_invalid_address"});
+                            }
                         };
                         let address = match normalize_address(address_raw) {
                             Some(a) => a,
-                            None => return json!({"ok": false, "error": "invalid_address_format"}),
+                            None => {
+                                log_rpc("get_address_balances", "invalid_address_format");
+                                return json!({"ok": false, "error": "invalid_address_format"});
+                            }
                         };
 
                         let include_outpoints = payload
@@ -261,17 +292,31 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
 
+                        log_rpc(
+                            "get_address_balances",
+                            &format!(
+                                "address={}, include_outpoints={}",
+                                address, include_outpoints
+                            ),
+                        );
+
                         let agg = match get_balance_for_address(&mdb, &address) {
                             Ok(m) => m,
                             Err(e) => {
-                                eprintln!("[RPC:essentials.get_address_balances] get_balance_for_address failed: {e:?}");
+                                log_rpc(
+                                    "get_address_balances",
+                                    &format!("get_balance_for_address failed: {e:?}"),
+                                );
                                 return json!({"ok": false, "error": "internal_error"});
                             }
                         };
 
                         let mut balances: Map<String, Value> = Map::new();
                         for (id, amt) in agg {
-                            balances.insert(format!("{}:{}", id.block, id.tx), Value::String(amt.to_string()));
+                            balances.insert(
+                                format!("{}:{}", id.block, id.tx),
+                                Value::String(amt.to_string()),
+                            );
                         }
 
                         let mut resp = json!({
@@ -288,7 +333,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             let keys = match mdb.scan_prefix(&pref) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    eprintln!("[RPC:essentials.get_address_balances] scan_prefix failed: {e:?}");
+                                    log_rpc(
+                                        "get_address_balances",
+                                        &format!("scan_prefix failed: {e:?}"),
+                                    );
                                     Vec::new()
                                 }
                             };
@@ -317,7 +365,8 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                                 outpoints.push(json!({ "outpoint": op, "entries": entry_list }));
                             }
 
-                            resp.as_object_mut().unwrap()
+                            resp.as_object_mut()
+                                .unwrap()
                                 .insert("outpoints".to_string(), Value::Array(outpoints));
                         }
 
@@ -339,7 +388,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                     async move {
                         let outpoint = match payload.get("outpoint").and_then(|v| v.as_str()) {
                             Some(s) if !s.is_empty() => s.trim().to_string(),
-                            _ => return json!({"ok": false, "error": "missing_or_invalid_outpoint", "hint": "expected \"<txid>:<vout>\""}),
+                            _ => {
+                                log_rpc("get_outpoint_balances", "missing_or_invalid_outpoint");
+                                return json!({"ok": false, "error": "missing_or_invalid_outpoint", "hint": "expected \"<txid>:<vout>\""});
+                            }
                         };
 
                         // parse "<txid>:<vout>"
@@ -347,21 +399,32 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             Some((txid_hex, vout_str)) => {
                                 let txid = match bitcoin::Txid::from_str(txid_hex) {
                                     Ok(t) => t,
-                                    Err(_) => return json!({"ok": false, "error": "invalid_txid"}),
+                                    Err(_) => {
+                                        log_rpc("get_outpoint_balances", "invalid_txid");
+                                        return json!({"ok": false, "error": "invalid_txid"});
+                                    }
                                 };
                                 let vout_u32 = match vout_str.parse::<u32>() {
                                     Ok(n) => n,
-                                    Err(_) => return json!({"ok": false, "error": "invalid_vout"}),
+                                    Err(_) => {
+                                        log_rpc("get_outpoint_balances", "invalid_vout");
+                                        return json!({"ok": false, "error": "invalid_vout"});
+                                    }
                                 };
                                 (txid, vout_u32)
                             }
-                            None => return json!({"ok": false, "error": "invalid_outpoint_format", "hint": "expected \"<txid>:<vout>\""}),
+                            None => {
+                                log_rpc("get_outpoint_balances", "invalid_outpoint_format");
+                                return json!({"ok": false, "error": "invalid_outpoint_format", "hint": "expected \"<txid>:<vout>\""});
+                            }
                         };
+
+                        log_rpc("get_outpoint_balances", &format!("outpoint={}", outpoint));
 
                         let entries = match get_outpoint_balances_index(&mdb, &txid, vout_u32) {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!("[RPC:essentials.get_outpoint_balances] index lookup failed: {e:?}");
+                                log_rpc("get_outpoint_balances", &format!("index lookup failed: {e:?}"));
                                 return json!({"ok": false, "error": "internal_error"});
                             }
                         };
@@ -415,12 +478,20 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                     async move {
                         let address_raw = match payload.get("address").and_then(|v| v.as_str()) {
                             Some(s) if !s.is_empty() => s.trim(),
-                            _ => return json!({"ok": false, "error": "missing_or_invalid_address"}),
+                            _ => {
+                                log_rpc("get_address_outpoints", "missing_or_invalid_address");
+                                return json!({"ok": false, "error": "missing_or_invalid_address"});
+                            }
                         };
                         let address = match normalize_address(address_raw) {
                             Some(a) => a,
-                            None => return json!({"ok": false, "error": "invalid_address_format"}),
+                            None => {
+                                log_rpc("get_address_outpoints", "invalid_address_format");
+                                return json!({"ok": false, "error": "invalid_address_format"});
+                            }
                         };
+
+                        log_rpc("get_address_outpoints", &format!("address={address}"));
 
                         // Prefix for /balances/{address}/
                         let mut pref = b"/balances/".to_vec();
@@ -430,14 +501,18 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                         let keys = match mdb.scan_prefix(&pref) {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!("[RPC:essentials.get_address_outpoints] scan_prefix failed: {e:?}");
+                                log_rpc(
+                                    "get_address_outpoints",
+                                    &format!("scan_prefix failed: {e:?}"),
+                                );
                                 Vec::new()
                             }
                         };
 
                         let keys_amount = keys.len();
-                        eprintln!(
-                            "[RPC:essentials.get_address_outpoints] get outpoints for address: {address}, estimated keys: {keys_amount}"
+                        log_rpc(
+                            "get_address_outpoints",
+                            &format!("address={address}, estimated_keys={keys_amount}"),
                         );
 
                         let mut outpoints: Vec<Value> = Vec::with_capacity(keys.len());
@@ -451,7 +526,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             let espo_out = match decoded {
                                 Ok(op) => op,
                                 Err(err) => {
-                                    eprintln!("[RPC:essentials.get_address_outpoints] decode failed: {err}");
+                                    log_rpc(
+                                        "get_address_outpoints",
+                                        &format!("decode failed: {err}"),
+                                    );
                                     continue;
                                 }
                             };
@@ -476,19 +554,25 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             let entries_vec = match get_outpoint_balances_index(&mdb, &txid, vout) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    eprintln!(
-                                        "[RPC:essentials.get_address_outpoints] O(1) index read failed for {outpoint_str}: {e:?}"
+                                    log_rpc(
+                                        "get_address_outpoints",
+                                        &format!(
+                                            "O(1) index read failed for {outpoint_str}: {e:?}"
+                                        ),
                                     );
                                     Vec::new()
                                 }
                             };
 
-                            let entry_list: Vec<Value> = entries_vec.into_iter().map(|be| {
-                                json!({
-                                    "alkane": format!("{}:{}", be.alkane.block, be.alkane.tx),
-                                    "amount": be.amount.to_string()
+                            let entry_list: Vec<Value> = entries_vec
+                                .into_iter()
+                                .map(|be| {
+                                    json!({
+                                        "alkane": format!("{}:{}", be.alkane.block, be.alkane.tx),
+                                        "amount": be.amount.to_string()
+                                    })
                                 })
-                            }).collect();
+                                .collect();
 
                             outpoints.push(json!({
                                 "outpoint": outpoint_str,
@@ -522,7 +606,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
         let reg_ping = reg.clone();
         tokio::spawn(async move {
             reg_ping
-                .register("ping", |_cx, _payload| async move { Value::String("pong".to_string()) })
+                .register("ping", |_cx, _payload| async move {
+                    log_rpc("ping", "ok");
+                    Value::String("pong".to_string())
+                })
                 .await;
         });
     }

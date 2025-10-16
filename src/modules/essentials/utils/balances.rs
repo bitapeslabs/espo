@@ -1,6 +1,6 @@
 // src/modules/essentials/utils/balances.rs
 
-use crate::consts::NETWORK;
+use crate::config::get_network;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Result, anyhow};
@@ -685,6 +685,8 @@ Public API
 
 #[allow(unused_assignments)]
 pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()> {
+    let network = get_network();
+
     eprintln!("[balances] >>> begin block #{} (txs={})", block.height, block.transactions.len());
 
     // --------- stats ----------
@@ -840,7 +842,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                 let mut resolved_addr = addr_by_outpoint.get(&in_key).cloned();
                 if resolved_addr.is_none() {
                     if let Some(spk) = spk_by_outpoint.get(&in_key) {
-                        resolved_addr = spk_to_address_str(spk, NETWORK);
+                        resolved_addr = spk_to_address_str(spk, network);
                     }
                 }
 
@@ -884,7 +886,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                 continue;
             }
 
-            if let Some(address_str) = spk_to_address_str(&output.script_pubkey, NETWORK) {
+            if let Some(address_str) = spk_to_address_str(&output.script_pubkey, network) {
                 // Combine duplicates
                 let mut amounts_by_alkane: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
                 for entry in entries_for_vout {

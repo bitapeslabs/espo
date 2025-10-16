@@ -24,6 +24,11 @@ use crate::modules::ammdata::utils::pathfinder::{
     plan_swap_exact_tokens_for_tokens_implicit, plan_swap_tokens_for_exact_tokens,
 };
 
+#[inline]
+fn log_rpc(method: &str, msg: &str) {
+    eprintln!("[RPC::AMMDATA] {method} — {msg}");
+}
+
 fn now_ts() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
@@ -157,12 +162,12 @@ fn id_str(id: &SchemaAlkaneId) -> String {
 pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
     let mdb_ptr = Arc::new(mdb);
 
-    eprintln!("[RPC_AMMDATA] registering RPC handlers…");
+    eprintln!("[RPC::AMMDATA] registering RPC handlers…");
 
     /* -------------------- get_candles -------------------- */
     let reg_candles = reg.clone();
-
     let mdb_ptr_candles: Arc<Mdb> = Arc::clone(&mdb_ptr);
+
     tokio::spawn(async move {
         let mdb_for_handler = Arc::clone(&mdb_ptr_candles);
         reg_candles
@@ -208,7 +213,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         {
                             Some(p) => p,
                             None => {
-                                eprintln!("[RPC:get_candles] invalid pool, payload={payload:?}");
+                                log_rpc("get_candles", &format!("invalid pool, payload={payload:?}"));
                                 return json!({
                                     "ok": false,
                                     "error": "missing_or_invalid_pool",
@@ -216,6 +221,19 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                                 });
                             }
                         };
+
+                    log_rpc(
+                        "get_candles",
+                        &format!(
+                            "pool={}, timeframe={}, side={:?}, page={}, limit={}, now={}",
+                            id_str(&pool),
+                            tf.code(),
+                            side,
+                            page,
+                            limit,
+                            now
+                        ),
+                    );
 
                     let slice = read_candles_v1(&mdb, pool, tf, /*unused*/ limit, now, side);
                     match slice {
@@ -259,7 +277,10 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                                 "candles": arr
                             })
                         }
-                        Err(e) => json!({ "ok": false, "error": format!("read_failed: {e}") }),
+                        Err(e) => {
+                            log_rpc("get_candles", &format!("read_failed: {e}"));
+                            json!({ "ok": false, "error": format!("read_failed: {e}") })
+                        }
                     }
                 }
             })
@@ -306,7 +327,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         {
                             Some(p) => p,
                             None => {
-                                eprintln!("[RPC:get_trades] invalid pool, payload={payload:?}");
+                                log_rpc("get_trades", &format!("invalid pool, payload={payload:?}"));
                                 return json!({
                                     "ok": false,
                                     "error": "missing_or_invalid_pool",
@@ -314,6 +335,20 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                                 });
                             }
                         };
+
+                    log_rpc(
+                        "get_trades",
+                        &format!(
+                            "pool={}, side={:?}, filter_side={:?}, sort={}, dir={:?}, page={}, limit={}",
+                            id_str(&pool),
+                            side,
+                            filter_side,
+                            sort_code,
+                            dir,
+                            page,
+                            limit
+                        ),
+                    );
 
                     if sort_token.is_some() || !matches!(filter_side, TradeSideFilter::All) {
                         match read_trades_for_pool_sorted(
@@ -338,7 +373,10 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                                     "trades": trades
                                 })
                             }
-                            Err(e) => json!({ "ok": false, "error": format!("read_failed: {e}") }),
+                            Err(e) => {
+                                log_rpc("get_trades", &format!("read_failed(sorted): {e}"));
+                                json!({ "ok": false, "error": format!("read_failed: {e}") })
+                            }
                         }
                     } else {
                         match read_trades_for_pool(&mdb_for_handler, pool, page, limit, side) {
@@ -357,7 +395,10 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                                     "trades": trades
                                 })
                             }
-                            Err(e) => json!({ "ok": false, "error": format!("read_failed: {e}") }),
+                            Err(e) => {
+                                log_rpc("get_trades", &format!("read_failed: {e}"));
+                                json!({ "ok": false, "error": format!("read_failed: {e}") })
+                            }
                         }
                     }
                 }
@@ -367,19 +408,19 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
 
     /* -------------------- get_pools (LIVE ONLY, single call) -------------------- */
     let reg_pools = reg.clone();
-
     let mdb_for_pools = Arc::clone(&mdb_ptr);
+
     tokio::spawn(async move {
         reg_pools
             .register("get_pools", move |_cx, payload|  {
                 let mdb_for_handler = Arc::clone(&mdb_for_pools);
+                async move {
                 // Single live call that returns ALL pools + reserves
-                async move{
                 let live_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> =
                     match fetch_all_pools(&mdb_for_handler) {
                         Ok(m) => m,
                         Err(e) => {
-                            eprintln!("[RPC:get_pools] live reserves fetch failed: {e:?}");
+                            log_rpc("get_pools", &format!("live reserves fetch failed: {e:?}"));
                             return json!({
                                 "ok": false,
                                 "error": "live_fetch_failed",
@@ -409,6 +450,8 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                     .map(|n| n as usize)
                     .unwrap_or(1)
                     .max(1);
+
+                log_rpc("get_pools", &format!("total={}, page={}, limit={}", total, page, limit));
 
                 let offset = limit.saturating_mul(page.saturating_sub(1));
                 let end = (offset + limit).min(total);
@@ -459,7 +502,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                     match fetch_all_pools(&mdb_for_handler) {
                         Ok(m) => m,
                         Err(e) => {
-                            eprintln!("[RPC:find_best_swap_path] live fetch failed: {e:?}");
+                            log_rpc("find_best_swap_path", &format!("live fetch failed: {e:?}"));
                             return json!({
                                 "ok": false,
                                 "error": "no_liquidity",
@@ -469,6 +512,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                     };
 
                 if snapshot_map.is_empty() {
+                    log_rpc("find_best_swap_path", "live reserves map is empty");
                     return json!({
                         "ok": false,
                         "error": "no_liquidity",
@@ -508,6 +552,18 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                     .unwrap_or(3)
                     .max(1)
                     .min(6);
+
+                log_rpc(
+                    "find_best_swap_path",
+                    &format!(
+                        "mode={}, token_in={}, token_out={}, fee_bps={}, max_hops={}",
+                        id_str(&token_in),
+                        id_str(&token_in),
+                        id_str(&token_out),
+                        fee_bps,
+                        max_hops
+                    ),
+                );
 
                 // Run planner by mode
                 let plan = match mode.as_str() {
@@ -649,7 +705,10 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                             "hops": hops
                         })
                     }
-                    None => json!({"ok": false, "error": "no_path_found"}),
+                    None => {
+                        log_rpc("find_best_swap_path", "no_path_found");
+                        json!({"ok": false, "error": "no_path_found"})
+                    }
                 }
     }})
             .await;
@@ -670,7 +729,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                     match fetch_all_pools(&mdb_for_handler) {
                         Ok(m) => m,
                         Err(e) => {
-                            eprintln!("[RPC:get_best_mev_swap] live fetch failed: {e:?}");
+                            log_rpc("get_best_mev_swap", &format!("live fetch failed: {e:?}"));
                             return json!({
                                 "ok": false,
                                 "error": "no_liquidity",
@@ -680,6 +739,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                     };
 
                 if snapshot_map.is_empty() {
+                    log_rpc("get_best_mev_swap", "live reserves map is empty");
                     return json!({
                         "ok": false,
                         "error": "no_liquidity",
@@ -705,6 +765,16 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                     .map(|n| n as usize)
                     .unwrap_or(3)
                     .clamp(2, 6); // cycles require at least 2 hops
+
+                log_rpc(
+                    "get_best_mev_swap",
+                    &format!(
+                        "token={}, fee_bps={}, max_hops={}",
+                        id_str(&token),
+                        fee_bps,
+                        max_hops
+                    ),
+                );
 
                 match plan_best_mev_swap(&snapshot_map, token, fee_bps, max_hops) {
                     Some(pq) => {
@@ -733,7 +803,10 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                             "hops": hops
                         })
                     }
-                    None => json!({"ok": false, "error": "no_profitable_cycle"}),
+                    None => {
+                        log_rpc("get_best_mev_swap", "no_profitable_cycle");
+                        json!({"ok": false, "error": "no_profitable_cycle"})
+                    }
                 }
             }})
             .await;
@@ -744,7 +817,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
     tokio::spawn(async move {
         reg_ping
             .register("ping", |_cx, _payload| async move {
-                eprintln!("[RPC:ping] pong");
+                log_rpc("ping", "ok");
                 Value::String("pong".to_string())
             })
             .await;

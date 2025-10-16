@@ -1,16 +1,16 @@
 use crate::schemas::SchemaAlkaneId;
 use std::collections::{BTreeMap, HashMap};
 
+use crate::config::get_network;
+use crate::modules::ammdata::schemas::SchemaTradeV1;
+use crate::modules::ammdata::utils::candles::PriceSide;
+use crate::runtime::mdb::Mdb;
 use anyhow::Result;
 use bitcoin::{
     Address, Network, Script, Transaction, TxIn, TxOut, Txid, blockdata::script::Instruction,
     hashes::Hash,
 };
 use borsh::{BorshDeserialize, to_vec};
-
-use crate::modules::ammdata::schemas::SchemaTradeV1;
-use crate::modules::ammdata::utils::candles::PriceSide;
-use crate::runtime::mdb::Mdb;
 
 /* ----------------------- storage key helpers -----------------------
 IMPORTANT: All keys here are RELATIVE to the DB-level namespace.
@@ -102,7 +102,6 @@ fn primary_spender_info(
 /* ---------------- build a SchemaTradeV1 from extraction ------------- */
 
 use crate::alkanes::trace::EspoAlkanesTransaction;
-use crate::consts;
 use crate::modules::ammdata::utils::reserves::ReserveExtraction;
 
 /// Create a SchemaTradeV1 from a ReserveExtraction and its hosting tx.
@@ -112,8 +111,8 @@ pub fn create_trade_v1(
     tx: &EspoAlkanesTransaction,
     extraction: &ReserveExtraction,
 ) -> Option<SchemaTradeV1> {
+    let network = get_network();
     // identify a primary swapper address + x-only pubkey
-    let network: Network = consts::NETWORK;
     let (address, xpubkey) = primary_spender_info(network, prevouts, &tx.transaction)
         .unwrap_or((String::new(), [0u8; 32]));
 

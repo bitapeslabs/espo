@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::config::init_block_source;
 //modules
+use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
 use crate::utils::{EtaTracker, fmt_duration};
@@ -21,14 +22,15 @@ use anyhow::{Context, Result};
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
     config::{get_config, get_espo_db, init_config},
-    consts::{NETWORK, alkanes_genesis_block},
+    consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
     runtime::rpc::run_rpc,
 };
 #[tokio::main]
 async fn main() -> Result<()> {
     init_config()?;
-    init_block_source(NETWORK)?;
+    let network = get_network();
+    init_block_source()?;
     let cfg = get_config();
 
     // Build module registry with the global ESPO DB
@@ -47,14 +49,14 @@ async fn main() -> Result<()> {
     });
     eprintln!("[rpc] listening on {}", addr);
 
-    let global_genesis = alkanes_genesis_block(NETWORK);
+    let global_genesis = alkanes_genesis_block(network);
 
     // Decide initial start height (resume at last+1 per module)
     let start_height = mods
         .modules()
         .iter()
         .map(|m| {
-            let g = m.get_genesis_block(NETWORK);
+            let g = m.get_genesis_block(network);
             match m.get_index_height() {
                 Some(h) => h.saturating_add(1).max(g),
                 None => g,
@@ -108,7 +110,7 @@ async fn main() -> Result<()> {
                     // (Optional) include hash or tx count here as you like
 
                     for m in mods.modules() {
-                        if next_height >= m.get_genesis_block(NETWORK) {
+                        if next_height >= m.get_genesis_block(network) {
                             if let Err(e) = m.index_block(espo_block.clone()) {
                                 eprintln!(
                                     "[module:{}] height {}: {e:?}",
