@@ -9,6 +9,9 @@ pub mod types;
 pub mod utils;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use crate::config::init_block_source;
@@ -26,6 +29,9 @@ use crate::{
     modules::defs::ModuleRegistry,
     runtime::rpc::run_rpc,
 };
+
+static ESPO_HEIGHT: OnceLock<Arc<AtomicU32>> = OnceLock::new();
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_config()?;
@@ -66,7 +72,13 @@ async fn main() -> Result<()> {
         .unwrap_or(global_genesis)
         .max(global_genesis);
 
+    let height_cell = Arc::new(AtomicU32::new(start_height));
+
+    ESPO_HEIGHT
+        .set(height_cell.clone())
+        .map_err(|_| anyhow::anyhow!("espo height client already initialized"))?;
     let mut next_height: u32 = start_height;
+
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
     // ETA tracker
@@ -123,6 +135,9 @@ async fn main() -> Result<()> {
 
                     eta.finish_block();
                     next_height = next_height.saturating_add(1);
+                    if let Some(h) = ESPO_HEIGHT.get() {
+                        h.store(next_height, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 Err(e) => {
                     eprintln!("[indexer] error at height {}: {e:?}", next_height);

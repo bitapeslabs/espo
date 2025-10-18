@@ -1,8 +1,10 @@
+use crate::ESPO_HEIGHT;
 use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB};
 use anyhow::Result;
 use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{DB, Options};
+use std::sync::atomic::Ordering;
 use std::{fs, path::Path, sync::OnceLock, time::Duration};
 
 // Bitcoin Core / bitcoin::Network
@@ -127,7 +129,7 @@ pub fn init_config() -> Result<()> {
 
     // --- init Electrum client once ---
     let electrum_url = format!("tcp://{}", args.electrum_rpc_url);
-    let client = Client::new(&electrum_url)?;
+    let client: Client = Client::new(&electrum_url)?;
     ELECTRUM_CLIENT
         .set(client)
         .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
@@ -213,4 +215,11 @@ pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
 /// NEW: Global accessor for bitcoin::Network
 pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
+}
+
+pub fn get_espo_next_height() -> u32 {
+    ESPO_HEIGHT
+        .get()
+        .expect("indexer must be initialized before calling get_espo_next_height")
+        .load(Ordering::Relaxed)
 }

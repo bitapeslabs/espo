@@ -5,4 +5,5 @@ cargo run --release -- \
   --bitcoind-rpc-url http://127.0.0.1:8332 \
   --bitcoind-rpc-user admin \
   --bitcoind-rpc-pass admin \
-  --bitcoind-blocks-dir "$HOME/.bitcoin/blocks"
+  --bitcoind-blocks-dir "$HOME/.bitcoin/blocks" \
+  --network mainnet

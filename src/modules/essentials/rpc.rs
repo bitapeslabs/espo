@@ -1,6 +1,8 @@
 use crate::config::get_network;
 use crate::modules::defs::RpcNsRegistrar;
-use crate::modules::essentials::main::Essentials; // for Essentials::k_kv
+use crate::modules::essentials::main::Essentials;
+use crate::modules::essentials::storage::{HoldersCountEntry, holders_count_key};
+// for Essentials::k_kv
 use crate::runtime::mdb::Mdb;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 
@@ -10,8 +12,9 @@ use serde_json::{Value, json};
 use borsh::BorshDeserialize;
 
 // <-- use the public helpers & types from balances.rs
+use super::storage::BalanceEntry;
 use super::utils::balances::{
-    BalanceEntry, get_balance_for_address, get_holders_for_alkane,
+    get_balance_for_address, get_holders_for_alkane,
     get_outpoint_balances as get_outpoint_balances_index,
 };
 
@@ -35,6 +38,7 @@ fn normalize_address(s: &str) -> Option<String> {
 
 /* ---------------- register ---------------- */
 use std::sync::Arc;
+use std::vec;
 
 /// Tiny helper to standardize RPC logs.
 #[inline]
@@ -263,7 +267,6 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
         });
     }
 
-    /* -------- NEW: get_address_balances -------- */
     {
         let reg_addr_bal = reg.clone();
         let mdb_addr_bal = Arc::clone(&mdb);
@@ -377,7 +380,6 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
         });
     }
 
-    /* -------- NEW: get_outpoint_balances -------- */
     {
         let reg_op_bal = reg.clone();
         let mdb_op_bal = Arc::clone(&mdb);
@@ -467,7 +469,50 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
         });
     }
 
-    /* -------- UPDATED: get_address_outpoints -------- */
+    {
+        let reg_holders_count = reg.clone();
+        let mdb_holders_count = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_holders_count
+                .register("get_holders_count", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_holders_count);
+                    async move {
+
+
+                        let alkane = match payload
+                            .get("alkane")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_holders_count", "missing_or_invalid_alkane");
+                                return json!({"ok": false, "error": "missing_or_invalid_alkane"});
+                            }
+                        };
+
+                        let holders_count_key = holders_count_key(&alkane);
+
+
+                        let count: u64 = match HoldersCountEntry::try_from_slice(&mdb.get(&holders_count_key).ok().flatten().unwrap_or(vec![] as Vec<u8>)) {
+                            Ok(count_value) => count_value.count,
+                            Err(_) => {
+                                log_rpc("get_holders_count", "missing_or_invalid_outpoint");
+                                return json!({"ok": false, "error": "missing_or_invalid_outpoint", "hint": "expected \"<txid>:<vout>\""});
+                            }
+                        };
+
+
+                        json!({
+                            "ok": true,
+                            "count": count,
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
     {
         let reg_addr_ops = reg.clone();
         let mdb_addr_ops = Arc::clone(&mdb);

@@ -1,4 +1,4 @@
-use crate::modules::defs::RpcRegistry;
+use crate::{config::get_espo_next_height, modules::defs::RpcRegistry};
 use axum::{
     Router,
     body::Bytes,
@@ -39,11 +39,27 @@ struct JsonRpcResponse {
 
 const JSONRPC_VERSION: &str = "2.0";
 
+// Built-in root method name
+const ROOT_METHOD_GET_ESPO_HEIGHT: &str = "get_espo_height";
+
 fn err_response(id: Value, code: i64, message: &str, data: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION,
         result: None,
         error: Some(JsonRpcError { code, message: message.to_string(), data }),
+        id,
+    }
+}
+
+fn get_espo_tip_height_response(id: Value) -> JsonRpcResponse {
+    let height: u32 = get_espo_next_height().saturating_sub(1);
+
+    JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION,
+        result: Some(json!({
+            "height": height
+        })),
+        error: None,
         id,
     }
 }
@@ -126,24 +142,38 @@ async fn handle_single_request(
         }
     };
 
+    // --- Built-in "get_espo_height" support (notifications still receive no reply) ---
     if id_opt.is_none() {
         // Valid notification → process but do not respond
         let method_exists = {
-            let methods = state.registry.list().await;
-            methods.iter().any(|m| m == method)
+            // Consider built-in root method as existing
+            if method == ROOT_METHOD_GET_ESPO_HEIGHT {
+                true
+            } else {
+                let methods = state.registry.list().await;
+                methods.iter().any(|m| m == method)
+            }
         };
         if !method_exists {
             // MUST NOT reply to a notification (even if unknown)
             return None;
         }
-        // Fire-and-forget invoke
-        let cx = context::current();
-        let _ = state.registry.call(cx, method, params).await;
+        // Fire-and-forget invoke for registered methods; built-in does nothing
+        if method != ROOT_METHOD_GET_ESPO_HEIGHT {
+            let cx = context::current();
+            let _ = state.registry.call(cx, method, params.clone()).await;
+        }
         return None;
     }
 
     // Normal call (must produce a response)
     let id = id_opt.unwrap(); // safe
+
+    // If the built-in root method is requested, handle immediately.
+    if method == ROOT_METHOD_GET_ESPO_HEIGHT {
+        return Some(get_espo_tip_height_response(id));
+    }
+
     // Check method existence to produce -32601 at the protocol layer
     let method_exists = {
         let methods = state.registry.list().await;
@@ -153,7 +183,7 @@ async fn handle_single_request(
         return Some(method_not_found(id));
     }
 
-    // Invoke
+    // Invoke registered method WITH THE ORIGINAL PARAMS
     let cx = context::current();
     let result = match std::panic::AssertUnwindSafe(state.registry.call(cx, method, params))
         .catch_unwind()
