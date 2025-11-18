@@ -29,17 +29,16 @@ dependencies = [
 [[package]]
 name = "alkanes-support"
 version = "1.2.3"
-source = "git+https://github.com/kungfuflex/alkanes-rs#83a78fe719cb4e2817d032b3cca6f10b1f7a7a8a"
+source = "git+https://github.com/kungfuflex/alkanes-rs?rev=b5d8815772ebe69f8b0309d233fad0fd79dd0934#b5d8815772ebe69f8b0309d233fad0fd79dd0934"
 dependencies = [
  "anyhow",
  "bitcoin",
  "flate2",
  "hex",
  "metashrew-support",
- "protobuf 3.7.2",
- "protobuf-codegen 3.7.2",
- "protoc-bin-vendored",
- "protoc-rust",
+ "prost",
+ "prost-build",
+ "prost-types",
  "protorune-support",
  "serde",
 ]
@@ -262,7 +261,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -699,7 +698,7 @@ dependencies = [
  "hex",
  "lru",
  "ordinals",
- "protobuf 3.7.2",
+ "prost",
  "protobuf-json-mapping",
  "protorune-support",
  "rocksdb",
@@ -722,6 +721,12 @@ name = "find-msvc-tools"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fd99930f64d146689264c637b5af2f0233a933bef0d8570e2526bf9e083192d"
+
+[[package]]
+name = "fixedbitset"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 
 [[package]]
 name = "flate2"
@@ -1097,6 +1102,15 @@ checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 
 [[package]]
 name = "itertools"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
@@ -1298,6 +1312,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "multimap"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1381,7 +1401,7 @@ dependencies = [
 [[package]]
 name = "ordinals"
 version = "1.2.3"
-source = "git+https://github.com/kungfuflex/alkanes-rs#83a78fe719cb4e2817d032b3cca6f10b1f7a7a8a"
+source = "git+https://github.com/kungfuflex/alkanes-rs?rev=b5d8815772ebe69f8b0309d233fad0fd79dd0934#b5d8815772ebe69f8b0309d233fad0fd79dd0934"
 dependencies = [
  "bitcoin",
  "derive_more",
@@ -1395,6 +1415,16 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "petgraph"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4c5cc86750666a3ed20bdaf5ca2a0344f9c67674cae0515bec2da16fbaa47db"
+dependencies = [
+ "fixedbitset",
+ "indexmap 2.11.1",
+]
 
 [[package]]
 name = "pin-project"
@@ -1475,6 +1505,59 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prost"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "deb1435c188b76130da55f17a466d252ff7b1418b2ad3e037d127b94e3411f29"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-build"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
+dependencies = [
+ "bytes",
+ "heck",
+ "itertools 0.12.1",
+ "log",
+ "multimap",
+ "once_cell",
+ "petgraph",
+ "prettyplease",
+ "prost",
+ "prost-types",
+ "regex",
+ "syn",
+ "tempfile",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
+dependencies = [
+ "anyhow",
+ "itertools 0.12.1",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "prost-types"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9091c90b0a32608e984ff2fa4091273cbdd755d54935c51d520887f4a1dbd5b0"
+dependencies = [
+ "prost",
 ]
 
 [[package]]
@@ -1643,7 +1726,7 @@ dependencies = [
 [[package]]
 name = "protorune-support"
 version = "1.2.3"
-source = "git+https://github.com/kungfuflex/alkanes-rs#83a78fe719cb4e2817d032b3cca6f10b1f7a7a8a"
+source = "git+https://github.com/kungfuflex/alkanes-rs?rev=b5d8815772ebe69f8b0309d233fad0fd79dd0934#b5d8815772ebe69f8b0309d233fad0fd79dd0934"
 dependencies = [
  "anyhow",
  "bech32",
@@ -1651,10 +1734,9 @@ dependencies = [
  "hex",
  "metashrew-support",
  "ordinals",
- "protobuf 3.7.2",
- "protobuf-codegen 3.7.2",
- "protoc-bin-vendored",
- "protoc-rust",
+ "prost",
+ "prost-build",
+ "prost-types",
  "serde",
 ]
 

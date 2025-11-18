@@ -2,6 +2,8 @@ use crate::config::{
     get_block_source, // NEW: use BlockSource for full blocks
     get_metashrew_sdb,
 };
+use prost::Message;
+
 use crate::consts::TRACES_BY_BLOCK_PREFIX;
 use crate::core::blockfetcher::BlockSource;
 use crate::runtime::sdb::SDB;
@@ -15,7 +17,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
 
 // use bitcoincore_rpc::RpcApi; // REMOVED: block fetch now via BlockSource
-use protobuf::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -150,8 +151,14 @@ pub fn extract_alkane_storage(
                     if let Some(ctx) = enter.context.as_ref() {
                         if let Some(inner) = ctx.inner.as_ref() {
                             if let Some(myself) = inner.myself.as_ref() {
-                                let owner: SchemaAlkaneId = myself.clone().try_into()?;
-                                stack.push(owner);
+                                if let Some(owner) = myself.clone().try_into().ok() {
+                                    stack.push(owner);
+                                } else {
+                                    println!(
+                                        "WARN: Txid {} has a trace making a call to an invalid alkane id and therefore will be excluded from EspoBlock",
+                                        transaction.compute_txid()
+                                    )
+                                }
                             }
                         }
                     }
@@ -168,7 +175,6 @@ pub fn extract_alkane_storage(
                     }
                 }
                 Event::CreateAlkane(_create) => {}
-                _ => {}
             }
         }
     }
@@ -266,10 +272,10 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
             use alkanes::alkanes_trace_event::Event;
             match event {
                 Event::EnterContext(enter) => {
-                    let typ = match enter.call_type.enum_value_or_default() {
-                        alkanes::AlkanesTraceCallType::CALL => "call",
-                        alkanes::AlkanesTraceCallType::DELEGATECALL => "delegatecall",
-                        alkanes::AlkanesTraceCallType::STATICCALL => "staticcall",
+                    let typ = match enter.call_type() {
+                        alkanes::AlkanesTraceCallType::Call => "call",
+                        alkanes::AlkanesTraceCallType::Delegatecall => "delegatecall",
+                        alkanes::AlkanesTraceCallType::Staticcall => "staticcall",
                         _ => "unknown",
                     };
 
@@ -324,8 +330,8 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                 }
 
                 Event::ExitContext(exit) => {
-                    let status = match exit.status.enum_value_or_default() {
-                        alkanes::AlkanesTraceStatusFlag::FAILURE => "failure",
+                    let status = match exit.status() {
+                        alkanes::AlkanesTraceStatusFlag::Failure => "failure",
                         _ => "success",
                     };
 
@@ -395,7 +401,6 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                         }
                     }));
                 }
-                &_ => {}
             }
         }
     }
@@ -413,10 +418,10 @@ fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
 
 // parse possibly-tailed trace (strip trailing u32 if needed)
 fn parse_trace_maybe_with_trailer(mut bytes: Vec<u8>) -> Option<AlkanesTrace> {
-    AlkanesTrace::parse_from_bytes(&bytes).ok().or_else(|| {
+    AlkanesTrace::decode(bytes.as_slice()).ok().or_else(|| {
         if bytes.len() >= 4 {
             bytes.truncate(bytes.len() - 4);
-            AlkanesTrace::parse_from_bytes(&bytes).ok()
+            AlkanesTrace::decode(bytes.as_slice()).ok()
         } else {
             None
         }
