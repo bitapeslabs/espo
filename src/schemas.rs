@@ -1,5 +1,5 @@
 use alkanes_support::proto::alkanes::{AlkaneId, Uint128};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use protorune_support::balance_sheet::IntoString;
 use std::fmt;
@@ -39,40 +39,25 @@ fn uint128_from_u128_le(x: u128) -> Uint128 {
     Uint128 { lo, hi }
 }
 
-/* ---------- AlkaneId -> SchemaAlkaneId ---------- */
-
 impl TryInto<SchemaAlkaneId> for AlkaneId {
     type Error = anyhow::Error;
 
     fn try_into(self) -> Result<SchemaAlkaneId> {
-        let b = self
+        let prost_block_u128 = self
             .block
             .as_ref()
             .context("Schema error: missing block on AlkaneId -> SchemaAlkaneId")?;
-        let t = self
+        let prost_tx_u128 = self
             .tx
             .as_ref()
             .context("Schema error: missing tx on AlkaneId -> SchemaAlkaneId")?;
 
-        // Correct recomposition: (hi << 64) | lo
-        let block128 = u128_from_uint128(b);
-        let tx128 = u128_from_uint128(t);
+        let block: u32 = u128_from_uint128(prost_block_u128).try_into().unwrap_or(u32::MAX);
+        let tx: u64 = u128_from_uint128(prost_tx_u128).try_into().unwrap_or(u64::MAX);
 
-        // Enforce fit to schema (u32/u64)
-        if block128 > (u32::MAX as u128) {
-            return Err(anyhow!("Schema error: block does not fit into u32: {block128}"));
-        }
-        if tx128 > (u64::MAX as u128) {
-            println!("(DBG SCHEMA) -> {}:{}", block128, tx128);
-            println!("(DBG PROTOBUF) -> {:?}", self);
-            return Err(anyhow!("Schema error: tx does not fit into u64: {tx128}"));
-        }
-
-        Ok(SchemaAlkaneId { block: block128 as u32, tx: tx128 as u64 })
+        Ok(SchemaAlkaneId { block, tx })
     }
 }
-
-/* ---------- SchemaAlkaneId -> AlkaneId ---------- */
 
 impl TryFrom<SchemaAlkaneId> for AlkaneId {
     type Error = anyhow::Error;

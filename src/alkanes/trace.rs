@@ -21,6 +21,7 @@ use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EspoSandshrewLikeTrace {
@@ -151,14 +152,8 @@ pub fn extract_alkane_storage(
                     if let Some(ctx) = enter.context.as_ref() {
                         if let Some(inner) = ctx.inner.as_ref() {
                             if let Some(myself) = inner.myself.as_ref() {
-                                if let Some(owner) = myself.clone().try_into().ok() {
-                                    stack.push(owner);
-                                } else {
-                                    println!(
-                                        "WARN: Txid {} has a trace making a call to an invalid alkane id and therefore will be excluded from EspoBlock",
-                                        transaction.compute_txid()
-                                    )
-                                }
+                                let owner: SchemaAlkaneId = myself.clone().try_into()?;
+                                stack.push(owner);
                             }
                         }
                     }
