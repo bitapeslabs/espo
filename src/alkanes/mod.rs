@@ -1,2 +1,3 @@
+pub mod metashrew;
 pub mod trace;
 pub mod utils;

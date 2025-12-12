@@ -1,4 +1,5 @@
 use crate::ESPO_HEIGHT;
+use crate::alkanes::metashrew::MetashrewAdapter;
 use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB};
 use anyhow::Result;
 use clap::Parser;
@@ -73,6 +74,9 @@ pub struct CliArgs {
     /// Bitcoin network: 'mainnet' or 'regtest'
     #[arg(short, long, value_parser = parse_network, default_value = "mainnet")]
     pub network: Network,
+
+    #[arg(long, short, default_value = None)]
+    pub metashrew_db_label: Option<String>,
 }
 
 pub fn init_config() -> Result<()> {
@@ -215,6 +219,12 @@ pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
 /// NEW: Global accessor for bitcoin::Network
 pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
+}
+
+pub fn get_metashrew() -> MetashrewAdapter {
+    let label = get_config().metashrew_db_label.clone();
+
+    MetashrewAdapter::new(label)
 }
 
 pub fn get_espo_next_height() -> u32 {

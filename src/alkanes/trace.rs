@@ -1,10 +1,8 @@
 use crate::config::{
     get_block_source, // NEW: use BlockSource for full blocks
-    get_metashrew_sdb,
+    get_metashrew,
 };
-use crate::consts::TRACES_BY_BLOCK_PREFIX;
 use crate::core::blockfetcher::BlockSource;
-use crate::runtime::sdb::SDB;
 use crate::schemas::EspoOutpoint;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::proto::alkanes;
@@ -15,8 +13,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
 
 // use bitcoincore_rpc::RpcApi; // REMOVED: block fetch now via BlockSource
-use protobuf::Message;
-use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -174,66 +170,6 @@ pub fn extract_alkane_storage(
     }
 
     Ok(out)
-}
-
-fn trace_block_prefix(block: &u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(7 + 8 + 1);
-    v.extend_from_slice(TRACES_BY_BLOCK_PREFIX);
-    v.extend_from_slice(&block.to_le_bytes());
-    v.push(b'/');
-    v
-}
-
-fn next_prefix(mut p: Vec<u8>) -> Option<Vec<u8>> {
-    for i in (0..p.len()).rev() {
-        if p[i] != 0xff {
-            p[i] += 1;
-            p.truncate(i + 1);
-            return Some(p);
-        }
-    }
-    None
-}
-
-fn is_length_bucket(key: &[u8], prefix: &[u8]) -> bool {
-    if key.len() < prefix.len() + 1 + 4 {
-        return false;
-    }
-    let bucket = &key[prefix.len()..key.len() - 4];
-    bucket == b"length"
-}
-
-pub fn collect_outpoints_for_block(db: &SDB, block: &u64) -> Result<Vec<Vec<u8>>> {
-    let prefix = trace_block_prefix(block);
-    let mut ro = ReadOptions::default();
-    if let Some(ub) = next_prefix(prefix.clone()) {
-        ro.set_iterate_upper_bound(ub);
-    }
-    ro.set_total_order_seek(true);
-
-    let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
-    let mut out = Vec::new();
-
-    while let Some(Ok((k, v))) = it.next() {
-        if !k.starts_with(&prefix) {
-            break;
-        }
-        if is_length_bucket(&k, &prefix) {
-            continue;
-        }
-        if v.len() == 4 && v[..] == [0x01, 0x00, 0x00, 0x00] {
-            continue;
-        }
-        if v.len() < 36 {
-            continue;
-        }
-        out.push(v[..36].to_vec());
-    }
-    Ok(out)
-}
-
-pub fn outpoint_bytes_to_key(bytes: &Vec<u8>) -> Vec<u8> {
-    vec![TRACES_BY_BLOCK_PREFIX, &bytes.to_vec(), &vec![0x00, 0x00, 0x00, 0x00]].concat()
 }
 
 fn fmt_u128_hex(u: &alkanes::Uint128) -> String {
@@ -412,41 +348,12 @@ fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
 }
 
 // parse possibly-tailed trace (strip trailing u32 if needed)
-fn parse_trace_maybe_with_trailer(mut bytes: Vec<u8>) -> Option<AlkanesTrace> {
-    AlkanesTrace::parse_from_bytes(&bytes).ok().or_else(|| {
-        if bytes.len() >= 4 {
-            bytes.truncate(bytes.len() - 4);
-            AlkanesTrace::parse_from_bytes(&bytes).ok()
-        } else {
-            None
-        }
-    })
+pub fn traces_for_block_as_protobuf(block: u64) -> Result<Vec<PartialEspoTrace>> {
+    get_metashrew().traces_for_block_as_protobuf(block)
 }
 
-pub fn traces_for_block_as_protobuf(db: &SDB, block: u64) -> Result<Vec<PartialEspoTrace>> {
-    let outpoints = collect_outpoints_for_block(db, &block)
-        .with_context(|| format!("collect_outpoints_for_block({block}) failed"))?;
-
-    let keys: Vec<Vec<u8>> = outpoints.iter().map(|op| outpoint_bytes_to_key(op)).collect();
-
-    let values = db.multi_get(keys.iter())?;
-
-    let traces: Vec<PartialEspoTrace> = values
-        .into_iter()
-        .flat_map(Option::into_iter)
-        .map(|bytes| parse_trace_maybe_with_trailer(bytes))
-        .flat_map(Option::into_iter)
-        .enumerate()
-        .map(|(index, protobuf_trace)| PartialEspoTrace {
-            protobuf_trace,
-            outpoint: outpoints[index].clone(),
-        })
-        .collect();
-    Ok(traces)
-}
-
-pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
-    let partial_traces = traces_for_block_as_protobuf(db, block)?;
+pub fn traces_for_block_as_json_str(block: u64) -> Result<String> {
+    let partial_traces = traces_for_block_as_protobuf(block)?;
     let mut entries: Vec<serde_json::Value> = Vec::new();
 
     for partial_trace in partial_traces {
@@ -466,11 +373,8 @@ pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
 }
 
 /// Build a map { txid_be_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
-fn traces_for_block_indexed(
-    db: &SDB,
-    block: u64,
-) -> Result<HashMap<String, Vec<(u32, PartialEspoTrace)>>> {
-    let partials = traces_for_block_as_protobuf(db, block)
+fn traces_for_block_indexed(block: u64) -> Result<HashMap<String, Vec<(u32, PartialEspoTrace)>>> {
+    let partials = traces_for_block_as_protobuf(block)
         .with_context(|| format!("failed traces_for_block_as_protobuf({block})"))?;
 
     let mut map: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
@@ -494,7 +398,6 @@ fn traces_for_block_indexed(
 pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
     eprintln!("[TRACE::get_espo_block] start block={block}, tip={tip}");
 
-    let metashrew_sdb = &get_metashrew_sdb();
     let block_source = get_block_source();
 
     // Block height conversions
@@ -519,7 +422,7 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
     let block_header: Header = full_block.header.clone();
 
     // Index traces
-    let traces_index = traces_for_block_indexed(metashrew_sdb, block)?;
+    let traces_index = traces_for_block_indexed(block)?;
     eprintln!(
         "[TRACE::get_espo_block] built traces_index for block={} ({} txs with traces)",
         block,
