@@ -6,8 +6,4 @@ cargo run --release -- \
   --bitcoind-rpc-user admin \
   --bitcoind-rpc-pass admin \
   --bitcoind-blocks-dir "$HOME/.bitcoin/blocks" \
-  --network mainnet \
-  --metashrew-version v9 
-
-
-
+  --network mainnet

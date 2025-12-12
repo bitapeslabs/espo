@@ -164,7 +164,6 @@ pub fn extract_alkane_storage(
                     }
                 }
                 Event::CreateAlkane(_create) => {}
-                _ => {}
             }
         }
     }
@@ -202,10 +201,10 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
             use alkanes::alkanes_trace_event::Event;
             match event {
                 Event::EnterContext(enter) => {
-                    let typ = match enter.call_type.enum_value_or_default() {
-                        alkanes::AlkanesTraceCallType::CALL => "call",
-                        alkanes::AlkanesTraceCallType::DELEGATECALL => "delegatecall",
-                        alkanes::AlkanesTraceCallType::STATICCALL => "staticcall",
+                    let typ = match enter.call_type() {
+                        alkanes::AlkanesTraceCallType::Call => "call",
+                        alkanes::AlkanesTraceCallType::Delegatecall => "delegatecall",
+                        alkanes::AlkanesTraceCallType::Staticcall => "staticcall",
                         _ => "unknown",
                     };
 
@@ -260,8 +259,8 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                 }
 
                 Event::ExitContext(exit) => {
-                    let status = match exit.status.enum_value_or_default() {
-                        alkanes::AlkanesTraceStatusFlag::FAILURE => "failure",
+                    let status = match exit.status() {
+                        alkanes::AlkanesTraceStatusFlag::Failure => "failure",
                         _ => "success",
                     };
 
@@ -331,7 +330,6 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                         }
                     }));
                 }
-                &_ => {}
             }
         }
     }
@@ -348,12 +346,12 @@ fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
 }
 
 // parse possibly-tailed trace (strip trailing u32 if needed)
-pub fn traces_for_block_as_protobuf(block: u64) -> Result<Vec<PartialEspoTrace>> {
-    get_metashrew().traces_for_block_as_protobuf(block)
+pub fn traces_for_block_as_prost(block: u64) -> Result<Vec<PartialEspoTrace>> {
+    get_metashrew().traces_for_block_as_prost(block)
 }
 
 pub fn traces_for_block_as_json_str(block: u64) -> Result<String> {
-    let partial_traces = traces_for_block_as_protobuf(block)?;
+    let partial_traces = traces_for_block_as_prost(block)?;
     let mut entries: Vec<serde_json::Value> = Vec::new();
 
     for partial_trace in partial_traces {
@@ -374,8 +372,8 @@ pub fn traces_for_block_as_json_str(block: u64) -> Result<String> {
 
 /// Build a map { txid_be_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
 fn traces_for_block_indexed(block: u64) -> Result<HashMap<String, Vec<(u32, PartialEspoTrace)>>> {
-    let partials = traces_for_block_as_protobuf(block)
-        .with_context(|| format!("failed traces_for_block_as_protobuf({block})"))?;
+    let partials = traces_for_block_as_prost(block)
+        .with_context(|| format!("failed traces_for_block_as_prost({block})"))?;
 
     let mut map: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     for p in partials {
@@ -435,9 +433,7 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
         let txid = tx.compute_txid();
         let txid_hex = txid.to_string();
 
-        let traces_opt: Option<Vec<EspoTrace>> = if let Some(vouts_partials) =
-            traces_index.get(&txid_hex)
-        {
+        let traces_opt: Option<Vec<EspoTrace>> = if let Some(vouts_partials) = traces_index.get(&txid_hex) {
             let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
             for (vout, partial) in vouts_partials.iter() {
                 let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;

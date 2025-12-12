@@ -2,14 +2,10 @@ use crate::alkanes::trace::PartialEspoTrace;
 use crate::config::get_metashrew_sdb;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::proto::alkanes::AlkanesTrace;
-use anyhow::{Result, anyhow};
-use protobuf::Message;
+use anyhow::{Context, Result, anyhow};
+use prost::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 
-/// Value layout in Metashrew balances:
-/// - 20 bytes: [0..16) = balance u128 LE, [16..20) = updated u32 LE
-/// - 16 bytes: balance u128 LE (no updated)
-/// - 8/4 bytes: occasionally compacted values (we'll decode as u64/u32)
 #[derive(Debug, Clone, Copy)]
 struct DecodedVal {
     balance: Option<u128>,
@@ -45,6 +41,29 @@ fn decode_balance_value(bytes: &[u8]) -> DecodedVal {
         }
         _ => DecodedVal { balance: None, updated: None },
     }
+}
+
+fn try_decode_prost(raw: &[u8]) -> Option<AlkanesTrace> {
+    AlkanesTrace::decode(raw).ok().or_else(|| {
+        if raw.len() >= 4 { AlkanesTrace::decode(&raw[..raw.len() - 4]).ok() } else { None }
+    })
+}
+
+/// Traces can be stored as raw protobuf bytes or as UTF-8 "height:HEX" blobs.
+/// This helper handles both by decoding any hex payload and stripping the
+/// optional 4-byte trailer some entries carry.
+pub fn decode_trace_blob(bytes: &[u8]) -> Option<AlkanesTrace> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if let Some((_block, hex_part)) = s.split_once(':') {
+            if let Ok(decoded) = hex::decode(hex_part) {
+                if let Some(trace) = try_decode_prost(&decoded) {
+                    return Some(trace);
+                }
+            }
+        }
+    }
+
+    try_decode_prost(bytes)
 }
 
 pub struct MetashrewAdapter {
@@ -202,7 +221,7 @@ impl MetashrewAdapter {
         Ok(best_balance)
     }
 
-    pub fn traces_for_block_as_protobuf(&self, block: u64) -> Result<Vec<PartialEspoTrace>> {
+    pub fn traces_for_block_as_prost(&self, block: u64) -> Result<Vec<PartialEspoTrace>> {
         let trace_block_prefix = |blk: u64| {
             let mut v = Vec::with_capacity(7 + 8 + 1);
             v.extend_from_slice(b"/trace/");
@@ -230,24 +249,9 @@ impl MetashrewAdapter {
             bucket == b"length"
         };
 
-        let outpoint_bytes_to_key = |bytes: &Vec<u8>| {
-            let mut key = Vec::with_capacity(7 + bytes.len());
-            key.extend_from_slice(b"/trace/");
-            key.extend_from_slice(bytes);
-            self.apply_label(key)
-        };
-        let parse_trace_maybe_with_trailer = |mut bytes: Vec<u8>| -> Option<AlkanesTrace> {
-            AlkanesTrace::parse_from_bytes(&bytes).ok().or_else(|| {
-                if bytes.len() >= 4 {
-                    bytes.truncate(bytes.len() - 4);
-                    AlkanesTrace::parse_from_bytes(&bytes).ok()
-                } else {
-                    None
-                }
-            })
-        };
-
         let db = get_metashrew_sdb();
+        // Ensure the secondary view is fresh before scanning traces.
+        db.catch_up_now().context("metashrew catch_up before scanning traces")?;
         let prefix = trace_block_prefix(block);
 
         let mut ro = ReadOptions::default();
@@ -257,39 +261,79 @@ impl MetashrewAdapter {
         ro.set_total_order_seek(true);
 
         let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
-        let mut outpoints = Vec::new();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut outpoints: Vec<Vec<u8>> = Vec::new();
 
         while let Some(Ok((k, v))) = it.next() {
             if !k.starts_with(&prefix) {
                 break;
             }
+
             if is_length_bucket(&k, &prefix) {
                 continue;
             }
-            if v.len() == 4 && v[..] == [0x01, 0x00, 0x00, 0x00] {
-                continue;
-            }
-            if v.len() < 36 {
-                continue;
-            }
-            outpoints.push(v[..36].to_vec());
-        }
 
-        let keys: Vec<Vec<u8>> = outpoints.iter().map(outpoint_bytes_to_key).collect();
+            let suffix = &k[prefix.len()..];
+            let parts: Vec<&[u8]> = suffix.split(|b| *b == b'/').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+
+            if parts[1] == b"length" {
+                continue;
+            }
+
+            let trace_idx = match std::str::from_utf8(parts[1]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let val_str = std::str::from_utf8(&v)
+                .map_err(|e| anyhow!("utf8 decode trace pointer for block {block}: {e}"))?;
+            let (_block_str, hex_part) = val_str
+                .split_once(':')
+                .ok_or_else(|| anyhow!("trace pointer missing ':' for block {block}"))?;
+
+            let hex_bytes = hex::decode(hex_part)
+                .map_err(|e| anyhow!("hex decode trace pointer for block {block}: {e}"))?;
+            if hex_bytes.len() < 36 {
+                continue;
+            }
+
+            let (tx_be, vout) = hex_bytes.split_at(32);
+
+            let mut key = Vec::with_capacity(7 + tx_be.len() + vout.len() + 1 + trace_idx.len());
+            key.extend_from_slice(b"/trace/");
+            key.extend_from_slice(tx_be);
+            key.extend_from_slice(vout);
+            key.push(b'/');
+            key.extend_from_slice(trace_idx.as_bytes());
+            keys.push(self.apply_label(key));
+
+            // Pointer payload stores txid in little-endian already; keep as-is for outpoint.
+            let mut outpoint = tx_be.to_vec();
+            outpoint.extend_from_slice(vout);
+            outpoints.push(outpoint);
+        }
 
         let values = db.multi_get(keys.iter())?;
 
         let traces: Vec<PartialEspoTrace> = values
             .into_iter()
-            .flat_map(Option::into_iter)
-            .map(|bytes| parse_trace_maybe_with_trailer(bytes))
-            .flat_map(Option::into_iter)
-            .enumerate()
-            .map(|(index, protobuf_trace)| PartialEspoTrace {
-                protobuf_trace,
-                outpoint: outpoints[index].clone(),
+            .zip(outpoints.iter())
+            .filter_map(|(maybe_bytes, outpoint)| {
+                maybe_bytes.as_deref().and_then(decode_trace_blob).map(|protobuf_trace| {
+                    PartialEspoTrace { protobuf_trace, outpoint: outpoint.clone() }
+                })
             })
             .collect();
+        if traces.is_empty() {
+            eprintln!(
+                "[metashrew] block {block}: pointers={} keys={} traces=0",
+                outpoints.len(),
+                keys.len()
+            );
+        }
         Ok(traces)
     }
 }

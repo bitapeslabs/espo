@@ -698,7 +698,7 @@ dependencies = [
  "hex",
  "lru",
  "ordinals",
- "protobuf 3.7.2",
+ "prost",
  "protobuf-json-mapping",
  "protorune-support",
  "rocksdb",

@@ -5,18 +5,17 @@ pub mod core;
 pub mod modules;
 pub mod runtime;
 pub mod schemas;
-pub mod types;
 pub mod utils;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use crate::config::init_block_source;
 //modules
 use crate::config::get_network;
+use crate::config::get_metashrew_sdb;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
 use crate::utils::{EtaTracker, fmt_duration};
@@ -29,8 +28,7 @@ use crate::{
     modules::defs::ModuleRegistry,
     runtime::rpc::run_rpc,
 };
-
-static ESPO_HEIGHT: OnceLock<Arc<AtomicU32>> = OnceLock::new();
+use espo::ESPO_HEIGHT;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,6 +36,7 @@ async fn main() -> Result<()> {
     let network = get_network();
     init_block_source()?;
     let cfg = get_config();
+    let metashrew_sdb = get_metashrew_sdb();
 
     // Build module registry with the global ESPO DB
     let mut mods = ModuleRegistry::with_db(get_espo_db());
@@ -80,11 +79,16 @@ async fn main() -> Result<()> {
     let mut next_height: u32 = start_height;
 
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
+    let mut last_tip: Option<u32> = None;
 
     // ETA tracker
     let mut eta = EtaTracker::new(3.0); // EMA smoothing factor (tweak if you want faster/slower adaptation)
 
     loop {
+        if let Err(e) = metashrew_sdb.catch_up_now() {
+            eprintln!("[indexer] metashrew catch_up before tip fetch: {e:?}");
+        }
+
         let tip = match get_safe_tip() {
             Ok(h) => h,
             Err(e) => {
@@ -93,6 +97,17 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+        if let Some(prev_tip) = last_tip {
+            if tip > prev_tip {
+                if let Err(e) = metashrew_sdb.catch_up_now() {
+                    eprintln!(
+                        "[indexer] metashrew catch_up after new tip {} (prev {}) detected: {e:?}",
+                        tip, prev_tip
+                    );
+                }
+            }
+        }
+        last_tip = Some(tip);
 
         if next_height == start_height {
             let remaining = tip.saturating_sub(next_height) + 1;
@@ -114,6 +129,13 @@ async fn main() -> Result<()> {
             );
 
             eta.start_block();
+
+            if let Err(e) = metashrew_sdb.catch_up_now() {
+                eprintln!(
+                    "[indexer] metashrew catch_up before indexing block {}: {e:?}",
+                    next_height
+                );
+            }
 
             match get_espo_block(next_height.into(), tip.into())
                 .with_context(|| format!("failed to load espo block {next_height}"))

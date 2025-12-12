@@ -957,7 +957,6 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         }
     });
 
-    // -------- block summary ----------
     let minus_total: u128 = stat_minus_by_alk.values().copied().sum();
     let plus_total: u128 = stat_plus_by_alk.values().copied().sum();
 
@@ -976,8 +975,6 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
 
     Ok(())
 }
-
-/* -------------------------- Queries -------------------------- */
 
 pub fn get_balance_for_address(mdb: &Mdb, address: &str) -> Result<HashMap<SchemaAlkaneId, u128>> {
     let mut prefix = b"/balances/".to_vec();
@@ -1033,8 +1030,6 @@ pub fn get_holders_for_alkane(
     let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
     Ok((total, slice))
 }
-
-/* -------------------------- Optional: resolve address -> spk -------------------------- */
 
 pub fn get_scriptpubkey_for_address(mdb: &Mdb, addr: &str) -> Result<Option<ScriptBuf>> {
     let key = addr_spk_key(addr);

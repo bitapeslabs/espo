@@ -19,10 +19,12 @@ pub fn fetch_latest_reserves_for_pools(
     let mut out: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = HashMap::with_capacity(pools.len());
 
     for (pool_id, defs) in pools {
-        let base_bal =
-            metashrew.get_latest_reserves_for_alkane(pool_id, &defs.base_alkane_id)?.unwrap_or(0);
-        let quote_bal =
-            metashrew.get_latest_reserves_for_alkane(pool_id, &defs.quote_alkane_id)?.unwrap_or(0);
+        let base_bal = metashrew
+            .get_latest_reserves_for_alkane(pool_id, &defs.base_alkane_id)?
+            .unwrap_or(0);
+        let quote_bal = metashrew
+            .get_latest_reserves_for_alkane(pool_id, &defs.quote_alkane_id)?
+            .unwrap_or(0);
 
         eprintln!(
             "[AMMDATA-LIVE] pool {}/{} live reserves: base={}, quote={}",

@@ -70,6 +70,11 @@ impl SDB {
         Ok(self.sdb.get(key.as_ref())?)
     }
 
+    /// Expose underlying RocksDB handle for direct reads (read-only context).
+    pub fn as_db(&self) -> &DB {
+        &self.sdb
+    }
+
     pub fn multi_get<K>(&self, keys: impl IntoIterator<Item = K>) -> Result<Vec<Option<Vec<u8>>>>
     where
         K: AsRef<[u8]>,
