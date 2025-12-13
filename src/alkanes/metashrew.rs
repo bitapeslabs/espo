@@ -6,43 +6,6 @@ use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 
-#[derive(Debug, Clone, Copy)]
-struct DecodedVal {
-    balance: Option<u128>,
-    updated: Option<u32>,
-}
-#[inline]
-fn decode_balance_value(bytes: &[u8]) -> DecodedVal {
-    match bytes.len() {
-        20 => {
-            let mut bal = [0u8; 16];
-            bal.copy_from_slice(&bytes[..16]);
-            let mut ts = [0u8; 4];
-            ts.copy_from_slice(&bytes[16..20]);
-            DecodedVal {
-                balance: Some(u128::from_le_bytes(bal)),
-                updated: Some(u32::from_le_bytes(ts)),
-            }
-        }
-        16 => {
-            let mut bal = [0u8; 16];
-            bal.copy_from_slice(bytes);
-            DecodedVal { balance: Some(u128::from_le_bytes(bal)), updated: None }
-        }
-        8 => {
-            let mut a = [0u8; 8];
-            a.copy_from_slice(bytes);
-            DecodedVal { balance: Some(u64::from_le_bytes(a) as u128), updated: None }
-        }
-        4 => {
-            let mut a = [0u8; 4];
-            a.copy_from_slice(bytes);
-            DecodedVal { balance: Some(u32::from_le_bytes(a) as u128), updated: None }
-        }
-        _ => DecodedVal { balance: None, updated: None },
-    }
-}
-
 fn try_decode_prost(raw: &[u8]) -> Option<AlkanesTrace> {
     AlkanesTrace::decode(raw).ok().or_else(|| {
         if raw.len() >= 4 { AlkanesTrace::decode(&raw[..raw.len() - 4]).ok() } else { None }
@@ -160,65 +123,54 @@ impl MetashrewAdapter {
             self.apply_label(v)
         };
 
-        let next_prefix = |mut p: Vec<u8>| -> Option<Vec<u8>> {
-            for i in (0..p.len()).rev() {
-                if p[i] != 0xff {
-                    p[i] += 1;
-                    p.truncate(i + 1);
-                    return Some(p);
-                }
-            }
-            None
-        };
-
         let prefix = balance_prefix(what_alkane, who_alkane);
+
+        let mut length_key = prefix.clone();
+        length_key.extend_from_slice(b"/length");
 
         let db = get_metashrew_sdb();
 
-        let mut ro = ReadOptions::default();
-        if let Some(ub) = next_prefix(prefix.clone()) {
-            ro.set_iterate_upper_bound(ub);
+        let length_bytes = match db.get(&length_key)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+
+        let length_str = std::str::from_utf8(&length_bytes)
+            .map_err(|e| anyhow!("utf8 decode balances length: {e}"))?;
+        let length: u64 =
+            length_str.parse().map_err(|e| anyhow!("parse balances length '{length_str}': {e}"))?;
+
+        let Some(latest_idx) = length.checked_sub(1) else { return Ok(None) };
+
+        let mut entry_key = prefix.clone();
+        entry_key.push(b'/');
+        entry_key.extend_from_slice(latest_idx.to_string().as_bytes());
+
+        let entry_bytes = match db.get(&entry_key)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+
+        let entry_str =
+            std::str::from_utf8(&entry_bytes).map_err(|e| anyhow!("utf8 decode balance entry: {e}"))?;
+        let (height_str, hex_part) =
+            entry_str.split_once(':').ok_or_else(|| anyhow!("balance entry missing ':'"))?;
+
+        let _updated_height: u64 =
+            height_str.parse().map_err(|e| anyhow!("parse balance height '{height_str}': {e}"))?;
+
+        let raw_balance = hex::decode(hex_part)
+            .map_err(|e| anyhow!("hex decode balance payload '{hex_part}': {e}"))?;
+        if raw_balance.len() != 16 {
+            return Err(anyhow!(
+                "balance payload length {}, expected 16 bytes",
+                raw_balance.len()
+            ));
         }
-        ro.set_total_order_seek(true);
+        let mut bal_bytes = [0u8; 16];
+        bal_bytes.copy_from_slice(&raw_balance);
 
-        let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
-
-        let mut best_updated: Option<u32> = None;
-        let mut best_slot: u32 = 0;
-        let mut best_balance: Option<u128> = None;
-
-        while let Some(Ok((k, v))) = it.next() {
-            if !k.starts_with(&prefix) {
-                break;
-            }
-            // key suffix = slot u32 LE (bytes 32..36 of WHO segment), but we don't need to parse WHO again
-            if k.len() < prefix.len() + 4 {
-                continue;
-            }
-            let mut slot_bytes = [0u8; 4];
-            slot_bytes.copy_from_slice(&k[prefix.len()..prefix.len() + 4]);
-            let slot = u32::from_le_bytes(slot_bytes);
-
-            let dec = decode_balance_value(&v);
-            if let Some(bal) = dec.balance {
-                // prefer higher updated; if none available, prefer higher slot
-                let better = match (best_updated, dec.updated) {
-                    (None, Some(_)) => true,
-                    (Some(prev), Some(cur)) if cur > prev => true,
-                    (Some(prev), Some(cur)) if cur == prev && slot > best_slot => true,
-                    (None, None) if slot > best_slot => true,
-                    (None, None) => best_balance.is_none(), // first one wins
-                    _ => false,
-                };
-                if better {
-                    best_updated = dec.updated;
-                    best_slot = slot;
-                    best_balance = Some(bal);
-                }
-            }
-        }
-
-        Ok(best_balance)
+        Ok(Some(u128::from_le_bytes(bal_bytes)))
     }
 
     pub fn traces_for_block_as_prost(&self, block: u64) -> Result<Vec<PartialEspoTrace>> {
