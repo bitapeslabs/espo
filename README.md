@@ -1,5 +1,6 @@
 
-<img width="977" height="292" alt="espothumb (1)" src="https://github.com/user-attachments/assets/8ce11e4d-2fed-482a-bf26-1d520544ee7d" />
+<img width="1124" height="336" alt="espobannernew" src="https://github.com/user-attachments/assets/525a8ed1-9811-4016-b5cb-f9efded12367" />
+
 
 # Espo
 
@@ -48,6 +49,7 @@ Espo will build indicies for the .blk files in your bitcoin blocks directory and
 This project is mantained by the pizza.fun foundation and opensourced to foster new developments on Alkanes. 
 
 Espo is licensed under the BUSL agreement, which allows personal AND commercial use of the software UNLESS you are building a direct competitor to pizza.fun.
+
 
 
 
