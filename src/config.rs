@@ -13,7 +13,7 @@ use bitcoincore_rpc::bitcoin::Network;
 use bitcoincore_rpc::{Auth, Client as CoreClient};
 
 // Block fetcher (blk files + RPC fallback)
-use crate::core::blockfetcher::BlkOrRpcBlockSource;
+use crate::core::blockfetcher::{BlkOrRpcBlockSource, BlockFetchMode};
 
 static CONFIG: OnceLock<CliArgs> = OnceLock::new();
 static ELECTRUM_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -30,6 +30,15 @@ fn parse_network(s: &str) -> std::result::Result<Network, String> {
         "mainnet" => Ok(Network::Bitcoin),
         "regtest" => Ok(Network::Regtest),
         _ => Err("invalid value for --network: expected 'mainnet' or 'regtest'".into()),
+    }
+}
+
+fn parse_block_fetch_mode(s: &str) -> std::result::Result<BlockFetchMode, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Ok(BlockFetchMode::Auto),
+        "rpc" | "rpc-only" | "rpc_only" => Ok(BlockFetchMode::RpcOnly),
+        "blk" | "blk-only" | "blk_only" | "files" => Ok(BlockFetchMode::BlkOnly),
+        _ => Err("invalid value for --block-source-mode: use auto | rpc-only | blk-only".into()),
     }
 }
 
@@ -77,6 +86,11 @@ pub struct CliArgs {
 
     #[arg(long, short, default_value = None)]
     pub metashrew_db_label: Option<String>,
+
+    /// Choose where block bodies come from: blk files + RPC fallback ("auto", default),
+    /// RPC only ("rpc-only"), or blk files only ("blk-only").
+    #[arg(long, value_parser = parse_block_fetch_mode, default_value = "rpc")]
+    pub block_source_mode: BlockFetchMode,
 }
 
 pub fn init_config() -> Result<()> {
@@ -109,12 +123,14 @@ pub fn init_config() -> Result<()> {
         anyhow::bail!("espo_db_path is not a directory: {}", args.espo_db_path);
     }
 
-    let blocks_dir = Path::new(&args.bitcoind_blocks_dir);
-    if !blocks_dir.exists() {
-        anyhow::bail!("bitcoind blocks dir does not exist: {}", args.bitcoind_blocks_dir);
-    }
-    if !blocks_dir.is_dir() {
-        anyhow::bail!("bitcoind blocks dir is not a directory: {}", args.bitcoind_blocks_dir);
+    if args.block_source_mode != BlockFetchMode::RpcOnly {
+        let blocks_dir = Path::new(&args.bitcoind_blocks_dir);
+        if !blocks_dir.exists() {
+            anyhow::bail!("bitcoind blocks dir does not exist: {}", args.bitcoind_blocks_dir);
+        }
+        if !blocks_dir.is_dir() {
+            anyhow::bail!("bitcoind blocks dir is not a directory: {}", args.bitcoind_blocks_dir);
+        }
     }
 
     if args.sdb_poll_ms == 0 {
@@ -173,7 +189,11 @@ pub fn init_config() -> Result<()> {
 pub fn init_block_source() -> Result<()> {
     let args = get_config();
     let network = get_network();
-    let src = BlkOrRpcBlockSource::new_with_config(&args.bitcoind_blocks_dir, network)?;
+    let src = BlkOrRpcBlockSource::new_with_config(
+        &args.bitcoind_blocks_dir,
+        network,
+        args.block_source_mode,
+    )?;
     BLOCK_SOURCE
         .set(src)
         .map_err(|_| anyhow::anyhow!("block source already initialized"))?;

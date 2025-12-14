@@ -6,4 +6,5 @@ cargo run --release -- \
   --bitcoind-rpc-user admin \
   --bitcoind-rpc-pass admin \
   --bitcoind-blocks-dir "$HOME/.bitcoin/blocks" \
-  --network mainnet
+  --network mainnet \
+  --block-source-mode rpc

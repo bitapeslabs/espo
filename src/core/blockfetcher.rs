@@ -1,5 +1,5 @@
 // blockfetcher.rs
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bitcoincore_rpc::bitcoin::hashes::Hash; // for to_byte_array()
 use bitcoincore_rpc::bitcoin::{Block, BlockHash, Network, consensus};
 use bitcoincore_rpc::{Client as CoreClient, RpcApi};
@@ -26,6 +26,16 @@ const NEAR_TIP_RPC_THRESHOLD: u32 = 6_000;
 pub trait BlockSource {
     /// Returns the full block for `height`. `tip` is used to optionally route near-tip to RPC.
     fn get_block_by_height(&self, height: u32, tip: u32) -> Result<Block>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockFetchMode {
+    /// Existing behaviour: use blk files when indexed, fall back to RPC near tip or if missing.
+    Auto,
+    /// Always fetch via RPC (skip blk files entirely). Useful when local blk files are stale/reorged.
+    RpcOnly,
+    /// Only use blk files for block bodies; RPC is still used for headers/height lookups.
+    BlkOnly,
 }
 
 /// Borsh-encoded value stored in Mdb for each block hash.
@@ -55,6 +65,7 @@ pub struct BlkOrRpcBlockSource {
     blocks_dir: PathBuf,
     network: Network,
     rpc: &'static CoreClient, // borrow the global RPC client from config
+    mode: BlockFetchMode,
 
     /// Stop indexing once this hash is known in the index (genesis of Alkanes range)
     genesis_stop_hash: Option<BlockHash>,
@@ -74,6 +85,7 @@ impl BlkOrRpcBlockSource {
         blocks_dir: impl AsRef<Path>,
         network: Network,
         rpc: &'static CoreClient,
+        mode: BlockFetchMode,
     ) -> Result<Self> {
         let db = get_espo_db(); // Arc<DB> from config
         let mdb = Mdb::from_db(db, Self::MDB_PREFIX);
@@ -108,6 +120,7 @@ impl BlkOrRpcBlockSource {
             blocks_dir: blocks_dir.as_ref().to_path_buf(),
             network,
             rpc,
+            mode,
             genesis_stop_hash,
             decoded_cache: Mutex::new(DecodedFileCache::default()),
             height_to_hash: Mutex::new(height_map),
@@ -115,9 +128,13 @@ impl BlkOrRpcBlockSource {
     }
 
     /// Convenience constructor that uses the Core RPC client from config directly.
-    pub fn new_with_config(blocks_dir: impl AsRef<Path>, network: Network) -> Result<Self> {
+    pub fn new_with_config(
+        blocks_dir: impl AsRef<Path>,
+        network: Network,
+        mode: BlockFetchMode,
+    ) -> Result<Self> {
         let rpc: &'static CoreClient = get_bitcoind_rpc_client();
-        Self::new(blocks_dir, network, rpc)
+        Self::new(blocks_dir, network, rpc, mode)
     }
 
     /// Utility: rough size estimate for logging (bytes per entry ~ (u32 height + 32B hash) = 36B).
@@ -475,6 +492,9 @@ impl BlkOrRpcBlockSource {
     /// stop-hash is present in the index, to avoid indexing pre-genesis files.
     /// Progress is: remaining ≈ last_height_in_file - alkanes_genesis_block(network).
     fn ensure_index_contains(&self, hash: &BlockHash, _target_height: u32) -> Result<bool> {
+        if self.mode == BlockFetchMode::RpcOnly {
+            return Ok(false);
+        }
         if self.index_get(hash)?.is_some() {
             return Ok(true);
         }
@@ -604,6 +624,13 @@ impl BlkOrRpcBlockSource {
             return Ok(verified);
         }
 
+        if self.mode == BlockFetchMode::BlkOnly {
+            return Err(anyhow!(
+                "blk-only mode: block {} failed active-chain verification; RPC fallback disabled",
+                hash
+            ));
+        }
+
         // As a last resort (e.g., pruned header lookup oddity), try direct RPC get_block
         eprintln!(
             "[BLOCKFETCHER] read_block_from_loc: disk body not verified; using RPC get_block({})",
@@ -623,11 +650,26 @@ impl BlockSource for BlkOrRpcBlockSource {
     fn get_block_by_height(&self, height: u32, tip: u32) -> Result<Block> {
         let t0 = Instant::now();
         eprintln!(
-            "[BLOCKFETCHER] request height={} (tip={}, Δ={})",
+            "[BLOCKFETCHER] request height={} (tip={}, Δ={}) mode={:?}",
             height,
             tip,
-            tip.saturating_sub(height)
+            tip.saturating_sub(height),
+            self.mode
         );
+
+        // Fast-path: RPC only mode skips any blk file lookups.
+        if self.mode == BlockFetchMode::RpcOnly {
+            let hash: BlockHash = self
+                .rpc
+                .get_block_hash(height as u64)
+                .with_context(|| format!("bitcoind: getblockhash({height})"))?;
+            let blk = self
+                .rpc
+                .get_block(&hash)
+                .with_context(|| format!("bitcoind: getblock({hash})"))?;
+            eprintln!("[BLOCKFETCHER] height={} RPC-only ok in {:.2?}", height, t0.elapsed());
+            return Ok(blk);
+        }
 
         // 0) First: consult the preloaded height→hash map (already filtered to active chain)
         if let Some(h) = self.height_to_hash.lock().unwrap().get(&height).cloned() {
@@ -652,7 +694,9 @@ impl BlockSource for BlkOrRpcBlockSource {
         self.height_to_hash.lock().unwrap().insert(height, hash);
 
         // Near-tip guard: direct RPC (avoid tail races on a file being appended)
-        if tip.saturating_sub(height) <= NEAR_TIP_RPC_THRESHOLD {
+        if self.mode != BlockFetchMode::BlkOnly
+            && tip.saturating_sub(height) <= NEAR_TIP_RPC_THRESHOLD
+        {
             eprintln!("[BLOCKFETCHER] height={} using RPC (near tip)", height);
             let blk = self
                 .rpc
@@ -688,6 +732,13 @@ impl BlockSource for BlkOrRpcBlockSource {
         }
 
         // 4) Fallback to RPC (e.g., pruned file or not in local blk files)
+        if self.mode == BlockFetchMode::BlkOnly {
+            return Err(anyhow!(
+                "block height {} not found in blk files (RPC fallback disabled by block_source_mode=blk-only)",
+                height
+            ));
+        }
+
         eprintln!("[BLOCKFETCHER] height={} fallback to RPC (not in local blk files)", height);
         let blk = self
             .rpc
