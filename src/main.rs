@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // Build module registry with the global ESPO DB
     let mut mods = ModuleRegistry::with_db(get_espo_db());
     mods.register_module(AmmData::new());
-    //mods.register_module(Essentials::new());
+    mods.register_module(Essentials::new());
     // mods.register_module(TracesData::new());
 
     // Start RPC server
