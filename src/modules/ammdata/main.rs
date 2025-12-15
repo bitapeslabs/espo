@@ -3,7 +3,7 @@ use super::storage::reserves_snapshot_key;
 use super::utils::candles::CandleCache;
 use super::utils::trades::{TradeIndexAcc, TradeWriteAcc};
 use crate::alkanes::trace::EspoBlock;
-use crate::config::get_electrum_client;
+use crate::config::get_electrum_like;
 use crate::modules::ammdata::consts::ammdata_genesis_block;
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, active_timeframes};
 use crate::modules::ammdata::storage::decode_reserves_snapshot;
@@ -102,7 +102,6 @@ impl EspoModule for AmmData {
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         use bitcoin::consensus::deserialize;
         use bitcoin::{Transaction, Txid};
-        use electrum_client::ElectrumApi;
         use std::collections::{HashMap, HashSet};
 
         let block_ts = block.block_header.time as u64;
@@ -202,16 +201,16 @@ impl EspoModule for AmmData {
         }
 
         // -----------------------------------------------------------------------------------------
-        // One Electrum batch for the subset of prevout txids we actually need
+        // One Electrum-like batch for the subset of prevout txids we actually need
         // -----------------------------------------------------------------------------------------
         let mut prevouts_subset: HashMap<Txid, Transaction> = HashMap::new();
         if !need_prevouts_for_txids.is_empty() {
             eprintln!(
-                "[AMMDATA] fetching prevouts subset via electrum: {} txids",
+                "[AMMDATA] fetching prevouts subset via electrum/esplora: {} txids",
                 need_prevouts_for_txids.len()
             );
 
-            let electrum = get_electrum_client();
+            let electrum = get_electrum_like();
             let ids: Vec<Txid> = need_prevouts_for_txids.iter().copied().collect();
 
             // Try batch first (raw, faster), then granular fallbacks for empties or errors.
@@ -231,9 +230,7 @@ impl EspoModule for AmmData {
                                         );
                                     }
                                 }
-                                _ => {
-                                    eprintln!("[AMMDATA] WARN: electrum missing prevout {txid}");
-                                }
+                                _ => eprintln!("[AMMDATA] WARN: missing prevout {txid}"),
                             }
                         } else if let Ok(tx) = deserialize::<Transaction>(&raw) {
                             prevouts_subset.insert(txid, tx);
@@ -246,7 +243,7 @@ impl EspoModule for AmmData {
                 }
                 Err(e) => {
                     eprintln!(
-                        "[AMMDATA] WARN: electrum batch_transaction_get_raw failed: {e:?}; falling back per-tx"
+                        "[AMMDATA] WARN: electrum-like batch_transaction_get_raw failed: {e:?}; falling back per-tx"
                     );
                     for txid in ids {
                         match electrum.transaction_get_raw(&txid) {
@@ -259,7 +256,7 @@ impl EspoModule for AmmData {
                                     );
                                 }
                             }
-                            _ => eprintln!("[AMMDATA] WARN: electrum missing prevout {txid}"),
+                            _ => eprintln!("[AMMDATA] WARN: missing prevout {txid}"),
                         }
                     }
                 }

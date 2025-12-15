@@ -21,6 +21,7 @@ axum = "0.8.4"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net"] }
 bitcoin = "0.32.7"
 electrum-client = "0.24.0"
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
 tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "tcp"] }
 borsh = { version = "1.5.7", features = ["derive"] }
 futures = "0.3.31"

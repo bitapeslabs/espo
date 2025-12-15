@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use crate::config::init_block_source;
 //modules
-use crate::config::get_network;
 use crate::config::get_metashrew_sdb;
+use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
 use crate::utils::{EtaTracker, fmt_duration};
@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // Build module registry with the global ESPO DB
     let mut mods = ModuleRegistry::with_db(get_espo_db());
     mods.register_module(AmmData::new());
-    mods.register_module(Essentials::new());
+    //mods.register_module(Essentials::new());
     // mods.register_module(TracesData::new());
 
     // Start RPC server

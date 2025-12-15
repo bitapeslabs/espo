@@ -1,3 +1,5 @@
+pub mod electrum_like;
+
 use std::time::{Duration, Instant};
 
 /// Tracks a simple running *average* of seconds per block.

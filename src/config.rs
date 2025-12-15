@@ -1,12 +1,13 @@
 use crate::ESPO_HEIGHT;
 use crate::alkanes::metashrew::MetashrewAdapter;
+use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
 use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB};
 use anyhow::Result;
 use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{DB, Options};
 use std::sync::atomic::Ordering;
-use std::{fs, path::Path, sync::OnceLock, time::Duration};
+use std::{fs, path::Path, sync::{Arc, OnceLock}, time::Duration};
 
 // Bitcoin Core / bitcoin::Network
 use bitcoincore_rpc::bitcoin::Network;
@@ -16,7 +17,8 @@ use bitcoincore_rpc::{Auth, Client as CoreClient};
 use crate::core::blockfetcher::{BlkOrRpcBlockSource, BlockFetchMode};
 
 static CONFIG: OnceLock<CliArgs> = OnceLock::new();
-static ELECTRUM_CLIENT: OnceLock<Client> = OnceLock::new();
+static ELECTRUM_CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
+static ELECTRUM_LIKE: OnceLock<Arc<dyn ElectrumLike>> = OnceLock::new();
 static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
 static METASHREW_SDB: OnceLock<std::sync::Arc<SDB>> = OnceLock::new();
 static ESPO_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
@@ -49,7 +51,11 @@ pub struct CliArgs {
     pub readonly_metashrew_db_dir: String,
 
     #[arg(short, long)]
-    pub electrum_rpc_url: String,
+    pub electrum_rpc_url: Option<String>,
+
+    /// HTTP base URL to an electrs/esplora endpoint (e.g. https://myelectrs.example)
+    #[arg(long)]
+    pub electrs_esplora_url: Option<String>,
 
     /// Full HTTP URL to Bitcoin Core's JSON-RPC (e.g. http://127.0.0.1:8332)
     #[arg(long)]
@@ -137,6 +143,15 @@ pub fn init_config() -> Result<()> {
         anyhow::bail!("sdb_poll_ms must be greater than 0");
     }
 
+    let electrum_url = args.electrum_rpc_url.clone().filter(|s| !s.is_empty());
+    let esplora_url = args.electrs_esplora_url.clone().filter(|s| !s.is_empty());
+    if electrum_url.is_none() && esplora_url.is_none() {
+        anyhow::bail!("provide either --electrum-rpc-url or --electrs-esplora-url");
+    }
+    if electrum_url.is_some() && esplora_url.is_some() {
+        eprintln!("[config] both electrum rpc and electrs esplora URLs provided; electrum rpc will be used");
+    }
+
     // --- store config ---
     CONFIG
         .set(args.clone())
@@ -147,12 +162,21 @@ pub fn init_config() -> Result<()> {
         .set(args.network)
         .map_err(|_| anyhow::anyhow!("network already initialized"))?;
 
-    // --- init Electrum client once ---
-    let electrum_url = format!("tcp://{}", args.electrum_rpc_url);
-    let client: Client = Client::new(&electrum_url)?;
-    ELECTRUM_CLIENT
-        .set(client)
-        .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
+    // --- init Electrum-like client once ---
+    let electrum_like: Arc<dyn ElectrumLike> = if let Some(url) = electrum_url {
+        let electrum_url = format!("tcp://{}", url);
+        let client: Arc<Client> = Arc::new(Client::new(&electrum_url)?);
+        ELECTRUM_CLIENT
+            .set(client.clone())
+            .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
+        Arc::new(ElectrumRpcClient::new(client))
+    } else {
+        let base = esplora_url.expect("validation ensures esplora url exists when electrum is None");
+        Arc::new(EsploraElectrumLike::new(base)?)
+    };
+    ELECTRUM_LIKE
+        .set(electrum_like)
+        .map_err(|_| anyhow::anyhow!("electrum-like client already initialized"))?;
 
     // --- init Bitcoin Core RPC client once ---
     let core = CoreClient::new(
@@ -204,8 +228,15 @@ pub fn get_config() -> &'static CliArgs {
     CONFIG.get().expect("init_config() must be called once at startup")
 }
 
-pub fn get_electrum_client() -> &'static Client {
-    ELECTRUM_CLIENT.get().expect("init_config() must be called once at startup")
+pub fn get_electrum_client() -> Option<Arc<Client>> {
+    ELECTRUM_CLIENT.get().cloned()
+}
+
+pub fn get_electrum_like() -> Arc<dyn ElectrumLike> {
+    ELECTRUM_LIKE
+        .get()
+        .expect("init_config() must be called once at startup")
+        .clone()
 }
 
 pub fn get_bitcoind_rpc_client() -> &'static CoreClient {
