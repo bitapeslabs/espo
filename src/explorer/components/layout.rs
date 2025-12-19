@@ -27,7 +27,7 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                         nav class="nav" {
                             a class="brand" href="/" {
                                 (logo_espo())
-                                span class="brand-text" { "EspoExplorer" }
+                                span class="brand-text" { "Espo" }
                             }
                             a class="navlink" href="/" { "Blocks" }
                         }

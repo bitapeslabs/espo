@@ -3,6 +3,7 @@ use bitcoincore_rpc::RpcApi;
 use maud::html;
 
 use crate::config::{get_bitcoind_rpc_client, get_espo_next_height};
+use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout;
 
 pub async fn home_page() -> Html<String> {
@@ -31,11 +32,17 @@ pub async fn home_page() -> Html<String> {
     layout(
         "Blocks",
         html! {
-            div class="row" {
-                h1 class="h1" { "Blocks" }
-                form class="search" method="get" action="/search" {
-                    input class="input" type="text" name="q" placeholder="Search height or block hash";
-                    button class="btn" type="submit" { "Search" }
+            div class="block-hero full-bleed" {
+                (block_carousel(Some(latest_height), espo_tip))
+            }
+
+            div class="block-hero-inner" {
+                div class="row" {
+                    h1 class="h1" { "Blocks" }
+                    form class="search" method="get" action="/search" {
+                        input class="input" type="text" name="q" placeholder="Search height or block hash";
+                        button class="btn" type="submit" { "Search" }
+                    }
                 }
             }
 

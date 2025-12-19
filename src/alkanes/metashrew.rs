@@ -5,6 +5,8 @@ use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
+use bitcoin::hashes::Hash;
+use bitcoin::Txid;
 
 fn try_decode_prost(raw: &[u8]) -> Option<AlkanesTrace> {
     AlkanesTrace::decode(raw).ok().or_else(|| {
@@ -60,6 +62,17 @@ impl MetashrewAdapter {
         MetashrewAdapter { label }
     }
 
+    fn next_prefix(&self, mut p: Vec<u8>) -> Option<Vec<u8>> {
+        for i in (0..p.len()).rev() {
+            if p[i] != 0xff {
+                p[i] += 1;
+                p.truncate(i + 1);
+                return Some(p);
+            }
+        }
+        None
+    }
+
     fn apply_label(&self, key: Vec<u8>) -> Vec<u8> {
         let suffix = b"://";
 
@@ -96,6 +109,52 @@ impl MetashrewAdapter {
         let tip_height_prefix: Vec<u8> = self.apply_label(b"/__INTERNAL/tip-height".to_vec());
 
         self.read_uint_key::<4, u32>(tip_height_prefix)
+    }
+
+    /// Fetch all traces for a txid directly from the secondary DB, without needing block height.
+    pub fn traces_for_tx(&self, txid: &Txid) -> Result<Vec<PartialEspoTrace>> {
+        let db = get_metashrew_sdb();
+        db.catch_up_now().context("metashrew catch_up before scanning traces_for_tx")?;
+
+        let tx_be = txid.to_byte_array().to_vec();
+        let mut tx_le = tx_be.clone();
+        tx_le.reverse();
+
+        let mut out: Vec<PartialEspoTrace> = Vec::new();
+
+        for search_bytes in [&tx_be, &tx_le] {
+            let mut prefix = b"/trace/".to_vec();
+            prefix.extend_from_slice(search_bytes);
+            let prefix = self.apply_label(prefix);
+
+            let mut ro = ReadOptions::default();
+            if let Some(ub) = self.next_prefix(prefix.clone()) {
+                ro.set_iterate_upper_bound(ub);
+            }
+            ro.set_total_order_seek(true);
+
+            let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
+            while let Some(Ok((k, v))) = it.next() {
+                if !k.starts_with(&prefix) {
+                    break;
+                }
+
+                let suffix = &k[prefix.len()..];
+                if suffix.len() < 5 || suffix[4] != b'/' {
+                    continue;
+                }
+
+                let vout_le: [u8; 4] = suffix[..4].try_into().unwrap_or_default();
+                let mut outpoint: Vec<u8> = tx_le.clone();
+                outpoint.extend_from_slice(&vout_le);
+
+                if let Some(protobuf_trace) = decode_trace_blob(&v) {
+                    out.push(PartialEspoTrace { protobuf_trace, outpoint });
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     pub fn get_latest_reserves_for_alkane(

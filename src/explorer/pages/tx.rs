@@ -4,11 +4,16 @@ use std::str::FromStr;
 use axum::extract::{Path, State};
 use axum::response::Html;
 use bitcoin::consensus::encode::deserialize;
+use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
 use maud::html;
 
-use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height};
+use crate::alkanes::trace::{
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
+    prettyify_protobuf_trace_json, traces_for_block_as_prost,
+};
+use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew};
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout;
 use crate::explorer::components::tx_view::render_tx;
@@ -48,12 +53,19 @@ pub async fn tx_page(
 
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let rpc = get_bitcoind_rpc_client();
-    let tx_height: Option<u64> = rpc
+    let tx_height_rpc: Option<u64> = rpc
         .get_raw_transaction_info(&txid, None)
         .ok()
         .and_then(|info| info.blockhash)
         .and_then(|bh| rpc.get_block_header_info(&bh).ok())
         .map(|hdr| hdr.height as u64);
+    let tx_height: Option<u64> = tx_height_rpc.or_else(|| {
+        electrum_like
+            .transaction_get_height(&txid)
+            .map_err(|e| eprintln!("[tx_page] electrum height fetch failed for {txid}: {e}"))
+            .ok()
+            .flatten()
+    });
 
     // Prevouts (best-effort): batch fetch unique txids.
     let mut prev_txids: Vec<Txid> = tx
@@ -84,16 +96,114 @@ pub async fn tx_page(
         electrum_like.transaction_get_outspends(txid).unwrap_or_default()
     };
 
+    let traces_for_tx: Option<Vec<EspoTrace>> = tx_height.and_then(|h| match fetch_traces_for_tx(h, &txid, &tx) {
+        Ok(v) if !v.is_empty() => Some(v),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("[tx_page] failed to fetch traces for {txid}: {e}");
+            None
+        }
+    }).or_else(|| {
+        match fetch_traces_for_tx_noheight(&txid, &tx) {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("[tx_page] failed to fetch traces (noheight) for {txid}: {e}");
+                None
+            }
+        }
+    });
+    let traces_ref: Option<&[EspoTrace]> = traces_for_tx.as_ref().map(|v| v.as_slice());
+
     layout(
         &format!("Tx {txid}"),
         html! {
-
-            (block_carousel(tx_height, espo_tip))
-            div class="row" {
-                h1 class="h1" { "Transaction" }
-                span class="mono" { (txid.to_string()) }
+            div class="block-hero full-bleed" {
+                (block_carousel(tx_height, espo_tip))
             }
-            (render_tx(&txid, &tx, None, state.network, &prev_map, &outpoint_fn, &outspends_fn))
+            div class="block-hero-inner" {
+                div class="row" {
+                    h1 class="h1" { "Transaction" }
+                    span class="mono" { (txid.to_string()) }
+                }
+            }
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn))
         },
     )
+}
+
+fn fetch_traces_for_tx(
+    height: u64,
+    txid: &Txid,
+    tx: &Transaction,
+) -> anyhow::Result<Vec<EspoTrace>> {
+    let partials = traces_for_block_as_prost(height)?;
+    let mut out: Vec<EspoTrace> = Vec::new();
+    let tx_hex = txid.to_string();
+
+    for partial in partials {
+        let (txid_le, vout_le) = partial.outpoint.split_at(32);
+        let mut txid_be = txid_le.to_vec();
+        txid_be.reverse();
+
+        let trace_txid = Txid::from_slice(&txid_be)?;
+        if trace_txid != *txid {
+            continue;
+        }
+
+        let vout = u32::from_le_bytes(vout_le.try_into()?);
+        let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
+        let events: Vec<EspoSandshrewLikeTraceEvent> =
+            serde_json::from_str(&events_json_str)?;
+
+        let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
+        let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)?;
+
+        out.push(EspoTrace {
+            sandshrew_trace,
+            protobuf_trace: partial.protobuf_trace,
+            storage_changes,
+            outpoint: crate::schemas::EspoOutpoint {
+                txid: txid_be,
+                vout,
+                tx_spent: None,
+            },
+        });
+    }
+
+    Ok(out)
+}
+
+fn fetch_traces_for_tx_noheight(txid: &Txid, tx: &Transaction) -> anyhow::Result<Vec<EspoTrace>> {
+    let partials = get_metashrew().traces_for_tx(txid)?;
+    let mut out: Vec<EspoTrace> = Vec::new();
+    let tx_hex = txid.to_string();
+
+    for partial in partials {
+        let (txid_le, vout_le) = partial.outpoint.split_at(32);
+        let mut txid_be = txid_le.to_vec();
+        txid_be.reverse();
+
+        let trace_txid = Txid::from_slice(&txid_be)?;
+        if trace_txid != *txid {
+            continue;
+        }
+
+        let vout = u32::from_le_bytes(vout_le.try_into()?);
+        let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
+        let events: Vec<EspoSandshrewLikeTraceEvent> =
+            serde_json::from_str(&events_json_str)?;
+
+        let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
+        let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)?;
+
+        out.push(EspoTrace {
+            sandshrew_trace,
+            protobuf_trace: partial.protobuf_trace,
+            storage_changes,
+            outpoint: crate::schemas::EspoOutpoint { txid: txid_be, vout, tx_spent: None },
+        });
+    }
+
+    Ok(out)
 }

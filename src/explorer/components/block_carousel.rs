@@ -29,9 +29,11 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   let pendingEdge = false;
   let leftDepleted = false;
   let rightDepleted = false;
-  let anchorLeftHeight = current;
   let suppressSelectUpdate = false;
   let scrollRaf = null;
+  let hasCentered = false;
+  const isLatest = current === espoTip;
+  let indicator = null;
 
   const setLoading = (side, val) => {{
     if (side === 'left') {{
@@ -57,7 +59,64 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     return 'just now';
   }}
 
+  function ensureIndicator() {{
+    if (indicator) return indicator;
+    indicator = root.querySelector('[data-bc-indicator]');
+    if (!indicator) {{
+      indicator = document.createElement('div');
+      indicator.className = 'bc-indicator';
+      indicator.dataset.bcIndicator = '1';
+      indicator.setAttribute('aria-hidden', 'true');
+      indicator.innerHTML = '<svg class="bc-indicator-svg" viewBox="0 0 24 14" aria-hidden="true" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg>';
+    }}
+    return indicator;
+  }}
+
+  function getIndexByHeight(height) {{
+    return blocks.findIndex((b) => b.height === height);
+  }}
+
+  function snapToHeight(height, jump = false) {{
+    if (!embla) return;
+    const idx = getIndexByHeight(height);
+    if (idx < 0) return;
+    embla.scrollTo(idx, jump);
+  }}
+
+  function updateIndicator() {{
+    if (!embla) return;
+    const node = ensureIndicator();
+    if (!node) return;
+    const currentCard = container.querySelector('.bc-card.current');
+    if (!currentCard) {{
+      node.style.opacity = '0';
+      return;
+    }}
+    node.style.opacity = '1';
+    currentCard.appendChild(node);
+  }}
+
+  function snapBackIfLatest() {{
+    if (!isLatest || !embla) return;
+    const currentCard = container.querySelector('.bc-card.current');
+    if (!currentCard) return;
+    const viewportRect = viewport.getBoundingClientRect();
+    const cardRect = currentCard.getBoundingClientRect();
+    const viewportCenter = viewportRect.left + viewportRect.width / 2;
+    const cardCenter = cardRect.left + cardRect.width / 2;
+    if (cardCenter < viewportCenter - 1) {{
+      snapToHeight(current, false);
+    }}
+  }}
+
   function render() {{
+    if (embla) {{
+      const idx = embla.selectedScrollSnap();
+      const slide = embla.slideNodes()[idx];
+      if (slide && slide.dataset.height) {{
+        selectedHeight = Number(slide.dataset.height);
+      }}
+    }}
     blocks.sort((a,b) => a.height - b.height);
     container.innerHTML = '';
     for (const b of blocks) {{
@@ -66,7 +125,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
       slide.dataset.height = String(b.height);
       slide.innerHTML = `
         <div class="bc-top">
-          <span class="bc-height-tag">#${{b.height}}</span>
+          <span class="bc-height-tag">${{b.height}}</span>
         </div>
         <a class="bc-card${{b.height === current ? ' current' : ''}}" href="/block/${{b.height}}">
           <div class="bc-face">
@@ -78,10 +137,17 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
       container.appendChild(slide);
     }}
 
+    let targetIdx = getIndexByHeight(hasCentered ? selectedHeight : current);
+    if (targetIdx < 0) {{
+      targetIdx = blocks.findIndex((b) => b.height === current);
+    }}
+    if (targetIdx < 0) targetIdx = 0;
+
     const opts = {{
-      align: 'start',
+      align: 'center',
       dragFree: true,
-      containScroll: 'trimSnaps'
+      containScroll: false,
+      startIndex: targetIdx
     }};
 
     const ensureSelectedHeight = () => {{
@@ -92,14 +158,6 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
       if (slide && slide.dataset.height) {{
         selectedHeight = Number(slide.dataset.height);
       }}
-      const inView = embla.slidesInView(true);
-      if (inView && inView.length > 0) {{
-        const leftIdx = Math.min(...inView);
-        const leftSlide = embla.slideNodes()[leftIdx];
-        if (leftSlide && leftSlide.dataset.height) {{
-          anchorLeftHeight = Number(leftSlide.dataset.height);
-        }}
-      }}
     }};
 
     suppressSelectUpdate = true;
@@ -107,25 +165,26 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
       embla = window.EmblaCarousel(viewport, opts);
       embla.on('select', () => {{
         ensureSelectedHeight();
+        updateIndicator();
         maybeLoadMore();
       }});
       embla.on('scroll', throttleMaybeLoad);
+      embla.on('settle', snapBackIfLatest);
+      embla.on('pointerUp', snapBackIfLatest);
     }} else if (embla) {{
       embla.reInit(opts);
     }}
 
     if (embla) {{
-      let idx = blocks.findIndex((b) => b.height === anchorLeftHeight);
-      if (idx < 0) {{
-        idx = blocks.findIndex((b) => b.height === selectedHeight);
-      }}
-      if (idx < 0) {{
-        idx = blocks.findIndex((b) => b.height === current);
-      }}
-      if (idx < 0) idx = 0;
-      embla.scrollTo(idx, true);
-      suppressSelectUpdate = false;
-      ensureSelectedHeight();
+      const idx = targetIdx;
+      window.requestAnimationFrame(() => {{
+        embla.scrollTo(idx, true);
+        hasCentered = true;
+        suppressSelectUpdate = false;
+        ensureSelectedHeight();
+        updateIndicator();
+        snapBackIfLatest();
+      }});
     }}
     suppressSelectUpdate = false;
     maybeLoadMore();
@@ -208,6 +267,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     scrollRaf = window.requestAnimationFrame(() => {{
       scrollRaf = null;
       maybeLoadMore();
+      updateIndicator();
     }});
   }}
 

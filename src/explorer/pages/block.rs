@@ -14,7 +14,6 @@ use crate::config::{
 };
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout;
-use crate::explorer::components::svg_assets::{icon_left, icon_right};
 use crate::explorer::components::tx_view::render_tx;
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::state::ExplorerState;

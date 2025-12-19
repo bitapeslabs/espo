@@ -15,6 +15,7 @@ pub trait ElectrumLike: Send + Sync {
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>>;
     fn tip_height(&self) -> Result<u32>;
     fn transaction_get_outspends(&self, txid: &Txid) -> Result<Vec<Option<Txid>>>;
+    fn transaction_get_height(&self, txid: &Txid) -> Result<Option<u64>>;
 }
 
 /// Thin wrapper over the native Electrum RPC client.
@@ -62,6 +63,16 @@ impl ElectrumLike for ElectrumRpcClient {
             .context("electrum transaction.get (verbose) for outspends")?;
 
         Ok(extract_outspends(&resp))
+    }
+
+    fn transaction_get_height(&self, txid: &Txid) -> Result<Option<u64>> {
+        let params = vec![Param::String(txid.to_string()), Param::Bool(true)];
+        let resp = self
+            .client
+            .raw_call("blockchain.transaction.get", params)
+            .context("electrum transaction.get (verbose) for height")?;
+
+        Ok(extract_height(&resp))
     }
 }
 
@@ -187,6 +198,38 @@ impl ElectrumLike for EsploraElectrumLike {
             Ok(out)
         })
     }
+
+    fn transaction_get_height(&self, txid: &Txid) -> Result<Option<u64>> {
+        self.block_on_result(async {
+            let url = format!("{}/tx/{}", self.base_url, txid);
+            let resp = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("esplora GET {url} failed"))?
+                .error_for_status()
+                .with_context(|| format!("esplora GET {url} returned error status"))?;
+
+            let body_str = resp.text().await.context("esplora tx body read failed")?;
+            let body: serde_json::Value =
+                serde_json::from_str(&body_str).context("esplora tx json decode failed")?;
+
+            let height = body
+                .get("status")
+                .and_then(|s| s.get("block_height"))
+                .and_then(|h| h.as_u64());
+            Ok(height)
+        })
+    }
+}
+
+fn extract_height(resp: &serde_json::Value) -> Option<u64> {
+    resp.get("height")
+        .or_else(|| resp.get("blockheight"))
+        .or_else(|| resp.get("block_height"))
+        .and_then(|h| h.as_i64())
+        .and_then(|h| if h >= 0 { Some(h as u64) } else { None })
 }
 
 #[derive(Deserialize)]
