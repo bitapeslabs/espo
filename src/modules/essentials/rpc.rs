@@ -1,7 +1,10 @@
-use crate::config::get_network;
+use crate::alkanes::trace::prettyify_protobuf_trace_json;
+use crate::config::{get_metashrew, get_network};
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::main::Essentials;
-use crate::modules::essentials::storage::{HoldersCountEntry, holders_count_key};
+use crate::modules::essentials::storage::{
+    HoldersCountEntry, holders_count_key, outpoint_addr_key, outpoint_balances_prefix,
+};
 // for Essentials::k_kv
 use crate::runtime::mdb::Mdb;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
@@ -19,6 +22,7 @@ use super::utils::balances::{
 };
 
 use bitcoin::Address;
+use bitcoin::hashes::Hash;
 use std::str::FromStr;
 
 /// Local decoder using the public BalanceEntry type
@@ -431,15 +435,29 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             }
                         };
 
-                        let addr = {
-                            let key = {
-                                let mut k = b"/outpoint_addr/".to_vec();
-                                k.extend_from_slice(outpoint.as_bytes());
-                                k
-                            };
-                            match mdb.get(&key) {
-                                Ok(Some(b)) => std::str::from_utf8(&b).ok().map(|s| s.to_string()),
-                                _ => None,
+                            let addr = {
+                                let pref =
+                                    outpoint_balances_prefix(txid.to_byte_array().as_slice(), vout_u32);
+                            if let Ok(pref) = pref {
+                                if let Ok(keys) = mdb.scan_prefix(&pref) {
+                                    if let Some(full_key) = keys.first() {
+                                        let raw = &full_key[b"/outpoint_balances/".len()..];
+                                        if let Ok(op) = EspoOutpoint::try_from_slice(raw) {
+                                            let key_new = outpoint_addr_key(&op).ok();
+                                            key_new.and_then(|k| mdb.get(&k).ok().flatten()).and_then(|b| {
+                                                std::str::from_utf8(&b).ok().map(|s| s.to_string())
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
                             }
                         };
 
@@ -464,6 +482,68 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             "items": [item]
                         })
                     }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_traces = reg.clone();
+        tokio::spawn(async move {
+            reg_traces
+                .register("get_block_traces", move |_cx, payload| async move {
+                    let height = match payload.get("height").and_then(|v| v.as_u64()) {
+                        Some(h) => h,
+                        None => {
+                            log_rpc("get_block_traces", "missing_or_invalid_height");
+                            return json!({"ok": false, "error": "missing_or_invalid_height", "hint": "expected {\"height\": <u64>}"} );
+                        }
+                    };
+
+                    log_rpc("get_block_traces", &format!("height={height}"));
+
+                    let partials = match get_metashrew().traces_for_block_as_prost(height) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log_rpc("get_block_traces", &format!("metashrew fetch failed: {e:?}"));
+                            return json!({"ok": false, "error": "metashrew_fetch_failed"});
+                        }
+                    };
+
+                    let mut traces: Vec<Value> = Vec::with_capacity(partials.len());
+                    for p in partials {
+                        if p.outpoint.len() < 36 {
+                            continue;
+                        }
+                        let (txid_le, vout_le) = p.outpoint.split_at(32);
+                        let mut txid_be = txid_le.to_vec();
+                        txid_be.reverse();
+                        let txid_hex = hex::encode(&txid_be);
+                        let vout = u32::from_le_bytes(vout_le[..4].try_into().expect("vout 4 bytes"));
+
+                        let events_str = match prettyify_protobuf_trace_json(&p.protobuf_trace) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log_rpc(
+                                    "get_block_traces",
+                                    &format!("normalize failed for {txid_hex}:{vout}: {e:?}"),
+                                );
+                                continue;
+                            }
+                        };
+                        let events: Value = serde_json::from_str(&events_str).unwrap_or(Value::Null);
+
+                        traces.push(json!({
+                            "outpoint": format!("{txid_hex}:{vout}"),
+                            "events": events
+                        }));
+                    }
+
+                    json!({
+                        "ok": true,
+                        "height": height,
+                        "traces": traces
+                    })
                 })
                 .await;
         });
@@ -578,6 +658,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                                     continue;
                                 }
                             };
+
+                            if espo_out.tx_spent.is_some() {
+                                continue;
+                            }
 
                             let outpoint_str = espo_out.as_outpoint_string();
 

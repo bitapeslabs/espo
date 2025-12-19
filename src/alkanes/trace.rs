@@ -15,7 +15,7 @@ use bitcoin::{Transaction, Txid};
 // use bitcoincore_rpc::RpcApi; // REMOVED: block fetch now via BlockSource
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EspoSandshrewLikeTrace {
@@ -123,7 +123,24 @@ pub struct EspoBlock {
     pub is_latest: bool,
     pub height: u32,
     pub block_header: Header,
+    pub tx_count: usize,
     pub transactions: Vec<EspoAlkanesTransaction>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GetEspoBlockOpts {
+    pub page: usize,
+    pub limit: usize,
+}
+
+impl GetEspoBlockOpts {
+    fn page_range(&self, total: usize) -> (usize, usize) {
+        let limit = self.limit.max(1);
+        let page = self.page.max(1);
+        let off = limit.saturating_mul(page.saturating_sub(1));
+        let end = (off + limit).min(total);
+        (off, end)
+    }
 }
 
 /// Map of AlkaneId -> (key -> value), last-write-wins per key within a single trace.
@@ -371,7 +388,10 @@ pub fn traces_for_block_as_json_str(block: u64) -> Result<String> {
 }
 
 /// Build a map { txid_be_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
-fn traces_for_block_indexed(block: u64) -> Result<HashMap<String, Vec<(u32, PartialEspoTrace)>>> {
+fn traces_for_block_indexed(
+    block: u64,
+    allow_txids: Option<&HashSet<String>>,
+) -> Result<HashMap<String, Vec<(u32, PartialEspoTrace)>>> {
     let partials = traces_for_block_as_prost(block)
         .with_context(|| format!("failed traces_for_block_as_prost({block})"))?;
 
@@ -381,6 +401,11 @@ fn traces_for_block_indexed(block: u64) -> Result<HashMap<String, Vec<(u32, Part
         let mut txid_be = txid_le.to_vec();
         txid_be.reverse();
         let txid_hex = hex::encode(&txid_be);
+        if let Some(allow) = allow_txids {
+            if !allow.contains(&txid_hex) {
+                continue;
+            }
+        }
         let vout = u32::from_le_bytes(vout_le.try_into().expect("vout 4 bytes"));
         map.entry(txid_hex).or_default().push((vout, p));
     }
@@ -394,6 +419,14 @@ fn traces_for_block_indexed(block: u64) -> Result<HashMap<String, Vec<(u32, Part
 /// Use the BlockSource for the block (header + transactions), Electrum for prevouts.
 /// Traces are now **multiple per transaction** and are stitched in per outpoint (vout).
 pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
+    get_espo_block_with_opts(block, tip, None)
+}
+
+pub fn get_espo_block_with_opts(
+    block: u64,
+    tip: u64,
+    opts: Option<GetEspoBlockOpts>,
+) -> Result<EspoBlock> {
     eprintln!("[TRACE::get_espo_block] start block={block}, tip={tip}");
 
     let block_source = get_block_source();
@@ -410,17 +443,30 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
     let full_block = block_source
         .get_block_by_height(h32, tip32)
         .context("BlockSource: get_block_by_height")?;
-    eprintln!(
-        "[TRACE::get_espo_block] got block at height={}, txs={}",
-        h32,
-        full_block.txdata.len()
-    );
+    let total_txs = full_block.txdata.len();
+    eprintln!("[TRACE::get_espo_block] got block at height={}, txs={}", h32, total_txs);
 
     // Header from block source
     let block_header: Header = full_block.header.clone();
 
-    // Index traces
-    let traces_index = traces_for_block_indexed(block)?;
+    let (page_start, page_end) =
+        opts.as_ref().map(|o| o.page_range(total_txs)).unwrap_or((0, total_txs));
+
+    // Select only the requested page of transactions
+    let mut selected: Vec<(Txid, Transaction)> =
+        Vec::with_capacity(page_end.saturating_sub(page_start));
+    for (idx, tx) in full_block.txdata.into_iter().enumerate() {
+        if idx < page_start || idx >= page_end {
+            continue;
+        }
+        let txid = tx.compute_txid();
+        selected.push((txid, tx));
+    }
+
+    let allow_txids: HashSet<String> = selected.iter().map(|(txid, _)| txid.to_string()).collect();
+
+    // Index traces only for the selected txids
+    let traces_index = traces_for_block_indexed(block, Some(&allow_txids))?;
     eprintln!(
         "[TRACE::get_espo_block] built traces_index for block={} ({} txs with traces)",
         block,
@@ -428,44 +474,54 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
     );
 
     // Build transactions
-    let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(full_block.txdata.len());
-    for tx in full_block.txdata.into_iter() {
-        let txid = tx.compute_txid();
+    let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(selected.len());
+    for (txid, tx) in selected.into_iter() {
         let txid_hex = txid.to_string();
 
-        let traces_opt: Option<Vec<EspoTrace>> = if let Some(vouts_partials) = traces_index.get(&txid_hex) {
-            let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
-            for (vout, partial) in vouts_partials.iter() {
-                let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
-                let events: Vec<EspoSandshrewLikeTraceEvent> =
-                    serde_json::from_str(&events_json_str)
-                        .context("deserialize sandshrew-like events")?;
+        let traces_opt: Option<Vec<EspoTrace>> =
+            if let Some(vouts_partials) = traces_index.get(&txid_hex) {
+                let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
+                for (vout, partial) in vouts_partials.iter() {
+                    let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
+                    let events: Vec<EspoSandshrewLikeTraceEvent> =
+                        serde_json::from_str(&events_json_str)
+                            .context("deserialize sandshrew-like events")?;
 
-                let sandshrew_trace =
-                    EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
+                    let sandshrew_trace =
+                        EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
 
-                let storage_changes = extract_alkane_storage(&partial.protobuf_trace, &tx)?;
-                let outpoint = EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout: *vout };
+                    let storage_changes = extract_alkane_storage(&partial.protobuf_trace, &tx)?;
+                    let outpoint = EspoOutpoint {
+                        txid: txid.as_byte_array().to_vec(),
+                        vout: *vout,
+                        tx_spent: None,
+                    };
 
-                traces_vec.push(EspoTrace {
-                    sandshrew_trace,
-                    protobuf_trace: partial.protobuf_trace.clone(),
-                    storage_changes,
-                    outpoint,
-                });
-            }
-            Some(traces_vec)
-        } else {
-            None
-        };
+                    traces_vec.push(EspoTrace {
+                        sandshrew_trace,
+                        protobuf_trace: partial.protobuf_trace.clone(),
+                        storage_changes,
+                        outpoint,
+                    });
+                }
+                Some(traces_vec)
+            } else {
+                None
+            };
 
         txs.push(EspoAlkanesTransaction { traces: traces_opt, transaction: tx });
     }
-    eprintln!("[TRACE::get_espo_block] built {} EspoAlkanesTransaction(s)", txs.len());
+    eprintln!(
+        "[TRACE::get_espo_block] built {} EspoAlkanesTransaction(s) (page {}..{})",
+        txs.len(),
+        page_start,
+        page_end
+    );
 
     eprintln!("[TRACE::get_espo_block] done block={block}");
     Ok(EspoBlock {
         block_header,
+        tx_count: total_txs,
         transactions: txs,
         height: block
             .try_into()

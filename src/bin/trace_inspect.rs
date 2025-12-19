@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rocksdb::{Direction, IteratorMode, Options, ReadOptions, DB};
+use rocksdb::{DB, Direction, IteratorMode, Options, ReadOptions};
 
 fn next_prefix(mut p: Vec<u8>) -> Option<Vec<u8>> {
     for i in (0..p.len()).rev() {
@@ -51,9 +51,7 @@ fn main() -> Result<()> {
         .context("usage: trace_inspect <block> [db_path]")?
         .parse()
         .context("block must be integer")?;
-    let db_path = args
-        .next()
-        .unwrap_or_else(|| "/data/.metashrew/v9/.metashrew-v9".to_string());
+    let db_path = args.next().unwrap_or_else(|| "/data/.metashrew/v9/.metashrew-v9".to_string());
 
     let mut opts = Options::default();
     opts.create_if_missing(false);
@@ -95,11 +93,7 @@ fn main() -> Result<()> {
 
     println!("pointer keys for block {block}: {}", pointer_count);
     for (i, (k, v)) in first_pointers.iter().enumerate() {
-        println!(
-            "ptr[{i}] key={} val_utf8={}",
-            hex::encode(k),
-            String::from_utf8_lossy(v)
-        );
+        println!("ptr[{i}] key={} val_utf8={}", hex::encode(k), String::from_utf8_lossy(v));
     }
 
     let mut found = 0usize;
@@ -117,11 +111,7 @@ fn main() -> Result<()> {
         }
     }
 
-    println!(
-        "blob keys derived: {} (found {})",
-        blob_keys.len(),
-        found
-    );
+    println!("blob keys derived: {} (found {})", blob_keys.len(), found);
     if let Some(len) = sample_len {
         println!("example blob length: {len} bytes");
     }

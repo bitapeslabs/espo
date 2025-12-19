@@ -10,16 +10,8 @@ use std::path::PathBuf;
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let file = args.next().expect("usage: dump_block_slice <blkfile> <offset> <len>");
-    let offset: u64 = args
-        .next()
-        .expect("missing offset")
-        .parse()
-        .expect("offset must be integer");
-    let len: usize = args
-        .next()
-        .expect("missing len")
-        .parse()
-        .expect("len must be integer");
+    let offset: u64 = args.next().expect("missing offset").parse().expect("offset must be integer");
+    let len: usize = args.next().expect("missing len").parse().expect("len must be integer");
 
     let path = PathBuf::from(file);
     let mut f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
@@ -31,11 +23,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("read {} bytes from {}", len, path.display()))?;
 
     let block: Block = deserialize(&buf).context("deserialize block")?;
-    println!(
-        "block slice: txs={} (hash={})",
-        block.txdata.len(),
-        block.block_hash()
-    );
+    println!("block slice: txs={} (hash={})", block.txdata.len(), block.block_hash());
 
     for (i, tx) in block.txdata.iter().enumerate() {
         let txid: Txid = tx.compute_txid();

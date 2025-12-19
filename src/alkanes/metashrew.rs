@@ -137,8 +137,9 @@ impl MetashrewAdapter {
 
         let length_str = std::str::from_utf8(&length_bytes)
             .map_err(|e| anyhow!("utf8 decode balances length: {e}"))?;
-        let length: u64 =
-            length_str.parse().map_err(|e| anyhow!("parse balances length '{length_str}': {e}"))?;
+        let length: u64 = length_str
+            .parse()
+            .map_err(|e| anyhow!("parse balances length '{length_str}': {e}"))?;
 
         let Some(latest_idx) = length.checked_sub(1) else { return Ok(None) };
 
@@ -151,21 +152,19 @@ impl MetashrewAdapter {
             None => return Ok(None),
         };
 
-        let entry_str =
-            std::str::from_utf8(&entry_bytes).map_err(|e| anyhow!("utf8 decode balance entry: {e}"))?;
+        let entry_str = std::str::from_utf8(&entry_bytes)
+            .map_err(|e| anyhow!("utf8 decode balance entry: {e}"))?;
         let (height_str, hex_part) =
             entry_str.split_once(':').ok_or_else(|| anyhow!("balance entry missing ':'"))?;
 
-        let _updated_height: u64 =
-            height_str.parse().map_err(|e| anyhow!("parse balance height '{height_str}': {e}"))?;
+        let _updated_height: u64 = height_str
+            .parse()
+            .map_err(|e| anyhow!("parse balance height '{height_str}': {e}"))?;
 
         let raw_balance = hex::decode(hex_part)
             .map_err(|e| anyhow!("hex decode balance payload '{hex_part}': {e}"))?;
         if raw_balance.len() != 16 {
-            return Err(anyhow!(
-                "balance payload length {}, expected 16 bytes",
-                raw_balance.len()
-            ));
+            return Err(anyhow!("balance payload length {}, expected 16 bytes", raw_balance.len()));
         }
         let mut bal_bytes = [0u8; 16];
         bal_bytes.copy_from_slice(&raw_balance);

@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use bitcoin::Txid;
-use electrum_client::{Client as ElectrumClient, ElectrumApi};
-use futures::{stream::FuturesUnordered, StreamExt};
+use electrum_client::{Client as ElectrumClient, ElectrumApi, Param};
+use futures::{StreamExt, stream::FuturesUnordered};
 use reqwest::Client as HttpClient;
+use serde::Deserialize;
 use std::future::Future;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::runtime::{Handle, Runtime};
 
@@ -12,6 +14,7 @@ pub trait ElectrumLike: Send + Sync {
     fn batch_transaction_get_raw(&self, txids: &[Txid]) -> Result<Vec<Vec<u8>>>;
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>>;
     fn tip_height(&self) -> Result<u32>;
+    fn transaction_get_outspends(&self, txid: &Txid) -> Result<Vec<Option<Txid>>>;
 }
 
 /// Thin wrapper over the native Electrum RPC client.
@@ -33,9 +36,7 @@ impl ElectrumLike for ElectrumRpcClient {
     }
 
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>> {
-        self.client
-            .transaction_get_raw(txid)
-            .context("electrum transaction_get_raw")
+        self.client.transaction_get_raw(txid).context("electrum transaction_get_raw")
     }
 
     fn tip_height(&self) -> Result<u32> {
@@ -49,6 +50,18 @@ impl ElectrumLike for ElectrumRpcClient {
             .try_into()
             .map_err(|_| anyhow::anyhow!("electrum: tip height doesn't fit into u32"))?;
         Ok(tip)
+    }
+
+    fn transaction_get_outspends(&self, txid: &Txid) -> Result<Vec<Option<Txid>>> {
+        // Electrum protocol does not standardize outspends; try verbose get (electrs supports
+        // `outspends` field) and fall back to empty.
+        let params = vec![Param::String(txid.to_string()), Param::Bool(true)];
+        let resp = self
+            .client
+            .raw_call("blockchain.transaction.get", params)
+            .context("electrum transaction.get (verbose) for outspends")?;
+
+        Ok(extract_outspends(&resp))
     }
 }
 
@@ -146,4 +159,53 @@ impl ElectrumLike for EsploraElectrumLike {
             Ok(tip)
         })
     }
+
+    fn transaction_get_outspends(&self, txid: &Txid) -> Result<Vec<Option<Txid>>> {
+        self.block_on_result(async {
+            let url = format!("{}/tx/{}/outspends", self.base_url, txid);
+            let resp = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("esplora GET {url} failed"))?
+                .error_for_status()
+                .with_context(|| format!("esplora GET {url} returned error status"))?;
+
+            let body_str = resp.text().await.context("esplora outspends body read failed")?;
+            let body: Vec<EsploraOutspend> =
+                serde_json::from_str(&body_str).context("esplora outspends json decode failed")?;
+
+            let mut out = Vec::with_capacity(body.len());
+            for o in body {
+                if o.spent {
+                    out.push(o.txid.and_then(|s| Txid::from_str(&s).ok()));
+                } else {
+                    out.push(None);
+                }
+            }
+            Ok(out)
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct EsploraOutspend {
+    spent: bool,
+    txid: Option<String>,
+}
+
+fn extract_outspends(v: &serde_json::Value) -> Vec<Option<Txid>> {
+    let Some(arr) = v.get("outspends").and_then(|o| o.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let spent_flag = item.get("spent").and_then(|b| b.as_bool());
+        let spender =
+            item.get("txid").and_then(|t| t.as_str()).and_then(|s| Txid::from_str(s).ok());
+        let spent = spent_flag.unwrap_or_else(|| spender.is_some());
+        out.push(if spent { spender } else { None });
+    }
+    out
 }

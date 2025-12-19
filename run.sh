@@ -6,4 +6,5 @@ cargo run --release -- \
   --bitcoind-rpc-user admin \
   --bitcoind-rpc-pass admin \
   --network mainnet \
-  --block-source-mode rpc
+  --block-source-mode rpc \
+  --explorer-host 0.0.0.0:5779

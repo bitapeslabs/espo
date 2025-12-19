@@ -2,6 +2,7 @@ pub mod alkanes;
 pub mod config;
 pub mod consts;
 pub mod core;
+pub mod explorer;
 pub mod modules;
 pub mod runtime;
 pub mod schemas;
@@ -21,6 +22,7 @@ use crate::modules::essentials::main::Essentials;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
 
+use crate::explorer::run_explorer;
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
     config::{get_config, get_espo_db, init_config},
@@ -53,6 +55,16 @@ async fn main() -> Result<()> {
         }
     });
     eprintln!("[rpc] listening on {}", addr);
+
+    // Optional SSR explorer server
+    if let Some(explorer_addr) = cfg.explorer_host {
+        tokio::spawn(async move {
+            if let Err(e) = run_explorer(explorer_addr).await {
+                eprintln!("[explorer] server error: {e:?}");
+            }
+        });
+        eprintln!("[explorer] listening on {}", explorer_addr);
+    }
 
     let global_genesis = alkanes_genesis_block(network);
 

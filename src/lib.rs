@@ -2,6 +2,7 @@ pub mod alkanes;
 pub mod config;
 pub mod consts;
 pub mod core;
+pub mod explorer;
 pub mod modules;
 pub mod runtime;
 pub mod schemas;

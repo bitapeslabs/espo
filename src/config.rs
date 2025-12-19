@@ -1,13 +1,19 @@
 use crate::ESPO_HEIGHT;
 use crate::alkanes::metashrew::MetashrewAdapter;
-use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
 use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB};
+use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
 use anyhow::Result;
 use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{DB, Options};
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::{fs, path::Path, sync::{Arc, OnceLock}, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 // Bitcoin Core / bitcoin::Network
 use bitcoincore_rpc::bitcoin::Network;
@@ -86,6 +92,10 @@ pub struct CliArgs {
     #[arg(short = 'p', long, default_value_t = 8080)]
     pub port: u16,
 
+    /// Optional bind address for the SSR explorer (e.g. 127.0.0.1:8081). If omitted, no explorer server is started.
+    #[arg(long)]
+    pub explorer_host: Option<SocketAddr>,
+
     /// Bitcoin network: 'mainnet' or 'regtest'
     #[arg(short, long, value_parser = parse_network, default_value = "mainnet")]
     pub network: Network,
@@ -149,7 +159,9 @@ pub fn init_config() -> Result<()> {
         anyhow::bail!("provide either --electrum-rpc-url or --electrs-esplora-url");
     }
     if electrum_url.is_some() && esplora_url.is_some() {
-        eprintln!("[config] both electrum rpc and electrs esplora URLs provided; electrum rpc will be used");
+        eprintln!(
+            "[config] both electrum rpc and electrs esplora URLs provided; electrum rpc will be used"
+        );
     }
 
     // --- store config ---
@@ -171,7 +183,8 @@ pub fn init_config() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
         Arc::new(ElectrumRpcClient::new(client))
     } else {
-        let base = esplora_url.expect("validation ensures esplora url exists when electrum is None");
+        let base =
+            esplora_url.expect("validation ensures esplora url exists when electrum is None");
         Arc::new(EsploraElectrumLike::new(base)?)
     };
     ELECTRUM_LIKE

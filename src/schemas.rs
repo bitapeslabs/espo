@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use protorune_support::balance_sheet::IntoString;
 use std::fmt;
+use std::io::ErrorKind;
 
 #[derive(
     BorshSerialize,
@@ -74,10 +75,27 @@ impl TryFrom<SchemaAlkaneId> for AlkaneId {
     }
 }
 
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Eq, Hash, Default)]
+#[derive(BorshSerialize, PartialEq, Debug, Clone, Eq, Hash, Default)]
 pub struct EspoOutpoint {
     pub txid: Vec<u8>, // BE bytes
     pub vout: u32,
+    pub tx_spent: Option<Vec<u8>>, // BE bytes of spending txid
+}
+
+impl BorshDeserialize for EspoOutpoint {
+    fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let txid: Vec<u8> = BorshDeserialize::deserialize_reader(reader)?;
+        let vout: u32 = BorshDeserialize::deserialize_reader(reader)?;
+
+        // Support legacy encodings without tx_spent by treating EOF as None.
+        let tx_spent = match Option::<Vec<u8>>::deserialize_reader(reader) {
+            Ok(v) => v,
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => None,
+            Err(e) => return Err(e),
+        };
+
+        Ok(EspoOutpoint { txid, vout, tx_spent })
+    }
 }
 
 impl EspoOutpoint {

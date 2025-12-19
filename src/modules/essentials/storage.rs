@@ -73,6 +73,24 @@ pub fn outpoint_balances_key(outp: &EspoOutpoint) -> Result<Vec<u8>> {
     Ok(k)
 }
 
+#[derive(BorshSerialize)]
+struct OutpointPrefix {
+    txid: Vec<u8>,
+    vout: u32,
+}
+
+/// Prefix for matching any serialization of an outpoint (with or without tx_spent)
+pub fn outpoint_balances_prefix(txid: &[u8], vout: u32) -> Result<Vec<u8>> {
+    let mut k = b"/outpoint_balances/".to_vec();
+    k.extend_from_slice(&borsh::to_vec(&OutpointPrefix { txid: txid.to_vec(), vout })?);
+    Ok(k)
+}
+
+/// Helper to build an outpoint with optional spending txid for lookups.
+pub fn mk_outpoint(txid: Vec<u8>, vout: u32, tx_spent: Option<Vec<u8>>) -> EspoOutpoint {
+    EspoOutpoint { txid, vout, tx_spent }
+}
+
 pub fn spk_to_address_str(spk: &ScriptBuf, net: Network) -> Option<String> {
     Address::from_script(spk.as_script(), net).ok().map(|a| a.to_string())
 }
