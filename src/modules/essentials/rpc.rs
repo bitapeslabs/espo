@@ -20,6 +20,7 @@ use super::utils::balances::{
     get_balance_for_address, get_holders_for_alkane,
     get_outpoint_balances as get_outpoint_balances_index,
 };
+use super::utils::inspections::{inspection_to_json, load_inspection};
 
 use bitcoin::Address;
 use bitcoin::hashes::Hash;
@@ -201,6 +202,53 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             "has_more": has_more,
                             "items": Value::Object(items)
                         })
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- inspections.lookup -------- */
+    {
+        let reg_inspection = reg.clone();
+        let mdb_inspection = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_inspection
+                .register("get_inspection", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_inspection);
+                    async move {
+                        let alk = match payload
+                            .get("alkane")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_inspection", "missing_or_invalid_alkane");
+                                return json!({
+                                    "ok": false,
+                                    "error": "missing_or_invalid_alkane",
+                                    "hint": "provide alkane as \"<block>:<tx>\" (hex ok)"
+                                });
+                            }
+                        };
+
+                        match load_inspection(&mdb, &alk) {
+                            Ok(Some(record)) => json!({
+                                "ok": true,
+                                "inspection": inspection_to_json(&record)
+                            }),
+                            Ok(None) => {
+                                json!({"ok": false, "error": "not_found"})
+                            }
+                            Err(e) => {
+                                log_rpc(
+                                    "get_inspection",
+                                    &format!("load_inspection failed for {}:{}: {e}", alk.block, alk.tx),
+                                );
+                                json!({"ok": false, "error": "lookup_failed"})
+                            }
+                        }
                     }
                 })
                 .await;

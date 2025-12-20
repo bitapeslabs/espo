@@ -5,12 +5,17 @@ use bitcoin::hashes::Hash;
 use bitcoin::{opcodes, Address, Amount, Network, ScriptBuf, Transaction, Txid};
 use maud::{Markup, PreEscaped, html};
 
-use crate::alkanes::trace::{EspoTrace, prettyify_protobuf_trace_json};
+use crate::alkanes::trace::{
+    EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoSandshrewLikeTraceStatus,
+    EspoTrace, prettyify_protobuf_trace_json,
+};
 use crate::explorer::components::svg_assets::{icon_arrow_bend_down_right, icon_caret_right};
-use crate::explorer::consts::{ALKANE_ICON_BASE, ALKANE_NAME_OVERRIDES};
+use crate::explorer::consts::{ALKANE_ICON_BASE, ALKANE_ICON_OVERRIDES, ALKANE_NAME_OVERRIDES};
 use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount};
 use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::essentials::utils::balances::OutpointLookup;
+use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
+use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
@@ -49,6 +54,53 @@ struct OpReturnDecoded {
     has_runestone_magic: bool,
     pushdata_only: bool,
 }
+
+#[derive(Clone, Debug)]
+struct ContractCallSummary {
+    contract_id: SchemaAlkaneId,
+    contract_name: ResolvedName,
+    icon_url: String,
+    method_name: Option<String>,
+    opcode: Option<u128>,
+    call_type: Option<String>,
+    response_text: Option<String>,
+    success: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedName {
+    value: String,
+    known: bool,
+}
+
+impl ResolvedName {
+    fn fallback_letter(&self) -> char {
+        if !self.known {
+            return '?';
+        }
+        self.value
+            .chars()
+            .find(|c| !c.is_whitespace())
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('?')
+    }
+}
+
+type InspectionCache = HashMap<SchemaAlkaneId, Option<StoredInspectionResult>>;
+#[derive(Clone, Debug, Default)]
+struct AlkaneKvMeta {
+    name: Option<String>,
+    symbol: Option<String>,
+}
+type AlkaneKvCache = HashMap<SchemaAlkaneId, AlkaneKvMeta>;
+#[derive(Clone, Debug)]
+struct AlkaneMetaDisplay {
+    name: ResolvedName,
+    symbol: String,
+    icon_url: String,
+}
+const KV_KEY_NAME: &[u8] = b"/name";
+const KV_KEY_SYMBOL: &[u8] = b"/symbol";
 
 fn decode_op_return_payload(spk: &ScriptBuf) -> Option<OpReturnDecoded> {
     let mut instructions = spk.instructions();
@@ -141,6 +193,249 @@ fn opreturn_utf8(data: &[u8]) -> String {
     String::from_utf8_lossy(data).into_owned()
 }
 
+fn parse_u128_from_str(s: &str) -> Option<u128> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u128::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u128>().ok()
+    }
+}
+
+fn parse_short_id_to_schema(id: &EspoSandshrewLikeTraceShortId) -> Option<SchemaAlkaneId> {
+    fn parse_u32_or_hex(s: &str) -> Option<u32> {
+        if let Some(hex) = s.strip_prefix("0x") {
+            return u32::from_str_radix(hex, 16).ok();
+        }
+        s.parse::<u32>().ok()
+    }
+    fn parse_u64_or_hex(s: &str) -> Option<u64> {
+        if let Some(hex) = s.strip_prefix("0x") {
+            return u64::from_str_radix(hex, 16).ok();
+        }
+        s.parse::<u64>().ok()
+    }
+
+    let block = parse_u32_or_hex(&id.block)?;
+    let tx = parse_u64_or_hex(&id.tx)?;
+    Some(SchemaAlkaneId { block, tx })
+}
+
+fn trace_opcode(inputs: &[String]) -> Option<u128> {
+    inputs.first().and_then(|s| parse_u128_from_str(s))
+}
+
+fn decode_trace_response(data_hex: &str) -> Option<String> {
+    let hex_str = data_hex.strip_prefix("0x").unwrap_or(data_hex);
+    if hex_str.is_empty() {
+        return None;
+    }
+    let bytes = hex::decode(hex_str).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let trimmed = text.trim_matches('\u{0}').to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn kv_row_key(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 4 + 8 + 2 + skey.len());
+    v.push(0x01);
+    v.extend_from_slice(&alk.block.to_be_bytes());
+    v.extend_from_slice(&alk.tx.to_be_bytes());
+    let len = u16::try_from(skey.len()).unwrap_or(u16::MAX);
+    v.extend_from_slice(&len.to_be_bytes());
+    if len as usize != skey.len() {
+        v.extend_from_slice(&skey[..(len as usize)]);
+    } else {
+        v.extend_from_slice(skey);
+    }
+    v
+}
+
+fn kv_utf8_value(alk: &SchemaAlkaneId, skey: &[u8], mdb: &Mdb) -> Option<String> {
+    let key = kv_row_key(alk, skey);
+    let raw = mdb.get(&key).ok().flatten()?;
+    let value = if raw.len() >= 32 { &raw[32..] } else { raw.as_slice() };
+    let s = std::str::from_utf8(value).ok()?.trim_matches('\0').to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn kv_meta_for_alkane(id: &SchemaAlkaneId, cache: &mut AlkaneKvCache, mdb: &Mdb) -> AlkaneKvMeta {
+    if let Some(meta) = cache.get(id) {
+        return meta.clone();
+    }
+    let meta = AlkaneKvMeta {
+        name: kv_utf8_value(id, KV_KEY_NAME, mdb),
+        symbol: kv_utf8_value(id, KV_KEY_SYMBOL, mdb),
+    };
+    cache.insert(*id, meta.clone());
+    meta
+}
+
+fn lookup_inspection<'a>(
+    id: &SchemaAlkaneId,
+    cache: &'a mut InspectionCache,
+    mdb: &Mdb,
+) -> Option<&'a StoredInspectionResult> {
+    if !cache.contains_key(id) {
+        let loaded = load_inspection(mdb, id).ok().flatten();
+        cache.insert(*id, loaded);
+    }
+    cache.get(id).and_then(|o| o.as_ref())
+}
+
+fn contract_display_name(
+    id: &SchemaAlkaneId,
+    inspection: Option<&StoredInspectionResult>,
+    kv_meta: &AlkaneKvMeta,
+) -> ResolvedName {
+    if let Some(meta) = inspection.and_then(|i| i.metadata.as_ref()) {
+        if !meta.name.trim().is_empty() {
+            return ResolvedName { value: meta.name.clone(), known: true };
+        }
+    }
+    if let Some(name) = kv_meta.name.as_ref() {
+        if !name.trim().is_empty() {
+            return ResolvedName { value: name.clone(), known: true };
+        }
+    }
+    let key = format!("{}:{}", id.block, id.tx);
+    for (id_s, name, _sym) in ALKANE_NAME_OVERRIDES {
+        if *id_s == key {
+            return ResolvedName { value: name.to_string(), known: true };
+        }
+    }
+    ResolvedName { value: key, known: false }
+}
+
+fn method_display_name(opcode: u128, inspection: Option<&StoredInspectionResult>) -> Option<String> {
+    let meta = inspection?.metadata.as_ref()?;
+    meta.methods
+        .iter()
+        .find(|m| m.opcode == opcode)
+        .map(|m| m.name.clone())
+}
+
+fn alkane_icon_url(id: &SchemaAlkaneId) -> String {
+    let key = format!("{}:{}", id.block, id.tx);
+    for (id_s, url) in ALKANE_ICON_OVERRIDES {
+        if *id_s == key {
+            return url.to_string();
+        }
+    }
+    format!("{}/{}_{}.png", ALKANE_ICON_BASE, id.block, id.tx)
+}
+
+fn contract_icon_url(id: &SchemaAlkaneId) -> String {
+    alkane_icon_url(id)
+}
+
+fn summarize_contract_call(
+    trace: &EspoTrace,
+    cache: &mut InspectionCache,
+    kv_cache: &mut AlkaneKvCache,
+    mdb: &Mdb,
+) -> Option<ContractCallSummary> {
+    let mut contract_id: Option<SchemaAlkaneId> = None;
+    let mut opcode: Option<u128> = None;
+    let mut call_type: Option<String> = None;
+    let mut response_text: Option<String> = None;
+    let mut any_failure = false;
+
+    for ev in &trace.sandshrew_trace.events {
+        match ev {
+            EspoSandshrewLikeTraceEvent::Invoke(data) => {
+                if contract_id.is_none() {
+                    contract_id = parse_short_id_to_schema(&data.context.myself);
+                }
+                if opcode.is_none() {
+                    opcode = trace_opcode(&data.context.inputs);
+                }
+                if call_type.is_none() && !data.typ.is_empty() {
+                    call_type = Some(data.typ.clone());
+                }
+            }
+            EspoSandshrewLikeTraceEvent::Return(data) => {
+                if matches!(data.status, EspoSandshrewLikeTraceStatus::Failure) {
+                    any_failure = true;
+                }
+                if let Some(text) = decode_trace_response(&data.response.data) {
+                    response_text = Some(text);
+                }
+            }
+            EspoSandshrewLikeTraceEvent::Create(_) => {}
+        }
+    }
+
+    let contract_id = contract_id?;
+    let inspection = lookup_inspection(&contract_id, cache, mdb);
+    let kv_meta = kv_meta_for_alkane(&contract_id, kv_cache, mdb);
+    let contract_name = contract_display_name(&contract_id, inspection, &kv_meta);
+    let method_name = opcode.and_then(|op| method_display_name(op, inspection));
+
+    Some(ContractCallSummary {
+        contract_id,
+        contract_name,
+        icon_url: contract_icon_url(&contract_id),
+        method_name,
+        opcode,
+        call_type,
+        response_text,
+        success: !any_failure,
+    })
+}
+
+fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
+    let alkane_path = format!("/alkane/{}:{}", summary.contract_id.block, summary.contract_id.tx);
+    let status_class = if summary.success { "success" } else { "failure" };
+    let status_text = match (summary.response_text.clone(), summary.success) {
+        (Some(t), true) => t,
+        (Some(t), false) => format!("Reverted: {t}"),
+        (None, true) => "Call successful".to_string(),
+        (None, false) => "Call reverted".to_string(),
+    };
+    let method_label =
+        summary.method_name.clone().unwrap_or_else(|| "contract call".to_string());
+    let fallback_letter = summary.contract_name.fallback_letter();
+
+    html! {
+        div class="trace-summary" {
+            span class="trace-summary-label" { "Contract call:" }
+            div class="trace-contract-row" {
+                div class="trace-contract-icon" aria-hidden="true" {
+                    img class="trace-contract-img" src=(summary.icon_url.clone()) alt=(summary.contract_name.value.clone()) loading="lazy" onerror="this.remove()" {}
+                    span class="trace-icon-letter" { (fallback_letter) }
+                }
+                div class="trace-contract-meta" {
+                    a class="trace-contract-name link" href=(alkane_path.clone()) { (summary.contract_name.value.clone()) }
+                }
+                span class="io-arrow" { (arrow_svg()) }
+            }
+            @if summary.method_name.is_some() || summary.opcode.is_some() {
+                div class="trace-method-pill" {
+                    span class="trace-method-name" { (method_label) }
+                    @if let Some(op) = summary.opcode {
+                        span class="trace-opcode" { (format!("opcode {}", op)) }
+                    }
+                }
+            }
+            div class=(format!("trace-status {}", status_class)) {
+                span class="trace-status-icon" aria-hidden="true" { (icon_arrow_bend_down_right()) }
+                span class="trace-status-text" { (status_text) }
+            }
+        }
+    }
+}
+
 /// Render a transaction with VINs, VOUTs, and optional trace details.
 pub fn render_tx(
     txid: &Txid,
@@ -150,8 +445,10 @@ pub fn render_tx(
     prev_map: &HashMap<Txid, Transaction>,
     outpoint_fn: &dyn Fn(&Txid, u32) -> OutpointLookup,
     outspends_fn: &dyn Fn(&Txid) -> Vec<Option<Txid>>,
+    essentials_mdb: &Mdb,
 ) -> Markup {
-    let vins_markup = render_vins(tx, network, prev_map, outpoint_fn);
+    let mut alkane_kv_cache: AlkaneKvCache = HashMap::new();
+    let vins_markup = render_vins(tx, network, prev_map, outpoint_fn, &mut alkane_kv_cache, essentials_mdb);
     let outspends = outspends_fn(txid);
     let protostone_json = protostone_json(tx);
     let runestone_vouts = runestone_vout_indices(tx);
@@ -164,6 +461,8 @@ pub fn render_tx(
         traces,
         &protostone_json,
         &runestone_vouts,
+        &mut alkane_kv_cache,
+        essentials_mdb,
     );
 
     html! {
@@ -182,6 +481,8 @@ fn render_vins(
     network: Network,
     prev_map: &HashMap<Txid, Transaction>,
     outpoint_fn: &dyn Fn(&Txid, u32) -> OutpointLookup,
+    alkane_kv_cache: &mut AlkaneKvCache,
+    essentials_mdb: &Mdb,
 ) -> Markup {
     html! {
         @if tx.input.is_empty() {
@@ -243,7 +544,7 @@ fn render_vins(
                                         }
                                     }
                                 }
-                                (balances_list(&prevout_view.balances))
+                                (balances_list(&prevout_view.balances, alkane_kv_cache, essentials_mdb))
                             }
                         }
                     }
@@ -262,9 +563,12 @@ fn render_vouts(
     traces: Option<&[EspoTrace]>,
     protostone_json: &Option<Value>,
     runestone_vouts: &HashSet<usize>,
+    alkane_kv_cache: &mut AlkaneKvCache,
+    essentials_mdb: &Mdb,
 ) -> Markup {
     let tx_bytes = txid.to_byte_array();
     let tx_hex = txid.to_string();
+    let mut inspection_cache: InspectionCache = HashMap::new();
 
     html! {
         @if tx.output.is_empty() {
@@ -297,7 +601,7 @@ fn render_vouts(
                                             .collect();
                                         if !matches.is_empty() { matches } else { ts.iter().collect() }
                                     }).unwrap_or_default();
-                                    (render_op_return(&payload, o.value, is_protostone, protostone_json.as_ref(), &traces_for_vout))
+                                    (render_op_return(&payload, o.value, is_protostone, protostone_json.as_ref(), &traces_for_vout, &mut inspection_cache, alkane_kv_cache, essentials_mdb))
                                 }
                                 None => {
                                     @let addr_opt = Address::from_script(o.script_pubkey.as_script(), network).ok();
@@ -328,7 +632,7 @@ fn render_vouts(
                                     }
                                 }
                             }
-                            (balances_list(&balances))
+                            (balances_list(&balances, alkane_kv_cache, essentials_mdb))
                         }
                         @match spent_by {
                             Some(spender) => a class="io-arrow io-arrow-link out spent" href=(format!("/tx/{}", spender)) title="Spent by transaction" { (arrow_svg()) },
@@ -347,6 +651,9 @@ fn render_op_return(
     is_protostone: bool,
     protostone_json: Option<&Value>,
     traces: &[&EspoTrace],
+    inspection_cache: &mut InspectionCache,
+    kv_cache: &mut AlkaneKvCache,
+    essentials_mdb: &Mdb,
 ) -> Markup {
     let fallback = opreturn_utf8(&payload.data);
     let trace_views: Vec<(String, Option<Value>)> = traces
@@ -378,22 +685,28 @@ fn render_op_return(
             }
             @if is_protostone {
                 div class="opret-body protostone-body" {
-                    details class="opret-toggle" open {
+                    @for (idx, ((trace_raw, trace_parsed), trace)) in trace_views.iter().zip(traces.iter()).enumerate() {
+                        @let label = format!("Alkanes Trace #{}", idx + 1);
+                        @let summary = summarize_contract_call(*trace, inspection_cache, kv_cache, essentials_mdb);
+                        div class="trace-view" {
+                            @if let Some(s) = summary {
+                                (render_trace_summary(&s))
+                            }
+                            details class="opret-toggle" {
+                                summary class="opret-toggle-summary" {
+                                    span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
+                                    span class="opret-toggle-label" { (label) }
+                                }
+                                div class="opret-toggle-body" { (json_viewer(trace_parsed.as_ref(), trace_raw)) }
+                            }
+                        }
+                    }
+                    details class="opret-toggle" {
                         summary class="opret-toggle-summary" {
                             span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
                             span class="opret-toggle-label" { "Protostone message" }
                         }
                         div class="opret-toggle-body" { (json_viewer(protostone_json, &fallback)) }
-                    }
-                    @for (idx, (trace_raw, trace_parsed)) in trace_views.iter().enumerate() {
-                        @let label = format!("Alkanes Trace #{}", idx + 1);
-                        details class="opret-toggle" {
-                            summary class="opret-toggle-summary" {
-                                span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
-                                span class="opret-toggle-label" { (label) }
-                            }
-                            div class="opret-toggle-body" { (json_viewer(trace_parsed.as_ref(), trace_raw)) }
-                        }
                     }
                 }
             } @else {
@@ -403,36 +716,68 @@ fn render_op_return(
     }
 }
 
-fn balances_list(entries: &[BalanceEntry]) -> Markup {
+fn balances_list(
+    entries: &[BalanceEntry],
+    kv_cache: &mut AlkaneKvCache,
+    essentials_mdb: &Mdb,
+) -> Markup {
     if entries.is_empty() {
         return html! {};
     }
     html! {
         div class="io-alkanes" {
             @for be in entries {
-                @let (name, sym, icon) = alkane_meta(&be.alkane);
+                @let meta = alkane_meta(&be.alkane, kv_cache, essentials_mdb);
                 @let alk = format!("{}:{}", be.alkane.block, be.alkane.tx);
+                @let fallback_letter = meta.name.fallback_letter();
                 div class="alk-line" {
                     span class="alk-arrow" aria-hidden="true" { (icon_arrow_bend_down_right()) }
-                    img class="alk-icon" src=(icon) alt=(sym.clone()) {}
+                    div class="alk-icon-wrap" aria-hidden="true" {
+                        img class="alk-icon-img" src=(meta.icon_url.clone()) alt=(meta.symbol.clone()) loading="lazy" onerror="this.remove()" {}
+                        span class="alk-icon-letter" { (fallback_letter) }
+                    }
                     span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
-                    a class="alk-sym link mono" href=(format!("/alkane/{alk}")) { (name) }
+                    a class="alk-sym link mono" href=(format!("/alkane/{alk}")) { (meta.name.value.clone()) }
                 }
             }
         }
     }
 }
 
-fn alkane_meta(id: &SchemaAlkaneId) -> (String, String, String) {
+fn alkane_meta(
+    id: &SchemaAlkaneId,
+    kv_cache: &mut AlkaneKvCache,
+    essentials_mdb: &Mdb,
+) -> AlkaneMetaDisplay {
+    let meta = kv_meta_for_alkane(id, kv_cache, essentials_mdb);
+    if let Some(name) = meta.name.as_ref() {
+        if !name.trim().is_empty() {
+            let icon_url = alkane_icon_url(id);
+            let sym = meta.symbol.clone().unwrap_or_else(|| name.clone());
+            return AlkaneMetaDisplay {
+                name: ResolvedName { value: name.clone(), known: true },
+                symbol: sym,
+                icon_url,
+            };
+        }
+    }
     let key = format!("{}:{}", id.block, id.tx);
     for (id_s, name, sym) in ALKANE_NAME_OVERRIDES {
         if *id_s == key {
-            let icon = format!("{}/{}_{}.png", ALKANE_ICON_BASE, id.block, id.tx);
-            return (name.to_string(), sym.to_string(), icon);
+            let icon_url = alkane_icon_url(id);
+            return AlkaneMetaDisplay {
+                name: ResolvedName { value: name.to_string(), known: true },
+                symbol: sym.to_string(),
+                icon_url,
+            };
         }
     }
-    let icon = format!("{}/{}_{}.png", ALKANE_ICON_BASE, id.block, id.tx);
-    (key.clone(), key, icon)
+    let icon_url = alkane_icon_url(id);
+    AlkaneMetaDisplay {
+        name: ResolvedName { value: key.clone(), known: false },
+        symbol: key,
+        icon_url,
+    }
 }
 
 fn json_viewer(value: Option<&Value>, raw: &str) -> Markup {

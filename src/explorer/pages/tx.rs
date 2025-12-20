@@ -127,7 +127,7 @@ pub async fn tx_page(
                     span class="mono" { (txid.to_string()) }
                 }
             }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn))
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb))
         },
     )
 }

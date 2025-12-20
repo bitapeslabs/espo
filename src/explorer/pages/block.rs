@@ -163,7 +163,7 @@ pub async fn block_page(
                         @for atx in tx_items {
                             @let txid = atx.transaction.compute_txid();
                             @let traces: Option<&[EspoTrace]> = atx.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&txid, &atx.transaction, traces, get_network(), &prev_map, &outpoint_fn, &outspends_fn))
+                            (render_tx(&txid, &atx.transaction, traces, get_network(), &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb))
                         }
                     }
                 }

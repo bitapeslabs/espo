@@ -105,7 +105,7 @@ a:hover {
 }
 .search {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
 }
 .input {
@@ -188,7 +188,7 @@ a:hover {
 }
 .pillrow {
   display: flex;
-  gap: 10px;
+  gap: 8x;
   align-items: center;
   flex-wrap: wrap;
 }
@@ -363,7 +363,7 @@ a:hover {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   width: 100%;
   padding: 0;
   margin: 0;
@@ -411,14 +411,11 @@ a:hover {
   border-radius: 2px;
 }
 .opret-body {
-  margin: 8px 0 0;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.22);
-  border: 1px solid rgba(35, 48, 66, 0.65);
   white-space: pre-wrap;
   overflow: hidden;
-  font-family: var(--mono);
-  color: rgba(215, 221, 230, 0.92);
+  font-family: var(--sans);
   width: 100%;
   box-sizing: border-box;
   margin-bottom: 4px;
@@ -427,7 +424,9 @@ a:hover {
   display: none;
 }
 .io-opret[open] + .opret-body {
-  display: block;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 .protostone-body {
   background: none;
@@ -439,9 +438,14 @@ a:hover {
   margin-top: 12px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.22);
-  border: 1px solid rgba(35, 48, 66, 0.65);
   overflow: hidden;
 }
+
+.trace-view > .opret-toggle{
+  border-top-left-radius: 0px;
+  border-top-right-radius: 0px;
+}
+
 .opret-toggle:first-of-type {
   margin-top: 0;
 }
@@ -479,6 +483,118 @@ a:hover {
 }
 .trace-body {
   margin-top: 8px;
+}
+.trace-view {
+  margin-top: 12px;
+  display: grid;
+}
+.trace-summary {
+  background: var(--panel2);
+  border-radius: 8px;
+  border-bottom-left-radius: 0px;
+  border-bottom-right-radius: 0px;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+}
+.trace-summary-label {
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+.trace-contract-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.trace-contract-icon,
+.alk-icon-wrap {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--panel3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+}
+.trace-contract-img,
+.alk-icon-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+  z-index: 2;
+}
+.trace-icon-letter,
+.alk-icon-letter {
+  z-index: 1;
+  font-size: 14px;
+}
+.trace-contract-meta {
+  display: grid;
+  gap: 2px;
+}
+.trace-contract-name {
+  font-weight: 600;
+  color: var(--muted);
+}
+.trace-contract-id {
+  font-size: 12px;
+}
+.trace-contract-open {
+  margin-left: auto;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+.trace-contract-open:hover {
+  background: rgba(148, 158, 255, 0.07);
+  text-decoration: none;
+}
+.trace-method-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 4px 8px;
+    font-weight: 500;
+    width: fit-content;
+}
+.trace-method-name {
+  white-space: nowrap;
+  word-break: break-word;
+}
+.trace-opcode,
+.trace-calltype {
+  color: var(--muted3);
+}
+.trace-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  word-break: break-word;
+}
+.trace-status-icon {
+  font-size: 16px;
+}
+.trace-status.success {
+  color: var(--success);
+}
+.trace-status.failure {
+  color: var(--danger);
+}
+.trace-status-text {
+  line-height: 1.4;
 }
 .json-viewer {
   position: relative;

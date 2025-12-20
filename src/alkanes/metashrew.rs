@@ -1,12 +1,15 @@
 use crate::alkanes::trace::PartialEspoTrace;
 use crate::config::get_metashrew_sdb;
 use crate::schemas::SchemaAlkaneId;
+use alkanes_support::gz;
+use alkanes_support::id::AlkaneId as SupportAlkaneId;
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use bitcoin::hashes::Hash;
 use bitcoin::Txid;
+use std::collections::HashSet;
 
 fn try_decode_prost(raw: &[u8]) -> Option<AlkanesTrace> {
     AlkanesTrace::decode(raw).ok().or_else(|| {
@@ -104,6 +107,103 @@ impl MetashrewAdapter {
             .map_err(|_| anyhow!("ESPO ERROR: Expected {} bytes, got {}", N, bytes.len()))?;
 
         Ok(T::from_le_bytes(arr))
+    }
+
+    fn load_wasm_inner(
+        &self,
+        db: &rocksdb::DB,
+        block: u128,
+        tx: u128,
+        seen: &mut HashSet<(u128, u128)>,
+        hops: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        const MAX_HOPS: usize = 64;
+        if hops > MAX_HOPS {
+            return Err(anyhow!("alias chain too deep (possible cycle)"));
+        }
+        if !seen.insert((block, tx)) {
+            return Err(anyhow!("alias cycle detected at ({block}, {tx})"));
+        }
+
+        // Build candidate keys (LE + BE, with optional /0..3 suffixes)
+        let mut base_le = b"/alkanes/".to_vec();
+        base_le.extend_from_slice(&block.to_le_bytes());
+        base_le.extend_from_slice(&tx.to_le_bytes());
+        let mut base_be = b"/alkanes/".to_vec();
+        base_be.extend_from_slice(&block.to_be_bytes());
+        base_be.extend_from_slice(&tx.to_be_bytes());
+
+        let mut candidate_keys: Vec<Vec<u8>> = Vec::new();
+        for base in [base_le, base_be] {
+            candidate_keys.push(self.apply_label(base.clone()));
+            for idx in 0u8..=3u8 {
+                let mut k = base.clone();
+                k.push(b'/');
+                k.push(b'0' + idx);
+                candidate_keys.push(self.apply_label(k));
+            }
+        }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for key in candidate_keys {
+            if let Some(raw) = db.get(&key)? {
+                if raw.is_empty() {
+                    continue;
+                }
+
+                // direct alias payload
+                if raw.len() == 32 {
+                    let alias = SupportAlkaneId::try_from(raw.clone())
+                        .map_err(|e| anyhow!("decode alkane alias for ({block}, {tx}): {e}"))?;
+                    return self.load_wasm_inner(db, alias.block, alias.tx, seen, hops + 1);
+                }
+
+                // pointer string like "height:HEX"
+                let mut payload = raw.to_vec();
+                if let Ok(s) = std::str::from_utf8(&raw) {
+                    if let Some((_h, hex_part)) = s.split_once(':') {
+                        if let Ok(decoded) = hex::decode(hex_part) {
+                            payload = decoded;
+                        }
+                    }
+                }
+
+                if payload.len() == 32 {
+                    if let Ok(alias) = SupportAlkaneId::try_from(payload.clone()) {
+                        return self.load_wasm_inner(db, alias.block, alias.tx, seen, hops + 1);
+                    }
+                }
+
+                match gz::decompress(payload.clone()) {
+                    Ok(bytes) => return Ok(Some(bytes)),
+                    Err(e) => {
+                        last_err = Some(anyhow!(e));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = last_err {
+            return Err(anyhow!("decompress alkane wasm payload from metashrew: {e}"));
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_alkane_wasm_bytes_with_db(
+        &self,
+        db: &rocksdb::DB,
+        alkane: &SchemaAlkaneId,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut seen = HashSet::new();
+        self.load_wasm_inner(db, alkane.block as u128, alkane.tx as u128, &mut seen, 0)
+    }
+
+    pub fn get_alkane_wasm_bytes(&self, alkane: &SchemaAlkaneId) -> Result<Option<Vec<u8>>> {
+        let db = get_metashrew_sdb();
+        db.catch_up_now().context("metashrew catch_up before wasm fetch")?;
+        self.get_alkane_wasm_bytes_with_db(db.as_db(), alkane)
     }
     pub fn get_alkanes_tip_height(&self) -> Result<u32> {
         let tip_height_prefix: Vec<u8> = self.apply_label(b"/__INTERNAL/tip-height".to_vec());

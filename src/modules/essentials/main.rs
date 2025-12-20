@@ -1,7 +1,11 @@
 use crate::alkanes::trace::EspoBlock;
+use crate::config::{get_metashrew, get_network};
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::consts::essentials_genesis_block;
 use crate::modules::essentials::rpc;
+use crate::modules::essentials::utils::inspections::{
+    created_alkanes_from_block, encode_inspection, inspection_key, inspect_wasm_metadata,
+};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
@@ -139,6 +143,8 @@ impl EspoModule for Essentials {
         // dedup directory markers:
         //   k_dir_entry(alk,skey) -> ()
         let mut dir_rows: HashSet<Vec<u8>> = HashSet::new();
+        // inspection index rows:
+        let mut inspection_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 
         let mut total_pairs_dedup = 0usize;
 
@@ -174,13 +180,62 @@ impl EspoModule for Essentials {
             }
         }
 
+        let mut created_alkanes = created_alkanes_from_block(&block);
+        // Special case: ensure genesis alkane (2:0) is inspected on the genesis block even if no trace emits a create.
+        let genesis_height = essentials_genesis_block(get_network());
+        if block.height == genesis_height {
+            let genesis = SchemaAlkaneId { block: 2, tx: 0 };
+            if !created_alkanes.contains(&genesis) {
+                created_alkanes.push(genesis);
+            }
+        }
+
+        let metashrew = get_metashrew();
+        for alk in created_alkanes {
+            match metashrew.get_alkane_wasm_bytes(&alk) {
+                Ok(Some(wasm_bytes)) => match inspect_wasm_metadata(&alk, &wasm_bytes) {
+                    Ok(record) => match encode_inspection(&record) {
+                        Ok(encoded) => {
+                            inspection_rows.insert(inspection_key(&alk), encoded);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[ESSENTIALS] failed to encode inspection for {}:{}: {e}",
+                                alk.block, alk.tx
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!(
+                            "[ESSENTIALS] inspection failed for {}:{}: {e}",
+                            alk.block, alk.tx
+                        );
+                    }
+                },
+                Ok(None) => {
+                    eprintln!(
+                        "[ESSENTIALS] no wasm payload found for alkane {}:{}; skipping inspection",
+                        alk.block, alk.tx
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ESSENTIALS] failed to fetch wasm for alkane {}:{}: {e}",
+                        alk.block, alk.tx
+                    );
+                }
+            }
+        }
+
         // If there’s nothing to write (typical empty block), skip the write-batch
-        if !kv_rows.is_empty() || !dir_rows.is_empty() {
+        if !kv_rows.is_empty() || !dir_rows.is_empty() || !inspection_rows.is_empty() {
             // -------- Phase B: write in sorted key order (better LSM locality) --------
             let mut kv_keys: Vec<Vec<u8>> = kv_rows.keys().cloned().collect();
             kv_keys.sort_unstable();
             let mut dir_keys: Vec<Vec<u8>> = dir_rows.into_iter().collect();
             dir_keys.sort_unstable();
+            let mut inspection_keys: Vec<Vec<u8>> = inspection_rows.keys().cloned().collect();
+            inspection_keys.sort_unstable();
 
             if let Err(e) = mdb.bulk_write(|wb: &mut MdbBatch<'_>| {
                 // Values first
@@ -192,6 +247,11 @@ impl EspoModule for Essentials {
                 // Then directory markers
                 for k in &dir_keys {
                     wb.put(k, &[]);
+                }
+                for k in &inspection_keys {
+                    if let Some(v) = inspection_rows.get(k) {
+                        wb.put(k, v);
+                    }
                 }
             }) {
                 eprintln!("[ESSENTIALS] bulk_write failed at block #{}: {e}", block.height);
@@ -208,9 +268,10 @@ impl EspoModule for Essentials {
             return Err(e);
         }
 
+        let inspections_saved = inspection_rows.len();
         eprintln!(
-            "[ESSENTIALS] block #{} indexed {} key/value updates (deduped)",
-            block.height, total_pairs_dedup
+            "[ESSENTIALS] block #{} indexed {} key/value updates (deduped); inspections {}",
+            block.height, total_pairs_dedup, inspections_saved
         );
         self.set_index_height(block.height)?;
         Ok(())
