@@ -44,6 +44,7 @@ struct OpReturnDecoded {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct ContractCallSummary {
     contract_id: SchemaAlkaneId,
     factory_id: Option<SchemaAlkaneId>,

@@ -3,6 +3,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse};
 use maud::{DOCTYPE, Markup, html};
 
+use crate::explorer::components::footer::footer;
 use crate::explorer::components::svg_assets::logo_espo;
 
 const STYLE_CSS: &str = include_str!("../assets/style.css");
@@ -36,6 +37,7 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                 main class="app" {
                     (content)
                 }
+                (footer())
             }
         }
     };
