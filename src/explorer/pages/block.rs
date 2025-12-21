@@ -125,20 +125,32 @@ pub async fn block_page(
     let mut display_end = 0usize;
     let mut last_page = 1usize;
     if let Some(espo_block) = espo_block.clone() {
-        let mut txs = espo_block.transactions;
         if traces_only {
+            let mut txs = espo_block.transactions;
             txs.retain(|t| t.traces.as_ref().map_or(false, |v| !v.is_empty()));
-        }
-        tx_total = txs.len();
-        let off = limit.saturating_mul(page.saturating_sub(1));
-        let end = (off + limit).min(tx_total);
-        tx_has_prev = page > 1;
-        tx_has_next = end < tx_total;
-        tx_items = txs.into_iter().skip(off).take(limit).collect();
-        if tx_total > 0 && off < tx_total {
-            display_start = off + 1;
-            display_end = (off + tx_items.len()).min(tx_total);
-            last_page = (tx_total + limit - 1) / limit;
+            tx_total = txs.len();
+            let off = limit.saturating_mul(page.saturating_sub(1));
+            let end = (off + limit).min(tx_total);
+            tx_has_prev = page > 1;
+            tx_has_next = end < tx_total;
+            tx_items = txs.into_iter().skip(off).take(limit).collect();
+            if tx_total > 0 && off < tx_total {
+                display_start = off + 1;
+                display_end = (off + tx_items.len()).min(tx_total);
+                last_page = (tx_total + limit - 1) / limit;
+            }
+        } else {
+            tx_total = espo_block.tx_count;
+            let off = limit.saturating_mul(page.saturating_sub(1));
+            let end = (off + limit).min(tx_total);
+            tx_has_prev = page > 1;
+            tx_has_next = end < tx_total;
+            tx_items = espo_block.transactions;
+            if tx_total > 0 {
+                display_start = off + 1;
+                display_end = (off + tx_items.len()).min(tx_total);
+                last_page = (tx_total + limit - 1) / limit;
+            }
         }
     }
 
