@@ -9,8 +9,12 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoSandshrewLikeTraceStatus,
     EspoTrace, prettyify_protobuf_trace_json,
 };
-use crate::explorer::components::svg_assets::{icon_arrow_bend_down_right, icon_caret_right};
-use crate::explorer::consts::{ALKANE_ICON_BASE, ALKANE_ICON_OVERRIDES, ALKANE_NAME_OVERRIDES};
+use crate::explorer::components::svg_assets::{
+    arrow_svg, icon_arrow_bend_down_right, icon_caret_right, icon_magic_wand,
+};
+use crate::explorer::consts::{
+    ALKANE_ICON_BASE, alkane_contract_name_overrides, alkane_icon_overrides, alkane_name_overrides,
+};
 use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount};
 use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::essentials::utils::balances::OutpointLookup;
@@ -21,32 +25,16 @@ use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use serde_json::{Value, json};
 
-const ADDR_PREFIX_LEN: usize = 31;
 const ADDR_SUFFIX_LEN: usize = 8;
-const ADDR_TRUNCATE_MIN_LEN: usize = ADDR_PREFIX_LEN + ADDR_SUFFIX_LEN;
 
-fn should_truncate_addr(addr: &str) -> bool {
-    addr.len() > ADDR_TRUNCATE_MIN_LEN
+fn addr_prefix_suffix(addr: &str) -> (String, String) {
+    let suffix_len = addr.len().min(ADDR_SUFFIX_LEN);
+    let split_at = addr.len().saturating_sub(suffix_len);
+    let prefix = addr[..split_at].to_string();
+    let suffix = addr[split_at..].to_string();
+    (prefix, suffix)
 }
 
-fn addr_suffix(addr: &str) -> String {
-    if !should_truncate_addr(addr) {
-        return String::new();
-    }
-    let suffix_len = addr.len().saturating_sub(ADDR_PREFIX_LEN).min(ADDR_SUFFIX_LEN);
-    if suffix_len == 0 {
-        return String::new();
-    }
-    addr[addr.len().saturating_sub(suffix_len)..].to_string()
-}
-
-fn arrow_svg() -> Markup {
-    html! {
-        svg class="io-arrow-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" aria-hidden="true" {
-            path d="M224.49,136.49l-72,72a12,12,0,0,1-17-17L187,140H40a12,12,0,0,1,0-24H187L135.51,64.48a12,12,0,0,1,17-17l72,72A12,12,0,0,1,224.49,136.49Z" fill="currentColor" {}
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 struct OpReturnDecoded {
@@ -58,6 +46,11 @@ struct OpReturnDecoded {
 #[derive(Clone, Debug)]
 struct ContractCallSummary {
     contract_id: SchemaAlkaneId,
+    factory_id: Option<SchemaAlkaneId>,
+    factory_template: Option<SchemaAlkaneId>,
+    factory_created: Option<SchemaAlkaneId>,
+    factory_created_meta: Option<AlkaneMetaDisplay>,
+    link_id: SchemaAlkaneId,
     contract_name: ResolvedName,
     icon_url: String,
     method_name: Option<String>,
@@ -91,6 +84,7 @@ type InspectionCache = HashMap<SchemaAlkaneId, Option<StoredInspectionResult>>;
 struct AlkaneKvMeta {
     name: Option<String>,
     symbol: Option<String>,
+    implementation: Option<Option<SchemaAlkaneId>>,
 }
 type AlkaneKvCache = HashMap<SchemaAlkaneId, AlkaneKvMeta>;
 #[derive(Clone, Debug)]
@@ -101,6 +95,11 @@ struct AlkaneMetaDisplay {
 }
 const KV_KEY_NAME: &[u8] = b"/name";
 const KV_KEY_SYMBOL: &[u8] = b"/symbol";
+const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
+const UPGRADEABLE_METHODS: [(&str, u128); 3] =
+    [("initialize", 32767), ("upgrade", 32766), ("forward", 36863)];
+const UPGRADEABLE_NAME: &str = "Upgradeable";
+const UPGRADEABLE_NAME_ALT: &str = "Upgradable";
 
 fn decode_op_return_payload(spk: &ScriptBuf) -> Option<OpReturnDecoded> {
     let mut instructions = spk.instructions();
@@ -224,6 +223,24 @@ fn trace_opcode(inputs: &[String]) -> Option<u128> {
     inputs.first().and_then(|s| parse_u128_from_str(s))
 }
 
+fn parse_factory_clone(
+    inputs: Option<&Vec<String>>,
+    created: Option<SchemaAlkaneId>,
+) -> Option<(SchemaAlkaneId, Option<SchemaAlkaneId>)> {
+    let inputs = inputs?;
+    if inputs.len() < 2 {
+        return None;
+    }
+    let header = parse_u128_from_str(&inputs[0])?;
+    let n = parse_u128_from_str(&inputs[1])?;
+    let template = match header {
+        5 => SchemaAlkaneId { block: 2, tx: n as u64 },
+        6 => SchemaAlkaneId { block: 3, tx: n as u64 },
+        _ => return None,
+    };
+    Some((template, created))
+}
+
 fn decode_trace_response(data_hex: &str) -> Option<String> {
     let hex_str = data_hex.strip_prefix("0x").unwrap_or(data_hex);
     if hex_str.is_empty() {
@@ -257,28 +274,89 @@ fn kv_row_key(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
     v
 }
 
-fn kv_utf8_value(alk: &SchemaAlkaneId, skey: &[u8], mdb: &Mdb) -> Option<String> {
+fn decode_kv_utf8(raw: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(raw).ok()?.trim_matches('\0').to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn kv_value_raw(alk: &SchemaAlkaneId, skey: &[u8], mdb: &Mdb) -> Option<Vec<u8>> {
     let key = kv_row_key(alk, skey);
     let raw = mdb.get(&key).ok().flatten()?;
-    let value = if raw.len() >= 32 { &raw[32..] } else { raw.as_slice() };
-    let s = std::str::from_utf8(value).ok()?.trim_matches('\0').to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
+    if raw.len() >= 32 { Some(raw[32..].to_vec()) } else { Some(raw) }
+}
+
+fn kv_utf8_value(alk: &SchemaAlkaneId, skey: &[u8], mdb: &Mdb) -> Option<String> {
+    let value = kv_value_raw(alk, skey, mdb)?;
+    decode_kv_utf8(&value)
+}
+
+fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
+    if raw.len() < 32 {
+        return None;
     }
+    let block_bytes: [u8; 16] = raw[0..16].try_into().ok()?;
+    let tx_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
+    let block = u128::from_le_bytes(block_bytes);
+    let tx = u128::from_le_bytes(tx_bytes);
+    if block > u32::MAX as u128 || tx > u64::MAX as u128 {
+        return None;
+    }
+    Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
+}
+
+fn kv_implementation_value(
+    alk: &SchemaAlkaneId,
+    cache: &mut AlkaneKvCache,
+    mdb: &Mdb,
+) -> Option<SchemaAlkaneId> {
+    if let Some(meta) = cache.get(alk) {
+        if let Some(stored) = &meta.implementation {
+            return *stored;
+        }
+    }
+    let mut meta = cache.get(alk).cloned().unwrap_or_default();
+    let implementation = kv_value_raw(alk, KV_KEY_IMPLEMENTATION, mdb)
+        .and_then(|raw| decode_kv_implementation(&raw));
+    meta.implementation = Some(implementation);
+    cache.insert(*alk, meta.clone());
+    implementation
 }
 
 fn kv_meta_for_alkane(id: &SchemaAlkaneId, cache: &mut AlkaneKvCache, mdb: &Mdb) -> AlkaneKvMeta {
     if let Some(meta) = cache.get(id) {
-        return meta.clone();
+        if meta.name.is_some() && meta.symbol.is_some() {
+            return meta.clone();
+        }
     }
-    let meta = AlkaneKvMeta {
-        name: kv_utf8_value(id, KV_KEY_NAME, mdb),
-        symbol: kv_utf8_value(id, KV_KEY_SYMBOL, mdb),
-    };
+    let mut meta = cache.get(id).cloned().unwrap_or_default();
+    if meta.name.is_none() {
+        meta.name = kv_utf8_value(id, KV_KEY_NAME, mdb);
+    }
+    if meta.symbol.is_none() {
+        meta.symbol = kv_utf8_value(id, KV_KEY_SYMBOL, mdb);
+    }
     cache.insert(*id, meta.clone());
     meta
+}
+
+fn seed_kv_cache_from_traces(traces: Option<&[EspoTrace]>, cache: &mut AlkaneKvCache) {
+    let Some(traces) = traces else { return };
+    for trace in traces {
+        for (alk, kvs) in &trace.storage_changes {
+            let entry = cache.entry(*alk).or_default();
+            for (skey, (_txid, value)) in kvs {
+                if entry.name.is_none() && skey.as_slice() == KV_KEY_NAME {
+                    entry.name = decode_kv_utf8(value);
+                }
+                if entry.symbol.is_none() && skey.as_slice() == KV_KEY_SYMBOL {
+                    entry.symbol = decode_kv_utf8(value);
+                }
+                if entry.implementation.is_none() && skey.as_slice() == KV_KEY_IMPLEMENTATION {
+                    entry.implementation = Some(decode_kv_implementation(value));
+                }
+            }
+        }
+    }
 }
 
 fn lookup_inspection<'a>(
@@ -293,11 +371,67 @@ fn lookup_inspection<'a>(
     cache.get(id).and_then(|o| o.as_ref())
 }
 
+fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
+    let Some(meta) = inspection.metadata.as_ref() else { return false };
+    let name_matches = meta.name.eq_ignore_ascii_case(UPGRADEABLE_NAME)
+        || meta.name.eq_ignore_ascii_case(UPGRADEABLE_NAME_ALT);
+    if !name_matches {
+        return false;
+    }
+    UPGRADEABLE_METHODS
+        .iter()
+        .all(|(name, opcode)| {
+            meta.methods
+                .iter()
+                .any(|m| m.name.eq_ignore_ascii_case(name) && m.opcode == *opcode)
+        })
+}
+
+fn contract_name_override(id: &SchemaAlkaneId) -> Option<String> {
+    let key = format!("{}:{}", id.block, id.tx);
+    for (id_s, name) in alkane_contract_name_overrides() {
+        if *id_s == key {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+fn upgradeable_proxy_target(
+    id: &SchemaAlkaneId,
+    inspection: Option<&StoredInspectionResult>,
+    trace: &EspoTrace,
+    kv_cache: &mut AlkaneKvCache,
+    mdb: &Mdb,
+) -> Option<SchemaAlkaneId> {
+    // Prefer storage changes in the trace; fall back to the DB.
+    if let Some(kvs) = trace.storage_changes.get(id) {
+        for (skey, (_txid, value)) in kvs {
+            if skey.as_slice() == KV_KEY_IMPLEMENTATION {
+                if let Some(decoded) = decode_kv_implementation(value) {
+                    if inspection.map_or(false, is_upgradeable_proxy) {
+                        return Some(decoded);
+                    }
+                }
+            }
+        }
+    }
+    let decoded = kv_implementation_value(id, kv_cache, mdb);
+    if decoded.is_some() && inspection.map_or(false, is_upgradeable_proxy) {
+        return decoded;
+    }
+    None
+}
+
 fn contract_display_name(
     id: &SchemaAlkaneId,
     inspection: Option<&StoredInspectionResult>,
     kv_meta: &AlkaneKvMeta,
 ) -> ResolvedName {
+    let key = format!("{}:{}", id.block, id.tx);
+    if let Some(name) = contract_name_override(id) {
+        return ResolvedName { value: name, known: true };
+    }
     if let Some(meta) = inspection.and_then(|i| i.metadata.as_ref()) {
         if !meta.name.trim().is_empty() {
             return ResolvedName { value: meta.name.clone(), known: true };
@@ -308,8 +442,8 @@ fn contract_display_name(
             return ResolvedName { value: name.clone(), known: true };
         }
     }
-    let key = format!("{}:{}", id.block, id.tx);
-    for (id_s, name, _sym) in ALKANE_NAME_OVERRIDES {
+
+    for (id_s, name, _sym) in alkane_name_overrides() {
         if *id_s == key {
             return ResolvedName { value: name.to_string(), known: true };
         }
@@ -327,7 +461,7 @@ fn method_display_name(opcode: u128, inspection: Option<&StoredInspectionResult>
 
 fn alkane_icon_url(id: &SchemaAlkaneId) -> String {
     let key = format!("{}:{}", id.block, id.tx);
-    for (id_s, url) in ALKANE_ICON_OVERRIDES {
+    for (id_s, url) in alkane_icon_overrides() {
         if *id_s == key {
             return url.to_string();
         }
@@ -346,6 +480,8 @@ fn summarize_contract_call(
     mdb: &Mdb,
 ) -> Option<ContractCallSummary> {
     let mut contract_id: Option<SchemaAlkaneId> = None;
+    let mut first_invoke_inputs: Option<Vec<String>> = None;
+    let mut created_alkane: Option<SchemaAlkaneId> = None;
     let mut opcode: Option<u128> = None;
     let mut call_type: Option<String> = None;
     let mut response_text: Option<String> = None;
@@ -356,6 +492,9 @@ fn summarize_contract_call(
             EspoSandshrewLikeTraceEvent::Invoke(data) => {
                 if contract_id.is_none() {
                     contract_id = parse_short_id_to_schema(&data.context.myself);
+                }
+                if first_invoke_inputs.is_none() {
+                    first_invoke_inputs = Some(data.context.inputs.clone());
                 }
                 if opcode.is_none() {
                     opcode = trace_opcode(&data.context.inputs);
@@ -372,20 +511,87 @@ fn summarize_contract_call(
                     response_text = Some(text);
                 }
             }
-            EspoSandshrewLikeTraceEvent::Create(_) => {}
+            EspoSandshrewLikeTraceEvent::Create(c) => {
+                if created_alkane.is_none() {
+                    created_alkane = parse_short_id_to_schema(&c.new_alkane);
+                }
+            }
         }
     }
 
     let contract_id = contract_id?;
-    let inspection = lookup_inspection(&contract_id, cache, mdb);
     let kv_meta = kv_meta_for_alkane(&contract_id, kv_cache, mdb);
-    let contract_name = contract_display_name(&contract_id, inspection, &kv_meta);
-    let method_name = opcode.and_then(|op| method_display_name(op, inspection));
+    let contract_inspection = lookup_inspection(&contract_id, cache, mdb).cloned();
+    let proxy_template = upgradeable_proxy_target(
+        &contract_id,
+        contract_inspection.as_ref(),
+        trace,
+        kv_cache,
+        mdb,
+    );
+    let (active_id, active_inspection, using_proxy_template) = match proxy_template {
+        Some(target) => {
+            let insp = lookup_inspection(&target, cache, mdb).cloned();
+            (target, insp, true)
+        }
+        None => (contract_id, contract_inspection.clone(), false),
+    };
+    let active_kv_meta = if using_proxy_template {
+        kv_meta_for_alkane(&active_id, kv_cache, mdb)
+    } else {
+        kv_meta.clone()
+    };
+    let (inspection_factory_id, contract_name, mut method_name, mut icon_id) = {
+        let inspection = active_inspection.as_ref();
+        let name = contract_display_name(&active_id, inspection, &active_kv_meta);
+        let mname = opcode.and_then(|op| method_display_name(op, inspection));
+        let icon = inspection.and_then(|i| i.factory_alkane).unwrap_or(active_id);
+        let factory = inspection.and_then(|i| i.factory_alkane);
+        (factory, name, mname, icon)
+    };
+    if using_proxy_template {
+        icon_id = contract_id;
+    }
+    let mut factory_pair = parse_factory_clone(first_invoke_inputs.as_ref(), created_alkane);
+    if factory_pair.is_none() {
+        if let (Some(factory_id), Some(created)) = (inspection_factory_id, created_alkane)
+        {
+            if factory_id != contract_id || created != contract_id {
+                factory_pair = Some((factory_id, Some(created)));
+            }
+        }
+    }
+    let mut link_id = active_id;
+    let mut effective_name = contract_name;
+    let mut created_meta: Option<AlkaneMetaDisplay> = None;
+    if let Some((template_id, _)) = factory_pair {
+        // Show the factory/template metadata for factory clones
+        let template_inspection = lookup_inspection(&template_id, cache, mdb);
+        let template_kv = kv_meta_for_alkane(&template_id, kv_cache, mdb);
+        effective_name = contract_display_name(&template_id, template_inspection, &template_kv);
+        let template_method = opcode.and_then(|op| method_display_name(op, template_inspection));
+        method_name = template_method.or(method_name);
+        icon_id = template_id;
+        link_id = template_id;
+    }
+    if let Some(created) = factory_pair.as_ref().and_then(|(_, c)| *c) {
+        created_meta = Some(alkane_meta(&created, kv_cache, mdb));
+    }
+    if using_proxy_template {
+        if let Some(name) = contract_name_override(&contract_id) {
+            effective_name = ResolvedName { value: name, known: true };
+        }
+    }
 
     Some(ContractCallSummary {
         contract_id,
-        contract_name,
-        icon_url: contract_icon_url(&contract_id),
+        factory_id: inspection_factory_id,
+        factory_template: factory_pair.as_ref().map(|(t, _)| *t),
+        factory_created: factory_pair.as_ref().and_then(|(_, c)| *c),
+        factory_created_meta: created_meta,
+        link_id,
+        contract_name: effective_name,
+        icon_url: contract_icon_url(&icon_id),
         method_name,
         opcode,
         call_type,
@@ -395,16 +601,21 @@ fn summarize_contract_call(
 }
 
 fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
-    let alkane_path = format!("/alkane/{}:{}", summary.contract_id.block, summary.contract_id.tx);
+    let is_factory_clone = summary.factory_template.is_some();
+    let link_id = summary.link_id;
+    let alkane_path = format!("/alkane/{}:{}", link_id.block, link_id.tx);
     let status_class = if summary.success { "success" } else { "failure" };
     let status_text = match (summary.response_text.clone(), summary.success) {
-        (Some(t), true) => t,
+        (Some(_), true) => "Call successful".to_string(),
         (Some(t), false) => format!("Reverted: {t}"),
         (None, true) => "Call successful".to_string(),
         (None, false) => "Call reverted".to_string(),
     };
-    let method_label =
+    let mut method_label =
         summary.method_name.clone().unwrap_or_else(|| "contract call".to_string());
+    if is_factory_clone {
+        method_label = "factory clone".to_string();
+    }
     let fallback_letter = summary.contract_name.fallback_letter();
 
     html! {
@@ -420,11 +631,43 @@ fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
                 }
                 span class="io-arrow" { (arrow_svg()) }
             }
-            @if summary.method_name.is_some() || summary.opcode.is_some() {
+            @if summary.method_name.is_some() || (summary.opcode.is_some() && !is_factory_clone) || is_factory_clone {
                 div class="trace-method-pill" {
+                    @if is_factory_clone {
+                        span class="trace-method-icon" aria-hidden="true" { (icon_magic_wand()) }
+                    }
                     span class="trace-method-name" { (method_label) }
                     @if let Some(op) = summary.opcode {
+                        @if !is_factory_clone {
                         span class="trace-opcode" { (format!("opcode {}", op)) }
+                        }
+                    }
+                }
+                @if is_factory_clone && (summary.method_name.is_some() && summary.opcode.is_some()) {
+                    div class="trace-method-pill trace-method-pill-secondary" {
+                        @if let Some(name) = summary.method_name.as_ref() {
+                            span class="trace-method-name" { (name) }
+                        }
+                        @if let Some(op) = summary.opcode {
+                            span class="trace-opcode" { (format!("opcode {}", op)) }
+                        }
+                    }
+                }
+            }
+            @if let Some(created) = summary.factory_created {
+                @let created_path = format!("/alkane/{}:{}", created.block, created.tx);
+                @let created_meta = summary.factory_created_meta.as_ref();
+                @let created_icon = created_meta.map(|m| m.icon_url.clone()).unwrap_or_else(|| contract_icon_url(&created));
+                @let created_name = created_meta.map(|m| m.name.value.clone()).unwrap_or_else(|| format!("{}:{}", created.block, created.tx));
+                @let created_letter = created_meta.map(|m| m.name.fallback_letter()).unwrap_or('?');
+                div class="trace-factory-clone" {
+                    span class="factory-clone-arrow muted" { (icon_arrow_bend_down_right()) }
+                    a class="trace-contract-name link" href=(created_path.clone()) {
+                        div class="trace-contract-icon" aria-hidden="true" {
+                            img class="trace-contract-img" src=(created_icon.clone()) alt=(created_name.clone()) loading="lazy" onerror="this.remove()" {}
+                            span class="trace-icon-letter" { (created_letter) }
+                        }
+                        span class="trace-contract-name" { (created_name) }
                     }
                 }
             }
@@ -446,8 +689,10 @@ pub fn render_tx(
     outpoint_fn: &dyn Fn(&Txid, u32) -> OutpointLookup,
     outspends_fn: &dyn Fn(&Txid) -> Vec<Option<Txid>>,
     essentials_mdb: &Mdb,
+    show_tx_title: bool,
 ) -> Markup {
     let mut alkane_kv_cache: AlkaneKvCache = HashMap::new();
+    seed_kv_cache_from_traces(traces, &mut alkane_kv_cache);
     let vins_markup = render_vins(tx, network, prev_map, outpoint_fn, &mut alkane_kv_cache, essentials_mdb);
     let outspends = outspends_fn(txid);
     let protostone_json = protostone_json(tx);
@@ -467,10 +712,18 @@ pub fn render_tx(
 
     html! {
         div class="card tx-card" {
-            span class="mono tx-title" { a class="link" href=(format!("/tx/{}", txid)) { (txid) } }
+            @if show_tx_title {
+                span class="mono tx-title" { a class="link" href=(format!("/tx/{}", txid)) { (txid) } }
+            }
             div class="tx-io-grid" {
-                div class="io-col" { (vins_markup) }
-                div class="io-col" { (vouts_markup) }
+                div class="io-col" {
+                    div class="io-col-title" { "Inputs" }
+                    (vins_markup)
+                }
+                div class="io-col" {
+                    div class="io-col-title" { "Outputs" }
+                    (vouts_markup)
+                }
             }
         }
     }
@@ -516,19 +769,10 @@ fn render_vins(
                                                 @match addr_opt {
                                                     Some(a) => {
                                                         @let addr = a.to_string();
+                                                        @let (addr_prefix, addr_suffix) = addr_prefix_suffix(&addr);
                                                         a class="link mono addr-inline" href=(format!("/address/{}", addr)) {
-                                                            @let truncate_addr = should_truncate_addr(&addr);
-                                                            @if truncate_addr {
-                                                                @let addr_suffix = addr_suffix(&addr);
-                                                                span class="addr-prefix-wrap" {
-                                                                    span class="addr-prefix" { (addr) }
-                                                                }
-                                                                @if !addr_suffix.is_empty() {
-                                                                    span class="addr-suffix" { (addr_suffix) }
-                                                                }
-                                                            } @else {
-                                                                span class="addr-full" { (addr) }
-                                                            }
+                                                            span class="addr-prefix" { (addr_prefix) }
+                                                            span class="addr-suffix" { (addr_suffix) }
                                                         }
                                                     }
                                                     None => span class="mono muted" { "unknown" },
@@ -579,6 +823,7 @@ fn render_vouts(
                     @let OutpointLookup { balances, spent_by: db_spent } = outpoint_fn(txid, vout as u32);
                     @let spent_by = outspends.get(vout).cloned().flatten().or(db_spent);
                     @let opret = decode_op_return_payload(&o.script_pubkey);
+                    @let is_opret = opret.is_some();
                     div class="io-row" {
                         div class="io-main" {
                             @match opret {
@@ -610,19 +855,10 @@ fn render_vouts(
                                             @match addr_opt {
                                                 Some(a) => {
                                                     @let addr = a.to_string();
+                                                    @let (addr_prefix, addr_suffix) = addr_prefix_suffix(&addr);
                                                     a class="link mono addr-inline" href=(format!("/address/{}", addr)) {
-                                                        @let truncate_addr = should_truncate_addr(&addr);
-                                                        @if truncate_addr {
-                                                            @let addr_suffix = addr_suffix(&addr);
-                                                            span class="addr-prefix-wrap" {
-                                                                span class="addr-prefix" { (addr) }
-                                                            }
-                                                            @if !addr_suffix.is_empty() {
-                                                                span class="addr-suffix" { (addr_suffix) }
-                                                            }
-                                                        } @else {
-                                                            span class="addr-full" { (addr) }
-                                                        }
+                                                        span class="addr-prefix" { (addr_prefix) }
+                                                        span class="addr-suffix" { (addr_suffix) }
                                                     }
                                                 }
                                                 None => span class="mono muted" { "non-standard" },
@@ -635,8 +871,8 @@ fn render_vouts(
                             (balances_list(&balances, alkane_kv_cache, essentials_mdb))
                         }
                         @match spent_by {
-                            Some(spender) => a class="io-arrow io-arrow-link out spent" href=(format!("/tx/{}", spender)) title="Spent by transaction" { (arrow_svg()) },
-                            None => span class="io-arrow out" title="Unspent output" { (arrow_svg()) },
+                            Some(spender) => a class=(if is_opret { "io-arrow io-arrow-link out spent opret-arrow" } else { "io-arrow io-arrow-link out spent" }) href=(format!("/tx/{}", spender)) title="Spent by transaction" { (arrow_svg()) },
+                            None => span class=(if is_opret { "io-arrow out opret-arrow" } else { "io-arrow out" }) title="Unspent output" { (arrow_svg()) },
                         }
                     }
                 }
@@ -671,12 +907,14 @@ fn render_op_return(
                 summary class="opret-summary" {
                     span class="opret-left" {
                         span class="opret-caret" aria-hidden="true" { (icon_caret_right()) }
-                        span class="opret-title mono" { "OP_RETURN" }
-                        @if is_protostone {
-                            span class="opret-meta" {
-                                "("
-                                span class="opret-diamond" aria-hidden="true" {}
-                                " Protostone message)"
+                        span class="opret-title mono" {
+                            "OP_RETURN"
+                            @if is_protostone {
+                                " ( "
+                                span class="opret-meta" {
+                                    span class="opret-diamond" aria-hidden="true" {}
+                                    " Protostone message)"
+                                }
                             }
                         }
                     }
@@ -762,7 +1000,7 @@ fn alkane_meta(
         }
     }
     let key = format!("{}:{}", id.block, id.tx);
-    for (id_s, name, sym) in ALKANE_NAME_OVERRIDES {
+    for (id_s, name, sym) in alkane_name_overrides() {
         if *id_s == key {
             let icon_url = alkane_icon_url(id);
             return AlkaneMetaDisplay {

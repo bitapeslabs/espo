@@ -36,12 +36,14 @@ pub struct StoredInspectionResult {
     pub bytecode_length: u64,
     pub metadata: Option<StoredInspectionMetadata>,
     pub metadata_error: Option<String>,
+    pub factory_alkane: Option<SchemaAlkaneId>,
 }
 
 impl StoredInspectionResult {
     pub fn from_inspection_result(
         alkane: &SchemaAlkaneId,
         result: &InspectionResult,
+        factory_alkane: SchemaAlkaneId,
     ) -> Result<Self> {
         let bytecode_length = u64::try_from(result.bytecode_length)
             .map_err(|_| anyhow!("bytecode length does not fit into u64"))?;
@@ -50,6 +52,7 @@ impl StoredInspectionResult {
             bytecode_length,
             metadata: result.metadata.as_ref().map(StoredInspectionMetadata::from),
             metadata_error: result.metadata_error.clone(),
+            factory_alkane: Some(factory_alkane),
         })
     }
 }
@@ -92,6 +95,7 @@ where
 pub fn inspect_wasm_metadata(
     alkane: &SchemaAlkaneId,
     wasm_bytes: &[u8],
+    factory_alkane: SchemaAlkaneId,
 ) -> Result<StoredInspectionResult> {
     let inspector = AlkaneInspector::new();
     let cfg = InspectionConfig {
@@ -106,7 +110,7 @@ pub fn inspect_wasm_metadata(
     let cli_id = CliAlkaneId { block: alkane.block as u64, tx: alkane.tx };
     let wasm_vec = wasm_bytes.to_vec();
     let res = block_on_result(inspector.inspect_alkane_with_bytes(&wasm_vec, &cli_id, &cfg))?;
-    StoredInspectionResult::from_inspection_result(alkane, &res)
+    StoredInspectionResult::from_inspection_result(alkane, &res, factory_alkane)
 }
 
 pub fn inspection_key(alkane: &SchemaAlkaneId) -> Vec<u8> {
@@ -191,11 +195,15 @@ fn metadata_to_json(meta: &StoredInspectionMetadata) -> Value {
 }
 
 pub fn inspection_to_json(record: &StoredInspectionResult) -> Value {
+    let factory_str = record
+        .factory_alkane
+        .map(|f| format!("{}:{}", f.block, f.tx));
     json!({
         "alkane": format!("{}:{}", record.alkane.block, record.alkane.tx),
         "bytecode_length": record.bytecode_length,
         "metadata": record.metadata.as_ref().map(metadata_to_json),
         "metadata_error": record.metadata_error,
+        "factory_alkane": factory_str,
     })
 }
 
@@ -220,6 +228,7 @@ mod tests {
                 }],
             }),
             metadata_error: None,
+            factory_alkane: Some(SchemaAlkaneId { block: 9, tx: 9 }),
         };
 
         let bytes = encode_inspection(&record).expect("encode");

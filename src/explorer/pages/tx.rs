@@ -124,10 +124,10 @@ pub async fn tx_page(
             div class="block-hero-inner" {
                 div class="row" {
                     h1 class="h1" { "Transaction" }
-                    span class="mono" { (txid.to_string()) }
+                    span class="mono tx-page-id" { (txid.to_string()) }
                 }
             }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb))
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, false))
         },
     )
 }

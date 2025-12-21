@@ -62,16 +62,20 @@ a:hover {
   gap: 14px;
 }
 .brand {
+  color: var(--text);
+  text-decoration: none !important;
   font-weight: 700;
   letter-spacing: 0.3px;
   display: inline-flex;
   align-items: center;
   gap: 10px;
+  font-size: 25px;
 }
+
 .brand-logo {
   display: block;
-  width: 20px;
-  height: 20px;
+  width: 30px;
+  height: 30px;
 }
 .navlink {
   color: var(--muted);
@@ -102,6 +106,15 @@ a:hover {
   justify-content: space-between;
   gap: 14px;
   flex-wrap: wrap;
+  min-width: 0;
+}
+.tx-page-id {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 .search {
   display: flex;
@@ -229,11 +242,23 @@ a:hover {
 .tx-title {
   margin-top: 0;
   margin-bottom: 20px;
+  font-weight: 500;
+  font-size: 15px;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tx-title a {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .tx-io-grid {
-  margin-top: 20px;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 @media (max-width: 800px) {
@@ -242,7 +267,25 @@ a:hover {
   }
 }
 .io-col {
-  border-radius: 8px;
+  min-width: 0;
+}
+.io-col-title {
+  display: none;
+  color: var(--muted2);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  margin: 0 0 6px;
+}
+@media (max-width: 800px) {
+  .tx-io-grid > .io-col + .io-col {
+    border-top: 1px solid var(--panel2);
+    padding-top: 12px;
+  }
+  .io-col-title {
+    display: block;
+  }
 }
 .tx-section-title {
   margin: 0 0 8px 0;
@@ -289,6 +332,10 @@ a:hover {
 .io-arrow.out {
   color: var(--success);
 }
+.io-arrow.out.opret-arrow,
+.io-arrow.out.opret-arrow.spent {
+  color: var(--muted);
+}
 .io-main {
   flex: 1;
   min-width: 0;
@@ -301,6 +348,7 @@ a:hover {
   width: 100%;
 }
 .io-addr {
+  font-weight: 500;
   line-height: 1.3;
   display: flex;
   flex: 1 1 auto;
@@ -310,31 +358,19 @@ a:hover {
   display: flex;
   align-items: baseline;
   max-width: 100%;
+  min-width: 0;
+  font-family: var(--sans);
+}
+.addr-prefix {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  font-family: var(--mono);
-}
-.addr-prefix-wrap {
-  display: flex;
-  flex: 0 1 31ch;
-  width: 31ch;
-  max-width: 31ch;
-  min-width: 0;
-}
-.addr-prefix {
-  display: block;
-  width: 100%;
-  overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-.addr-full {
   white-space: nowrap;
 }
 .addr-suffix {
   white-space: nowrap;
+  flex-shrink: 0;
   user-select: none;
 }
 .io-amount {
@@ -394,6 +430,9 @@ a:hover {
 }
 .opret-title {
   letter-spacing: 0.4px;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 .opret-meta {
   display: inline-flex;
@@ -401,6 +440,9 @@ a:hover {
   gap: 6px;
   color: var(--muted3);
   font-weight: 600;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 .opret-diamond {
   width: 10px;
@@ -541,7 +583,22 @@ a:hover {
   display: grid;
   gap: 2px;
 }
+.trace-method-icon{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.trace-factory-clone{
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
 .trace-contract-name {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
   font-weight: 600;
   color: var(--muted);
 }
@@ -569,6 +626,7 @@ a:hover {
     font-weight: 500;
     width: fit-content;
 }
+
 .trace-method-name {
   white-space: nowrap;
   word-break: break-word;

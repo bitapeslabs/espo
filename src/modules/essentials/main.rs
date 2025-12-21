@@ -193,7 +193,11 @@ impl EspoModule for Essentials {
         let metashrew = get_metashrew();
         for alk in created_alkanes {
             match metashrew.get_alkane_wasm_bytes(&alk) {
-                Ok(Some(wasm_bytes)) => match inspect_wasm_metadata(&alk, &wasm_bytes) {
+                Ok(Some((wasm_bytes, factory_id))) => match inspect_wasm_metadata(
+                    &alk,
+                    &wasm_bytes,
+                    factory_id,
+                ) {
                     Ok(record) => match encode_inspection(&record) {
                         Ok(encoded) => {
                             inspection_rows.insert(inspection_key(&alk), encoded);

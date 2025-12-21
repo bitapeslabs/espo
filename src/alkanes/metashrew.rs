@@ -116,7 +116,7 @@ impl MetashrewAdapter {
         tx: u128,
         seen: &mut HashSet<(u128, u128)>,
         hops: usize,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(Vec<u8>, SupportAlkaneId)>> {
         const MAX_HOPS: usize = 64;
         if hops > MAX_HOPS {
             return Err(anyhow!("alias chain too deep (possible cycle)"));
@@ -175,7 +175,9 @@ impl MetashrewAdapter {
                 }
 
                 match gz::decompress(payload.clone()) {
-                    Ok(bytes) => return Ok(Some(bytes)),
+                    Ok(bytes) => {
+                        return Ok(Some((bytes, SupportAlkaneId { block, tx })));
+                    }
                     Err(e) => {
                         last_err = Some(anyhow!(e));
                         continue;
@@ -195,12 +197,28 @@ impl MetashrewAdapter {
         &self,
         db: &rocksdb::DB,
         alkane: &SchemaAlkaneId,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
         let mut seen = HashSet::new();
-        self.load_wasm_inner(db, alkane.block as u128, alkane.tx as u128, &mut seen, 0)
+        let res = self.load_wasm_inner(db, alkane.block as u128, alkane.tx as u128, &mut seen, 0)?;
+        if let Some((bytes, sid)) = res {
+            let block: u32 = sid
+                .block
+                .try_into()
+                .map_err(|_| anyhow!("factory alkane block does not fit into u32"))?;
+            let tx: u64 = sid
+                .tx
+                .try_into()
+                .map_err(|_| anyhow!("factory alkane tx does not fit into u64"))?;
+            Ok(Some((bytes, SchemaAlkaneId { block, tx })))
+        } else {
+            Ok(None)
+        }
     }
 
-    pub fn get_alkane_wasm_bytes(&self, alkane: &SchemaAlkaneId) -> Result<Option<Vec<u8>>> {
+    pub fn get_alkane_wasm_bytes(
+        &self,
+        alkane: &SchemaAlkaneId,
+    ) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
         let db = get_metashrew_sdb();
         db.catch_up_now().context("metashrew catch_up before wasm fetch")?;
         self.get_alkane_wasm_bytes_with_db(db.as_db(), alkane)
