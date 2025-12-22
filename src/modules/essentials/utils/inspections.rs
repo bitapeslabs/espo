@@ -3,10 +3,10 @@ use crate::alkanes::trace::{
 };
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
-use anyhow::{Context, Result, anyhow};
 use alkanes_cli_common::alkanes::inspector::types::{AlkaneMetadata, AlkaneMethod};
 use alkanes_cli_common::alkanes::inspector::{AlkaneInspector, InspectionConfig, InspectionResult};
 use alkanes_cli_common::alkanes::types::AlkaneId as CliAlkaneId;
+use anyhow::{Context, Result, anyhow};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -128,7 +128,10 @@ pub fn decode_inspection(bytes: &[u8]) -> Result<StoredInspectionResult> {
     Ok(StoredInspectionResult::try_from_slice(bytes)?)
 }
 
-pub fn load_inspection(mdb: &Mdb, alkane: &SchemaAlkaneId) -> Result<Option<StoredInspectionResult>> {
+pub fn load_inspection(
+    mdb: &Mdb,
+    alkane: &SchemaAlkaneId,
+) -> Result<Option<StoredInspectionResult>> {
     let key = inspection_key(alkane);
     if let Some(bytes) = mdb.get(&key)? {
         let record = decode_inspection(&bytes)?;
@@ -195,9 +198,7 @@ fn metadata_to_json(meta: &StoredInspectionMetadata) -> Value {
 }
 
 pub fn inspection_to_json(record: &StoredInspectionResult) -> Value {
-    let factory_str = record
-        .factory_alkane
-        .map(|f| format!("{}:{}", f.block, f.tx));
+    let factory_str = record.factory_alkane.map(|f| format!("{}:{}", f.block, f.tx));
     json!({
         "alkane": format!("{}:{}", record.alkane.block, record.alkane.tx),
         "bytecode_length": record.bytecode_length,
@@ -238,10 +239,8 @@ mod tests {
 
     #[test]
     fn parse_short_ids() {
-        let short = EspoSandshrewLikeTraceShortId {
-            block: "0x2".to_string(),
-            tx: "16".to_string(),
-        };
+        let short =
+            EspoSandshrewLikeTraceShortId { block: "0x2".to_string(), tx: "16".to_string() };
         let parsed = parse_short_id(&short).expect("parsed");
         assert_eq!(parsed.block, 2);
         assert_eq!(parsed.tx, 16);

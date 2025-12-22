@@ -4,7 +4,7 @@ use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::consts::essentials_genesis_block;
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::utils::inspections::{
-    created_alkanes_from_block, encode_inspection, inspection_key, inspect_wasm_metadata,
+    created_alkanes_from_block, encode_inspection, inspect_wasm_metadata, inspection_key,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::SchemaAlkaneId;
@@ -193,29 +193,27 @@ impl EspoModule for Essentials {
         let metashrew = get_metashrew();
         for alk in created_alkanes {
             match metashrew.get_alkane_wasm_bytes(&alk) {
-                Ok(Some((wasm_bytes, factory_id))) => match inspect_wasm_metadata(
-                    &alk,
-                    &wasm_bytes,
-                    factory_id,
-                ) {
-                    Ok(record) => match encode_inspection(&record) {
-                        Ok(encoded) => {
-                            inspection_rows.insert(inspection_key(&alk), encoded);
-                        }
+                Ok(Some((wasm_bytes, factory_id))) => {
+                    match inspect_wasm_metadata(&alk, &wasm_bytes, factory_id) {
+                        Ok(record) => match encode_inspection(&record) {
+                            Ok(encoded) => {
+                                inspection_rows.insert(inspection_key(&alk), encoded);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[ESSENTIALS] failed to encode inspection for {}:{}: {e}",
+                                    alk.block, alk.tx
+                                );
+                            }
+                        },
                         Err(e) => {
                             eprintln!(
-                                "[ESSENTIALS] failed to encode inspection for {}:{}: {e}",
+                                "[ESSENTIALS] inspection failed for {}:{}: {e}",
                                 alk.block, alk.tx
                             );
                         }
-                    },
-                    Err(e) => {
-                        eprintln!(
-                            "[ESSENTIALS] inspection failed for {}:{}: {e}",
-                            alk.block, alk.tx
-                        );
                     }
-                },
+                }
                 Ok(None) => {
                     eprintln!(
                         "[ESSENTIALS] no wasm payload found for alkane {}:{}; skipping inspection",

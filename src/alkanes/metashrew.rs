@@ -5,10 +5,10 @@ use alkanes_support::gz;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result, anyhow};
+use bitcoin::Txid;
+use bitcoin::hashes::Hash;
 use prost::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
-use bitcoin::hashes::Hash;
-use bitcoin::Txid;
 use std::collections::HashSet;
 
 fn try_decode_prost(raw: &[u8]) -> Option<AlkanesTrace> {
@@ -199,7 +199,8 @@ impl MetashrewAdapter {
         alkane: &SchemaAlkaneId,
     ) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
         let mut seen = HashSet::new();
-        let res = self.load_wasm_inner(db, alkane.block as u128, alkane.tx as u128, &mut seen, 0)?;
+        let res =
+            self.load_wasm_inner(db, alkane.block as u128, alkane.tx as u128, &mut seen, 0)?;
         if let Some((bytes, sid)) = res {
             let block: u32 = sid
                 .block

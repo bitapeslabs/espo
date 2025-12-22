@@ -13,7 +13,9 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
     prettyify_protobuf_trace_json, traces_for_block_as_prost,
 };
-use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew};
+use crate::config::{
+    get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew,
+};
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::header::{
     HeaderCta, HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
@@ -62,7 +64,10 @@ fn mempool_tx_url(network: Network, txid: &Txid) -> Option<String> {
     Some(format!("{base}/tx/{txid}"))
 }
 
-fn fee_and_rate(tx: &Transaction, prev_map: &HashMap<Txid, Transaction>) -> (Option<u64>, Option<f64>) {
+fn fee_and_rate(
+    tx: &Transaction,
+    prev_map: &HashMap<Txid, Transaction>,
+) -> (Option<u64>, Option<f64>) {
     let mut input_total = Some(0u64);
     for vin in &tx.input {
         if vin.previous_output.is_null() {
@@ -80,9 +85,13 @@ fn fee_and_rate(tx: &Transaction, prev_map: &HashMap<Txid, Transaction>) -> (Opt
         input_total = input_total.and_then(|acc| acc.checked_add(prev_out.value.to_sat()));
     }
 
-    let Some(inputs) = input_total else { return (None, None); };
+    let Some(inputs) = input_total else {
+        return (None, None);
+    };
     let outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-    let Some(fee) = inputs.checked_sub(outputs) else { return (None, None); };
+    let Some(fee) = inputs.checked_sub(outputs) else {
+        return (None, None);
+    };
     let vbytes = tx.vsize() as u64;
     let fee_rate = if vbytes > 0 { Some(fee as f64 / vbytes as f64) } else { None };
     (Some(fee), fee_rate)
@@ -179,23 +188,23 @@ pub async fn tx_page(
     let (fee_sat, fee_rate) = fee_and_rate(&tx, &prev_map);
     let mempool_url = mempool_tx_url(state.network, &txid);
 
-    let traces_for_tx: Option<Vec<EspoTrace>> = tx_height.and_then(|h| match fetch_traces_for_tx(h, &txid, &tx) {
-        Ok(v) if !v.is_empty() => Some(v),
-        Ok(_) => None,
-        Err(e) => {
-            eprintln!("[tx_page] failed to fetch traces for {txid}: {e}");
-            None
-        }
-    }).or_else(|| {
-        match fetch_traces_for_tx_noheight(&txid, &tx) {
+    let traces_for_tx: Option<Vec<EspoTrace>> = tx_height
+        .and_then(|h| match fetch_traces_for_tx(h, &txid, &tx) {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("[tx_page] failed to fetch traces for {txid}: {e}");
+                None
+            }
+        })
+        .or_else(|| match fetch_traces_for_tx_noheight(&txid, &tx) {
             Ok(v) if !v.is_empty() => Some(v),
             Ok(_) => None,
             Err(e) => {
                 eprintln!("[tx_page] failed to fetch traces (noheight) for {txid}: {e}");
                 None
             }
-        }
-    });
+        });
     let traces_ref: Option<&[EspoTrace]> = traces_for_tx.as_ref().map(|v| v.as_slice());
 
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
@@ -233,7 +242,8 @@ pub async fn tx_page(
         },
     });
 
-    let pill = confirmations.map(|c| (format!("{} confirmations", format_with_commas(c)), HeaderPillTone::Success))
+    let pill = confirmations
+        .map(|c| (format!("{} confirmations", format_with_commas(c)), HeaderPillTone::Success))
         .or_else(|| Some(("Unconfirmed".to_string(), HeaderPillTone::Warning)));
     let cta: Option<HeaderCta> = None;
     let header_markup = header(HeaderProps {
@@ -260,6 +270,7 @@ pub async fn tx_page(
                     }
                 }
             }
+            h2 class="h2" { "Inputs & Outputs" }
             (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, false))
             (header_scripts())
         },
@@ -287,21 +298,17 @@ fn fetch_traces_for_tx(
 
         let vout = u32::from_le_bytes(vout_le.try_into()?);
         let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
-        let events: Vec<EspoSandshrewLikeTraceEvent> =
-            serde_json::from_str(&events_json_str)?;
+        let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_str(&events_json_str)?;
 
-        let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
+        let sandshrew_trace =
+            EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
         let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)?;
 
         out.push(EspoTrace {
             sandshrew_trace,
             protobuf_trace: partial.protobuf_trace,
             storage_changes,
-            outpoint: crate::schemas::EspoOutpoint {
-                txid: txid_be,
-                vout,
-                tx_spent: None,
-            },
+            outpoint: crate::schemas::EspoOutpoint { txid: txid_be, vout, tx_spent: None },
         });
     }
 
@@ -325,10 +332,10 @@ fn fetch_traces_for_tx_noheight(txid: &Txid, tx: &Transaction) -> anyhow::Result
 
         let vout = u32::from_le_bytes(vout_le.try_into()?);
         let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
-        let events: Vec<EspoSandshrewLikeTraceEvent> =
-            serde_json::from_str(&events_json_str)?;
+        let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_str(&events_json_str)?;
 
-        let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
+        let sandshrew_trace =
+            EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
         let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)?;
 
         out.push(EspoTrace {

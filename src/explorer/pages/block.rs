@@ -74,7 +74,11 @@ pub async fn block_page(
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let nav_tip = espo_tip.min(tip);
     let espo_indexed = height <= espo_tip;
-    let traces_only = matches!(q.traces.as_deref(), Some("1" | "true" | "on" | "yes"));
+    let traces_only = q
+        .traces
+        .as_deref()
+        .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
+        .unwrap_or(true);
 
     let block_hash = match rpc.get_block_hash(height) {
         Ok(h) => h,
@@ -108,13 +112,6 @@ pub async fn block_page(
         None
     };
 
-    let outpoint_fn = |txid: &Txid, vout: u32| -> OutpointLookup {
-        get_outpoint_balances_with_spent(&state.essentials_mdb, txid, vout).unwrap_or_default()
-    };
-    let outspends_fn = |txid: &Txid| -> Vec<Option<Txid>> {
-        electrum_like.transaction_get_outspends(txid).unwrap_or_default()
-    };
-
     let mempool_url = mempool_block_url(network, &block_hash);
 
     let mut tx_total = 0usize;
@@ -124,6 +121,7 @@ pub async fn block_page(
     let mut display_start = 0usize;
     let mut display_end = 0usize;
     let mut last_page = 1usize;
+    let traces_param = if traces_only { "1" } else { "0" };
     if let Some(espo_block) = espo_block.clone() {
         if traces_only {
             let mut txs = espo_block.transactions;
@@ -154,6 +152,23 @@ pub async fn block_page(
         }
     }
 
+    let outpoint_fn = |txid: &Txid, vout: u32| -> OutpointLookup {
+        get_outpoint_balances_with_spent(&state.essentials_mdb, txid, vout).unwrap_or_default()
+    };
+    let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
+        let mut dedup: Vec<Txid> = tx_items
+            .iter()
+            .map(|t| t.transaction.compute_txid())
+            .collect();
+        dedup.sort();
+        dedup.dedup();
+        let fetched = electrum_like.batch_transaction_get_outspends(&dedup).unwrap_or_default();
+        dedup.into_iter().zip(fetched.into_iter()).collect()
+    };
+    let outspends_fn = move |txid: &Txid| -> Vec<Option<Txid>> {
+        outspends_map.get(txid).cloned().unwrap_or_default()
+    };
+
     let mut prev_map: HashMap<Txid, Transaction> = HashMap::new();
     if !tx_items.is_empty() {
         let mut prev_txids: Vec<Txid> = Vec::new();
@@ -180,8 +195,10 @@ pub async fn block_page(
         }
     }
 
-    let block_time: Option<u64> =
-        hdr.as_ref().map(|h| h.time as u64).or_else(|| block_stats.as_ref().map(|s| s.time));
+    let block_time: Option<u64> = hdr
+        .as_ref()
+        .map(|h| h.time as u64)
+        .or_else(|| block_stats.as_ref().map(|s| s.time));
     let confirmations = hdr
         .as_ref()
         .and_then(|h| (h.confirmations >= 0).then_some(h.confirmations as u64))
@@ -280,15 +297,14 @@ pub async fn block_page(
                             input type="hidden" name="tab" value="txs";
                             input type="hidden" name="limit" value=(limit);
                             input type="hidden" name="page" value="1";
+                            input type="hidden" name="traces" value=(traces_param);
                             label class="switch" {
                                 span class="switch-label" { "Only Alkanes txs" }
                                 input
                                     class="switch-input"
                                     type="checkbox"
-                                    name="traces"
-                                    value="1"
                                     checked[traces_only]
-                                    onchange="this.form.submit()";
+                                    onchange="this.form.traces.value = this.checked ? '1' : '0'; this.form.submit();";
                                 span class="switch-slider" {}
                             }
                         }
@@ -312,14 +328,14 @@ pub async fn block_page(
                 @if espo_indexed {
                     div class="pager" {
                         @if tx_has_prev {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page=1&limit={limit}{}", if traces_only { "&traces=1" } else { "" })) aria-label="First page" {
+                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page=1&limit={limit}&traces={traces_param}")) aria-label="First page" {
                                 (icon_skip_left())
                             }
                         } @else {
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
                         }
                         @if tx_has_prev {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}{}", page - 1, if traces_only { "&traces=1" } else { "" })) aria-label="Previous page" {
+                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", page - 1)) aria-label="Previous page" {
                                 (icon_left())
                             }
                         } @else {
@@ -335,14 +351,14 @@ pub async fn block_page(
                             (tx_total)
                         }
                         @if tx_has_next {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}{}", page + 1, if traces_only { "&traces=1" } else { "" })) aria-label="Next page" {
+                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", page + 1)) aria-label="Next page" {
                                 (icon_right())
                             }
                         } @else {
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
                         }
                         @if tx_has_next {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}{}", last_page, if traces_only { "&traces=1" } else { "" })) aria-label="Last page" {
+                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", last_page)) aria-label="Last page" {
                                 (icon_skip_right())
                             }
                         } @else {

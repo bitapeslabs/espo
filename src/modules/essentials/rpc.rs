@@ -244,7 +244,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             Err(e) => {
                                 log_rpc(
                                     "get_inspection",
-                                    &format!("load_inspection failed for {}:{}: {e}", alk.block, alk.tx),
+                                    &format!(
+                                        "load_inspection failed for {}:{}: {e}",
+                                        alk.block, alk.tx
+                                    ),
                                 );
                                 json!({"ok": false, "error": "lookup_failed"})
                             }

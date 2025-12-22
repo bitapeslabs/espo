@@ -172,11 +172,20 @@ a:hover {
   height: 18px;
   color: inherit;
 }
+.tx-check-icon {
+  display: none;
+}
 .tx-copy:hover {
   color: var(--text);
 }
 .tx-copy[data-copied="1"] {
   color: var(--success);
+}
+.tx-copy[data-copied="1"] .tx-copy-icon {
+  display: none;
+}
+.tx-copy[data-copied="1"] .tx-check-icon {
+  display: inline-block;
 }
 .tx-conf-pill {
   background: var(--bg-success);
@@ -456,11 +465,12 @@ a:hover {
   vertical-align: middle;
 }
 .tx-card {
-  padding: 16px;
   background: var(--panel);
   border-radius: 8px;
+  overflow: hidden;
 }
 .tx-title {
+  padding: 12px;
   margin-top: 0;
   margin-bottom: 20px;
   font-weight: 500;
@@ -468,8 +478,10 @@ a:hover {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
+  background-color: var(--panel);
   white-space: nowrap;
   min-width: 0;
+  border-bottom: 4px solid var(--bg);
 }
 .tx-title a {
   display: block;
@@ -481,6 +493,7 @@ a:hover {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  padding: 16px 12px;
 }
 @media (max-width: 800px) {
   .tx-io-grid {
@@ -863,6 +876,17 @@ a:hover {
   align-items: center;
   gap: 8px;
 }
+.alkane-hero {
+  align-items: center;
+  gap: 14px;
+}
+.alkane-hero .alk-icon-wrap {
+  width: 64px;
+  height: 64px;
+}
+.alkane-hero .alk-icon-letter {
+  font-size: 22px;
+}
 .trace-contract-name {
   display: flex;
   flex-direction: row;
@@ -1052,6 +1076,22 @@ a:hover {
   gap: 6px;
   margin-top: 6px;
 }
+.io-alkanes-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 6px;
+  background-color: var(--panel);
+  padding: 12px;
+  border-radius: 8px;
+}
+.alk-card {
+  display: flex;
+  background: var(--panel2);
+  border-radius: 8px;
+  padding: 12px;
+  width: 100%;
+}
 .alk-line {
   display: flex;
   align-items: center;
@@ -1079,6 +1119,22 @@ a:hover {
   font-weight: 600;
   text-transform: uppercase;
 }
+@media (max-width: 1024px) {
+  .io-alkanes-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 640px) {
+  .io-alkanes-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .alk-card {
+    background: var(--panel);
+    padding: 0;
+  }
+}
 .alk-name {
   color: var(--muted2);
   font-size: 13px;
@@ -1091,8 +1147,8 @@ a:hover {
 }
 .pill.small {
   padding: 5px 8px;
-  font-size: 12px;
-  color: var(--muted);
+  font-size: 13px;
+  color: var(--link);
 }
 .pill.disabled {
   opacity: 0.3;

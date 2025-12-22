@@ -1,6 +1,6 @@
 use maud::{Markup, PreEscaped, html};
 
-use crate::explorer::components::svg_assets::icon_copy;
+use crate::explorer::components::svg_assets::{icon_check, icon_copy};
 
 pub struct HeaderSummaryItem {
     pub label: String,
@@ -53,7 +53,8 @@ pub fn header(props: HeaderProps) -> Markup {
                             span class="tx-hero-id-text" { (id) }
                             @if show_copy {
                                 button class="tx-copy" type="button" data-copy-btn="" data-copy-value=(id) aria-label="Copy id" {
-                                    (icon_copy())
+                                    span class="tx-copy-icon" aria-hidden="true" { (icon_copy()) }
+                                    span class="tx-check-icon" aria-hidden="true" { (icon_check()) }
                                 }
                             }
                         }
@@ -102,7 +103,7 @@ pub fn header_scripts() -> Markup {
       setTimeout(() => {
         btn.dataset.copied = '';
         if (label) label.textContent = 'Copy';
-      }, 1200);
+      }, 1000);
     };
     btn.addEventListener('click', async () => {
       try {

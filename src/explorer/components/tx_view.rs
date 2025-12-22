@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::hashes::Hash;
-use bitcoin::{opcodes, Address, Amount, Network, ScriptBuf, Transaction, Txid};
+use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, Txid, opcodes};
 use maud::{Markup, PreEscaped, html};
 
 use crate::alkanes::trace::{
@@ -35,7 +35,6 @@ fn addr_prefix_suffix(addr: &str) -> (String, String) {
     (prefix, suffix)
 }
 
-
 #[derive(Clone, Debug)]
 struct OpReturnDecoded {
     data: Vec<u8>,
@@ -62,13 +61,13 @@ struct ContractCallSummary {
 }
 
 #[derive(Clone, Debug)]
-struct ResolvedName {
-    value: String,
-    known: bool,
+pub(crate) struct ResolvedName {
+    pub value: String,
+    pub known: bool,
 }
 
 impl ResolvedName {
-    fn fallback_letter(&self) -> char {
+    pub fn fallback_letter(&self) -> char {
         if !self.known {
             return '?';
         }
@@ -82,17 +81,17 @@ impl ResolvedName {
 
 type InspectionCache = HashMap<SchemaAlkaneId, Option<StoredInspectionResult>>;
 #[derive(Clone, Debug, Default)]
-struct AlkaneKvMeta {
+pub(crate) struct AlkaneKvMeta {
     name: Option<String>,
     symbol: Option<String>,
     implementation: Option<Option<SchemaAlkaneId>>,
 }
-type AlkaneKvCache = HashMap<SchemaAlkaneId, AlkaneKvMeta>;
+pub(crate) type AlkaneKvCache = HashMap<SchemaAlkaneId, AlkaneKvMeta>;
 #[derive(Clone, Debug)]
-struct AlkaneMetaDisplay {
-    name: ResolvedName,
-    symbol: String,
-    icon_url: String,
+pub(crate) struct AlkaneMetaDisplay {
+    pub name: ResolvedName,
+    pub symbol: String,
+    pub icon_url: String,
 }
 const KV_KEY_NAME: &[u8] = b"/name";
 const KV_KEY_SYMBOL: &[u8] = b"/symbol";
@@ -253,11 +252,7 @@ fn decode_trace_response(data_hex: &str) -> Option<String> {
     }
     let text = String::from_utf8_lossy(&bytes).to_string();
     let trimmed = text.trim_matches('\u{0}').to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
 fn kv_row_key(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
@@ -323,7 +318,11 @@ fn kv_implementation_value(
     implementation
 }
 
-fn kv_meta_for_alkane(id: &SchemaAlkaneId, cache: &mut AlkaneKvCache, mdb: &Mdb) -> AlkaneKvMeta {
+pub(crate) fn kv_meta_for_alkane(
+    id: &SchemaAlkaneId,
+    cache: &mut AlkaneKvCache,
+    mdb: &Mdb,
+) -> AlkaneKvMeta {
     if let Some(meta) = cache.get(id) {
         if meta.name.is_some() && meta.symbol.is_some() {
             return meta.clone();
@@ -379,13 +378,11 @@ fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
     if !name_matches {
         return false;
     }
-    UPGRADEABLE_METHODS
-        .iter()
-        .all(|(name, opcode)| {
-            meta.methods
-                .iter()
-                .any(|m| m.name.eq_ignore_ascii_case(name) && m.opcode == *opcode)
-        })
+    UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
+        meta.methods
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case(name) && m.opcode == *opcode)
+    })
 }
 
 fn contract_name_override(id: &SchemaAlkaneId) -> Option<String> {
@@ -452,15 +449,15 @@ fn contract_display_name(
     ResolvedName { value: key, known: false }
 }
 
-fn method_display_name(opcode: u128, inspection: Option<&StoredInspectionResult>) -> Option<String> {
+fn method_display_name(
+    opcode: u128,
+    inspection: Option<&StoredInspectionResult>,
+) -> Option<String> {
     let meta = inspection?.metadata.as_ref()?;
-    meta.methods
-        .iter()
-        .find(|m| m.opcode == opcode)
-        .map(|m| m.name.clone())
+    meta.methods.iter().find(|m| m.opcode == opcode).map(|m| m.name.clone())
 }
 
-fn alkane_icon_url(id: &SchemaAlkaneId) -> String {
+pub(crate) fn alkane_icon_url(id: &SchemaAlkaneId) -> String {
     let key = format!("{}:{}", id.block, id.tx);
     for (id_s, url) in alkane_icon_overrides() {
         if *id_s == key {
@@ -523,13 +520,8 @@ fn summarize_contract_call(
     let contract_id = contract_id?;
     let kv_meta = kv_meta_for_alkane(&contract_id, kv_cache, mdb);
     let contract_inspection = lookup_inspection(&contract_id, cache, mdb).cloned();
-    let proxy_template = upgradeable_proxy_target(
-        &contract_id,
-        contract_inspection.as_ref(),
-        trace,
-        kv_cache,
-        mdb,
-    );
+    let proxy_template =
+        upgradeable_proxy_target(&contract_id, contract_inspection.as_ref(), trace, kv_cache, mdb);
     let (active_id, active_inspection, using_proxy_template) = match proxy_template {
         Some(target) => {
             let insp = lookup_inspection(&target, cache, mdb).cloned();
@@ -555,8 +547,7 @@ fn summarize_contract_call(
     }
     let mut factory_pair = parse_factory_clone(first_invoke_inputs.as_ref(), created_alkane);
     if factory_pair.is_none() {
-        if let (Some(factory_id), Some(created)) = (inspection_factory_id, created_alkane)
-        {
+        if let (Some(factory_id), Some(created)) = (inspection_factory_id, created_alkane) {
             if factory_id != contract_id || created != contract_id {
                 factory_pair = Some((factory_id, Some(created)));
             }
@@ -694,7 +685,8 @@ pub fn render_tx(
 ) -> Markup {
     let mut alkane_kv_cache: AlkaneKvCache = HashMap::new();
     seed_kv_cache_from_traces(traces, &mut alkane_kv_cache);
-    let vins_markup = render_vins(tx, network, prev_map, outpoint_fn, &mut alkane_kv_cache, essentials_mdb);
+    let vins_markup =
+        render_vins(tx, network, prev_map, outpoint_fn, &mut alkane_kv_cache, essentials_mdb);
     let outspends = outspends_fn(txid);
     let protostone_json = protostone_json(tx);
     let runestone_vouts = runestone_vout_indices(tx);
@@ -789,7 +781,7 @@ fn render_vins(
                                         }
                                     }
                                 }
-                                (balances_list(&prevout_view.balances, alkane_kv_cache, essentials_mdb))
+                                (balances_list(&prevout_view.balances, alkane_kv_cache, essentials_mdb, true))
                             }
                         }
                     }
@@ -869,7 +861,7 @@ fn render_vouts(
                                     }
                                 }
                             }
-                            (balances_list(&balances, alkane_kv_cache, essentials_mdb))
+                            (balances_list(&balances, alkane_kv_cache, essentials_mdb, true))
                         }
                         @match spent_by {
                             Some(spender) => a class=(if is_opret { "io-arrow io-arrow-link out spent opret-arrow" } else { "io-arrow io-arrow-link out spent" }) href=(format!("/tx/{}", spender)) title="Spent by transaction" { (arrow_svg()) },
@@ -896,7 +888,8 @@ fn render_op_return(
     let trace_views: Vec<(String, Option<Value>)> = traces
         .iter()
         .map(|t| {
-            let raw = prettyify_protobuf_trace_json(&t.protobuf_trace).unwrap_or_else(|_| "[]".to_string());
+            let raw = prettyify_protobuf_trace_json(&t.protobuf_trace)
+                .unwrap_or_else(|_| "[]".to_string());
             let parsed = serde_json::from_str::<Value>(&raw).ok();
             (raw, parsed)
         })
@@ -904,7 +897,7 @@ fn render_op_return(
 
     html! {
         div class="io-addr-row opret-row" {
-            details class="io-opret" {
+            details class="io-opret" open {
                 summary class="opret-summary" {
                     span class="opret-left" {
                         span class="opret-caret" aria-hidden="true" { (icon_caret_right()) }
@@ -959,6 +952,7 @@ fn balances_list(
     entries: &[BalanceEntry],
     kv_cache: &mut AlkaneKvCache,
     essentials_mdb: &Mdb,
+    show_arrow: bool,
 ) -> Markup {
     if entries.is_empty() {
         return html! {};
@@ -969,21 +963,31 @@ fn balances_list(
                 @let meta = alkane_meta(&be.alkane, kv_cache, essentials_mdb);
                 @let alk = format!("{}:{}", be.alkane.block, be.alkane.tx);
                 @let fallback_letter = meta.name.fallback_letter();
-                div class="alk-line" {
-                    span class="alk-arrow" aria-hidden="true" { (icon_arrow_bend_down_right()) }
-                    div class="alk-icon-wrap" aria-hidden="true" {
-                        img class="alk-icon-img" src=(meta.icon_url.clone()) alt=(meta.symbol.clone()) loading="lazy" onerror="this.remove()" {}
-                        span class="alk-icon-letter" { (fallback_letter) }
+                @let inner = html! {
+                    div class="alk-line" {
+                        @if show_arrow {
+                            span class="alk-arrow" aria-hidden="true" { (icon_arrow_bend_down_right()) }
+                        }
+                        div class="alk-icon-wrap" aria-hidden="true" {
+                            img class="alk-icon-img" src=(meta.icon_url.clone()) alt=(meta.symbol.clone()) loading="lazy" onerror="this.remove()" {}
+                            span class="alk-icon-letter" { (fallback_letter) }
+                        }
+                        span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
+                        a class="alk-sym link mono" href=(format!("/alkane/{alk}")) { (meta.name.value.clone()) }
                     }
-                    span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
-                    a class="alk-sym link mono" href=(format!("/alkane/{alk}")) { (meta.name.value.clone()) }
-                }
+                };
+                (inner)
             }
         }
     }
 }
 
-fn alkane_meta(
+pub fn render_alkane_balances(entries: &[BalanceEntry], essentials_mdb: &Mdb) -> Markup {
+    let mut cache: AlkaneKvCache = HashMap::new();
+    balances_list(entries, &mut cache, essentials_mdb, false)
+}
+
+pub(crate) fn alkane_meta(
     id: &SchemaAlkaneId,
     kv_cache: &mut AlkaneKvCache,
     essentials_mdb: &Mdb,
@@ -1088,8 +1092,9 @@ fn render_json_value(v: &Value, depth: usize, out: &mut String) {
                 let len = map.len();
                 for (idx, (k, val)) in map.iter().enumerate() {
                     out.push_str(&next_indent);
-                    let key_escaped =
-                        escape_html(&serde_json::to_string(k).unwrap_or_else(|_| format!("{:?}", k)));
+                    let key_escaped = escape_html(
+                        &serde_json::to_string(k).unwrap_or_else(|_| format!("{:?}", k)),
+                    );
                     out.push_str(r#"<span class="jv-key">"#);
                     out.push_str(&key_escaped);
                     out.push_str(r#"</span><span class="jv-sep">: </span>"#);
