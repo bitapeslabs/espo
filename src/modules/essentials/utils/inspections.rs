@@ -1,5 +1,6 @@
 use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
+    EspoSandshrewLikeTraceStatus,
 };
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -8,6 +9,7 @@ use alkanes_cli_common::alkanes::inspector::{AlkaneInspector, InspectionConfig, 
 use alkanes_cli_common::alkanes::types::AlkaneId as CliAlkaneId;
 use anyhow::{Context, Result, anyhow};
 use borsh::{BorshDeserialize, BorshSerialize};
+use bitcoin::hashes::Hash;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::future::Future;
@@ -132,13 +134,12 @@ pub fn load_inspection(
     mdb: &Mdb,
     alkane: &SchemaAlkaneId,
 ) -> Result<Option<StoredInspectionResult>> {
-    let key = inspection_key(alkane);
-    if let Some(bytes) = mdb.get(&key)? {
-        let record = decode_inspection(&bytes)?;
-        Ok(Some(record))
-    } else {
-        Ok(None)
+    // The inspection is now stored alongside the creation record; keep a small
+    // helper here for call sites that expect it.
+    if let Some(rec) = crate::modules::essentials::storage::load_creation_record(mdb, alkane)? {
+        return Ok(rec.inspection);
     }
+    Ok(None)
 }
 
 fn parse_short_id(id: &EspoSandshrewLikeTraceShortId) -> Option<SchemaAlkaneId> {
@@ -160,23 +161,64 @@ fn parse_short_id(id: &EspoSandshrewLikeTraceShortId) -> Option<SchemaAlkaneId> 
     Some(SchemaAlkaneId { block, tx })
 }
 
-pub fn created_alkanes_from_block(block: &EspoBlock) -> Vec<SchemaAlkaneId> {
-    let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct AlkaneCreationRecord {
+    pub alkane: SchemaAlkaneId,
+    pub txid: [u8; 32],
+    pub creation_height: u32,
+    pub creation_timestamp: u32,
+    pub tx_index_in_block: u32,
+    pub inspection: Option<StoredInspectionResult>,
+    pub names: Vec<String>,
+    pub symbols: Vec<String>,
+}
 
-    for tx in block.transactions.iter() {
+pub fn created_alkane_records_from_block(block: &EspoBlock) -> Vec<AlkaneCreationRecord> {
+    let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
+    let mut out: Vec<AlkaneCreationRecord> = Vec::new();
+
+    for (tx_index, tx) in block.transactions.iter().enumerate() {
         let Some(traces) = tx.traces.as_ref() else { continue };
+        let mut txid = tx.transaction.compute_txid().to_byte_array();
+        txid.reverse(); // store txid in standard BE display order
         for trace in traces {
+            let reverted = trace
+                .sandshrew_trace
+                .events
+                .iter()
+                .any(|ev| matches!(ev, EspoSandshrewLikeTraceEvent::Return(r) if matches!(r.status, EspoSandshrewLikeTraceStatus::Failure)));
+            if reverted {
+                continue;
+            }
             for ev in trace.sandshrew_trace.events.iter() {
                 if let EspoSandshrewLikeTraceEvent::Create(create) = ev {
                     if let Some(id) = parse_short_id(&create.new_alkane) {
-                        seen.insert(id);
+                        if seen.insert(id) {
+                            out.push(AlkaneCreationRecord {
+                                alkane: id,
+                                txid,
+                                creation_height: block.height,
+                                creation_timestamp: block.block_header.time,
+                                tx_index_in_block: tx_index as u32,
+                                inspection: None,
+                                names: Vec::new(),
+                                symbols: Vec::new(),
+                            });
+                        }
                     }
                 }
             }
         }
     }
 
-    seen.into_iter().collect()
+    out
+}
+
+pub fn created_alkanes_from_block(block: &EspoBlock) -> Vec<SchemaAlkaneId> {
+    created_alkane_records_from_block(block)
+        .into_iter()
+        .map(|rec| rec.alkane)
+        .collect()
 }
 
 fn method_to_json(m: &StoredInspectionMethod) -> Value {

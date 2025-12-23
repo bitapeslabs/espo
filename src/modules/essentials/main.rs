@@ -3,8 +3,12 @@ use crate::config::{get_metashrew, get_network};
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::consts::essentials_genesis_block;
 use crate::modules::essentials::rpc;
+use crate::modules::essentials::storage::{
+    alkane_creation_by_id_key, alkane_creation_count_key, alkane_creation_ordered_key,
+    encode_creation_record, load_creation_record, trace_count_key,
+};
 use crate::modules::essentials::utils::inspections::{
-    created_alkanes_from_block, encode_inspection, inspect_wasm_metadata, inspection_key,
+    created_alkane_records_from_block, inspect_wasm_metadata, AlkaneCreationRecord,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::SchemaAlkaneId;
@@ -53,7 +57,10 @@ impl Essentials {
     fn set_index_height(&self, new_height: u32) -> Result<()> {
         if let Some(prev) = *self.index_height.read().unwrap() {
             if new_height < prev {
-                return Ok(());
+                eprintln!(
+                    "[ESSENTIALS] index height rollback detected ({} -> {})",
+                    prev, new_height
+                );
             }
         }
         self.persist_index_height(new_height)?;
@@ -143,8 +150,18 @@ impl EspoModule for Essentials {
         // dedup directory markers:
         //   k_dir_entry(alk,skey) -> ()
         let mut dir_rows: HashSet<Vec<u8>> = HashSet::new();
-        // inspection index rows:
-        let mut inspection_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        // creation records rows (by id and by ordered key):
+        let mut creation_rows_by_id: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut creation_rows_ordered: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        // in-block name/symbol updates detected from storage writes
+        let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> =
+            HashMap::new();
+        // trace count row
+        let trace_count = block
+            .transactions
+            .iter()
+            .map(|tx| tx.traces.as_ref().map(|t| t.len()).unwrap_or(0))
+            .sum::<usize>() as u32;
 
         let mut total_pairs_dedup = 0usize;
 
@@ -175,41 +192,96 @@ impl EspoModule for Essentials {
                     let k_dir = Essentials::k_dir_entry(alk, skey);
                     dir_rows.insert(k_dir);
 
+                    // Track name/symbol updates for the alkane (append if new)
+                    let push_if_new = |map: &mut HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)>,
+                                           alk: SchemaAlkaneId,
+                                           name: Option<String>,
+                                           symbol: Option<String>| {
+                        let entry = map.entry(alk).or_default();
+                        if let Some(n) = name {
+                            if !entry.0.iter().any(|v| v == &n) {
+                                entry.0.push(n);
+                            }
+                        }
+                        if let Some(s) = symbol {
+                            if !entry.1.iter().any(|v| v == &s) {
+                                entry.1.push(s);
+                            }
+                        }
+                    };
+                    if skey.as_slice() == b"/name" {
+                        if let Ok(name) = String::from_utf8(value.clone()) {
+                            push_if_new(&mut meta_updates, *alk, Some(name), None);
+                        }
+                    } else if skey.as_slice() == b"/symbol" {
+                        if let Ok(symbol) = String::from_utf8(value.clone()) {
+                            push_if_new(&mut meta_updates, *alk, None, Some(symbol));
+                        }
+                    }
+
                     total_pairs_dedup += 1;
                 }
             }
         }
 
-        let mut created_alkanes = created_alkanes_from_block(&block);
+        let mut created_records = created_alkane_records_from_block(&block);
         // Special case: ensure genesis alkane (2:0) is inspected on the genesis block even if no trace emits a create.
         let genesis_height = essentials_genesis_block(get_network());
         if block.height == genesis_height {
             let genesis = SchemaAlkaneId { block: 2, tx: 0 };
-            if !created_alkanes.contains(&genesis) {
-                created_alkanes.push(genesis);
+            let has_genesis = created_records.iter().any(|r| r.alkane == genesis);
+            if !has_genesis {
+                // Use the coinbase txid when available; fall back to zeroed bytes.
+                let txid_bytes = block
+                    .transactions
+                    .first()
+                    .map(|t| {
+                        let mut b = t.transaction.compute_txid().to_byte_array();
+                        b.reverse();
+                        b
+                    })
+                    .unwrap_or([0u8; 32]);
+                created_records.push(AlkaneCreationRecord {
+                    alkane: genesis,
+                    txid: txid_bytes,
+                    creation_height: block.height,
+                    creation_timestamp: block.block_header.time,
+                    tx_index_in_block: 0,
+                    inspection: None,
+                    names: vec!["DIESEL".to_string()],
+                    symbols: vec!["diesel".to_string()],
+                });
+            }
+        }
+
+        // Attach name/symbol from this block's storage writes (append, preserving first seen).
+        for rec in created_records.iter_mut() {
+            if let Some((names, symbols)) = meta_updates.get(&rec.alkane) {
+                for n in names {
+                    if !rec.names.iter().any(|v| v == n) {
+                        rec.names.push(n.clone());
+                    }
+                }
+                for s in symbols {
+                    if !rec.symbols.iter().any(|v| v == s) {
+                        rec.symbols.push(s.clone());
+                    }
+                }
             }
         }
 
         let metashrew = get_metashrew();
-        for alk in created_alkanes {
-            match metashrew.get_alkane_wasm_bytes(&alk) {
+        for rec in created_records.iter_mut() {
+            match metashrew.get_alkane_wasm_bytes(&rec.alkane) {
                 Ok(Some((wasm_bytes, factory_id))) => {
-                    match inspect_wasm_metadata(&alk, &wasm_bytes, factory_id) {
-                        Ok(record) => match encode_inspection(&record) {
-                            Ok(encoded) => {
-                                inspection_rows.insert(inspection_key(&alk), encoded);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[ESSENTIALS] failed to encode inspection for {}:{}: {e}",
-                                    alk.block, alk.tx
-                                );
-                            }
-                        },
+                    match inspect_wasm_metadata(&rec.alkane, &wasm_bytes, factory_id) {
+                        Ok(record) => {
+                            rec.inspection = Some(record);
+                        }
                         Err(e) => {
                             eprintln!(
                                 "[ESSENTIALS] inspection failed for {}:{}: {e}",
-                                alk.block, alk.tx
+                                rec.alkane.block, rec.alkane.tx
                             );
                         }
                     }
@@ -217,27 +289,202 @@ impl EspoModule for Essentials {
                 Ok(None) => {
                     eprintln!(
                         "[ESSENTIALS] no wasm payload found for alkane {}:{}; skipping inspection",
-                        alk.block, alk.tx
+                        rec.alkane.block, rec.alkane.tx
                     );
                 }
                 Err(e) => {
                     eprintln!(
                         "[ESSENTIALS] failed to fetch wasm for alkane {}:{}: {e}",
-                        alk.block, alk.tx
+                        rec.alkane.block, rec.alkane.tx
                     );
                 }
             }
         }
 
+        // Dedup against existing records to avoid double-counting if re-run.
+        let mut new_creations_added: u64 = 0;
+        if !created_records.is_empty() {
+            let id_keys: Vec<Vec<u8>> =
+                created_records.iter().map(|r| alkane_creation_by_id_key(&r.alkane)).collect();
+            let existing = mdb.multi_get(&id_keys)?;
+
+            for (idx, rec) in created_records.into_iter().enumerate() {
+                let key_id = &id_keys[idx];
+                let encoded = match encode_creation_record(&rec) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "[ESSENTIALS] failed to encode creation record for {}:{}: {e}",
+                            rec.alkane.block, rec.alkane.tx
+                        );
+                        continue;
+                    }
+                };
+
+                let already = existing.get(idx).and_then(|v| v.as_ref());
+                if let Some(bytes) = already {
+                    // If we already have a record, upgrade inspection/name/symbol when present.
+                    match crate::modules::essentials::storage::decode_creation_record(bytes) {
+                        Ok(prev) => {
+                            let mut updated = prev.clone();
+                            let mut dirty = false;
+                            if updated.inspection.is_none() && rec.inspection.is_some() {
+                                updated.inspection = rec.inspection.clone();
+                                dirty = true;
+                            }
+                            // Merge names/symbols (append if new)
+                            let maybe_push = |vec: &mut Vec<String>, vals: &[String]| {
+                                let mut changed = false;
+                                for v in vals {
+                                    if !vec.iter().any(|x| x == v) {
+                                        vec.push(v.clone());
+                                        changed = true;
+                                    }
+                                }
+                                changed
+                            };
+                            if maybe_push(&mut updated.names, &rec.names) {
+                                dirty = true;
+                            }
+                            if maybe_push(&mut updated.symbols, &rec.symbols) {
+                                dirty = true;
+                            }
+                            if let Some((names, syms)) = meta_updates.get(&updated.alkane) {
+                                if maybe_push(&mut updated.names, names) {
+                                    dirty = true;
+                                }
+                                if maybe_push(&mut updated.symbols, syms) {
+                                    dirty = true;
+                                }
+                            }
+                            if dirty {
+                                let encoded_updated = match encode_creation_record(&updated) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[ESSENTIALS] failed to encode updated creation record for {}:{}: {e}",
+                                            updated.alkane.block, updated.alkane.tx
+                                        );
+                                        continue;
+                                    }
+                                };
+                                creation_rows_by_id.insert(key_id.clone(), encoded_updated.clone());
+                                let key_ord = alkane_creation_ordered_key(
+                                    updated.creation_timestamp,
+                                    updated.creation_height,
+                                    updated.tx_index_in_block,
+                                    &updated.alkane,
+                                );
+                                creation_rows_ordered.insert(key_ord, encoded_updated);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[ESSENTIALS] failed to decode existing creation record for {}:{}: {e}",
+                                rec.alkane.block, rec.alkane.tx
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                new_creations_added += 1;
+                creation_rows_by_id.insert(key_id.clone(), encoded.clone());
+                let key_ord = alkane_creation_ordered_key(
+                    rec.creation_timestamp,
+                    rec.creation_height,
+                    rec.tx_index_in_block,
+                    &rec.alkane,
+                );
+                creation_rows_ordered.insert(key_ord, encoded);
+            }
+        }
+
+        // Also update name/symbol for alkanes that had metadata writes in this block but were not newly created.
+        for (alk, (names, symbols)) in meta_updates.iter() {
+            let key_id = alkane_creation_by_id_key(alk);
+            if creation_rows_by_id.contains_key(&key_id) {
+                continue; // already updated via creation path above
+            }
+            let Some(mut rec) = load_creation_record(mdb, alk).ok().flatten() else {
+                continue;
+            };
+            let mut dirty = false;
+            let maybe_push = |vec: &mut Vec<String>, vals: &[String]| {
+                let mut changed = false;
+                for v in vals {
+                    if !vec.iter().any(|x| x == v) {
+                        vec.push(v.clone());
+                        changed = true;
+                    }
+                }
+                changed
+            };
+            if maybe_push(&mut rec.names, names) {
+                dirty = true;
+            }
+            if maybe_push(&mut rec.symbols, symbols) {
+                dirty = true;
+            }
+            if !dirty {
+                continue;
+            }
+            let encoded = match encode_creation_record(&rec) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[ESSENTIALS] failed to encode updated creation record for {}:{}: {e}",
+                        rec.alkane.block, rec.alkane.tx
+                    );
+                    continue;
+                }
+            };
+            creation_rows_by_id.insert(key_id, encoded.clone());
+            let key_ord = alkane_creation_ordered_key(
+                rec.creation_timestamp,
+                rec.creation_height,
+                rec.tx_index_in_block,
+                &rec.alkane,
+            );
+            creation_rows_ordered.insert(key_ord, encoded);
+        }
+
         // If there’s nothing to write (typical empty block), skip the write-batch
-        if !kv_rows.is_empty() || !dir_rows.is_empty() || !inspection_rows.is_empty() {
+        if !kv_rows.is_empty()
+            || !dir_rows.is_empty()
+            || !creation_rows_by_id.is_empty()
+            || !creation_rows_ordered.is_empty()
+        {
             // -------- Phase B: write in sorted key order (better LSM locality) --------
             let mut kv_keys: Vec<Vec<u8>> = kv_rows.keys().cloned().collect();
             kv_keys.sort_unstable();
             let mut dir_keys: Vec<Vec<u8>> = dir_rows.into_iter().collect();
             dir_keys.sort_unstable();
-            let mut inspection_keys: Vec<Vec<u8>> = inspection_rows.keys().cloned().collect();
-            inspection_keys.sort_unstable();
+            let mut creation_keys_by_id: Vec<Vec<u8>> =
+                creation_rows_by_id.keys().cloned().collect();
+            creation_keys_by_id.sort_unstable();
+            let mut creation_keys_ordered: Vec<Vec<u8>> =
+                creation_rows_ordered.keys().cloned().collect();
+            creation_keys_ordered.sort_unstable();
+            let mut creation_count_row: Option<[u8; 8]> = None;
+            if new_creations_added > 0 {
+                let current = mdb
+                    .get(alkane_creation_count_key())
+                    .ok()
+                    .flatten()
+                    .and_then(|b| {
+                        if b.len() == 8 {
+                            let mut arr = [0u8; 8];
+                            arr.copy_from_slice(&b);
+                            Some(u64::from_le_bytes(arr))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let updated = current.saturating_add(new_creations_added);
+                creation_count_row = Some(updated.to_le_bytes());
+            }
 
             if let Err(e) = mdb.bulk_write(|wb: &mut MdbBatch<'_>| {
                 // Values first
@@ -250,10 +497,19 @@ impl EspoModule for Essentials {
                 for k in &dir_keys {
                     wb.put(k, &[]);
                 }
-                for k in &inspection_keys {
-                    if let Some(v) = inspection_rows.get(k) {
+                for k in &creation_keys_by_id {
+                    if let Some(v) = creation_rows_by_id.get(k) {
                         wb.put(k, v);
                     }
+                }
+                for k in &creation_keys_ordered {
+                    if let Some(v) = creation_rows_ordered.get(k) {
+                        wb.put(k, v);
+                    }
+                }
+                wb.put(&trace_count_key(block.height), &trace_count.to_le_bytes());
+                if let Some(count_bytes) = creation_count_row {
+                    wb.put(alkane_creation_count_key(), &count_bytes);
                 }
             }) {
                 eprintln!("[ESSENTIALS] bulk_write failed at block #{}: {e}", block.height);
@@ -270,10 +526,10 @@ impl EspoModule for Essentials {
             return Err(e);
         }
 
-        let inspections_saved = inspection_rows.len();
+        let new_alkanes_saved = creation_rows_by_id.len();
         eprintln!(
-            "[ESSENTIALS] block #{} indexed {} key/value updates (deduped); inspections {}",
-            block.height, total_pairs_dedup, inspections_saved
+            "[ESSENTIALS] block #{} indexed {} key/value updates (deduped); new alkanes {}",
+            block.height, total_pairs_dedup, new_alkanes_saved
         );
         self.set_index_height(block.height)?;
         Ok(())

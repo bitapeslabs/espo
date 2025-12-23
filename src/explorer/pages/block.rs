@@ -22,7 +22,7 @@ use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::{
     icon_arrow_up_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
-use crate::explorer::components::tx_view::render_tx;
+use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::state::ExplorerState;
 use crate::modules::essentials::utils::balances::{
@@ -316,11 +316,16 @@ pub async fn block_page(
                 } @else if tx_total == 0 {
                     p class="muted" { "No transactions found." }
                 } @else {
+                    @let block_confirmations = tip.saturating_sub(height).saturating_add(1);
+                    @let base_pill = TxPill {
+                        label: format!("{} confirmations", format_with_commas(block_confirmations)),
+                        tone: TxPillTone::Success,
+                    };
                     div class="list" {
                         @for atx in tx_items {
                             @let txid = atx.transaction.compute_txid();
                             @let traces: Option<&[EspoTrace]> = atx.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&txid, &atx.transaction, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, true))
+                            (render_tx(&txid, &atx.transaction, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), true))
                         }
                     }
                 }

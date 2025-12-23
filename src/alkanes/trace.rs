@@ -98,13 +98,13 @@ pub struct EspoSandshrewLikeTraceCreateData {
     pub new_alkane: EspoSandshrewLikeTraceShortId,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PartialEspoTrace {
     pub protobuf_trace: AlkanesTrace,
     pub outpoint: Vec<u8>, // [32 txid_le | 4 vout_le]
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EspoTrace {
     pub sandshrew_trace: EspoSandshrewLikeTrace,
     pub protobuf_trace: AlkanesTrace,
@@ -112,7 +112,7 @@ pub struct EspoTrace {
     pub outpoint: EspoOutpoint,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EspoAlkanesTransaction {
     pub traces: Option<Vec<EspoTrace>>,
     pub transaction: Transaction,

@@ -4,9 +4,10 @@ use bitcoin::address::AddressType;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Network, Transaction, Txid};
+use bitcoincore_rpc::RpcApi;
 use maud::html;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use std::str::FromStr;
 
@@ -14,14 +15,14 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, PartialEspoTrace,
     extract_alkane_storage, prettyify_protobuf_trace_json,
 };
-use crate::config::{get_electrum_like, get_metashrew};
+use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_metashrew};
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
 use crate::explorer::components::header::{HeaderProps, HeaderSummaryItem, header, header_scripts};
 use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::{
     icon_arrow_up_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
-use crate::explorer::components::tx_view::render_tx;
+use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::fmt_sats;
 use crate::explorer::pages::state::ExplorerState;
@@ -29,6 +30,7 @@ use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_balances_with_spent,
 };
 use crate::modules::essentials::storage::BalanceEntry;
+use crate::runtime::mempool::{MempoolEntry, pending_by_txid, pending_for_address};
 use crate::utils::electrum_like::{AddressHistoryEntry, ElectrumLikeBackend};
 
 #[derive(Deserialize)]
@@ -42,6 +44,8 @@ struct AddressTxRender {
     txid: Txid,
     tx: Transaction,
     traces: Option<Vec<EspoTrace>>,
+    confirmations: Option<u64>,
+    is_mempool: bool,
 }
 
 fn format_with_commas(n: u64) -> String {
@@ -195,22 +199,54 @@ pub async fn address_page(
             .then_with(|| a.alkane.tx.cmp(&b.alkane.tx))
     });
 
+    let chain_tip = get_bitcoind_rpc_client().get_blockchain_info().ok().map(|i| i.blocks as u64);
+
     let off = limit.saturating_mul(page.saturating_sub(1));
     let mut traces_partials: HashMap<Txid, Vec<PartialEspoTrace>> = HashMap::new();
 
-    let mut tx_items: Vec<AddressHistoryEntry> = Vec::new();
-    let mut tx_total: usize = 0;
-    let mut tx_has_next = false;
+    let mut pending_entries: Vec<MempoolEntry> = pending_for_address(&address_str);
+    pending_entries.sort_by(|a, b| b.txid.cmp(&a.txid));
+    let pending_filtered: Vec<MempoolEntry> = pending_entries
+        .into_iter()
+        .filter(|e| !traces_only || e.traces.as_ref().map_or(false, |t| !t.is_empty()))
+        .collect();
+    let pending_total = pending_filtered.len();
+    let pending_set: HashSet<Txid> = pending_filtered.iter().map(|e| e.txid).collect();
+
+    let mut tx_renders: Vec<AddressTxRender> = Vec::new();
+    let tx_has_next: bool;
     let tx_has_prev = page > 1;
+    let tx_total: usize;
+
+    let pending_slice_start = off.min(pending_total);
+    let pending_slice_end = (off + limit).min(pending_total);
+    for entry in pending_filtered
+        .iter()
+        .skip(pending_slice_start)
+        .take(pending_slice_end.saturating_sub(pending_slice_start))
+    {
+        tx_renders.push(AddressTxRender {
+            txid: entry.txid,
+            tx: entry.tx.clone(),
+            traces: if traces_only { entry.traces.clone() } else { None },
+            confirmations: None,
+            is_mempool: true,
+        });
+    }
+
+    let remaining_slots = limit.saturating_sub(tx_renders.len());
+    let confirmed_offset = off.saturating_sub(pending_total);
 
     if traces_only {
         let mut collected: Vec<AddressHistoryEntry> = Vec::new();
         let mut skipped_traces: usize = 0;
         let mut scan_offset: usize = 0;
         let mut has_more = true;
+        let target_for_count = remaining_slots.max(1);
         let page_fetch_limit = limit.saturating_mul(2).max(limit);
+        let mut confirmed_seen: usize = 0;
 
-        while collected.len() < limit && has_more {
+        while has_more && collected.len() < target_for_count {
             let page_res =
                 electrum_like.address_history_page(&address, scan_offset, page_fetch_limit);
             let Ok(hist_page) = page_res else {
@@ -230,6 +266,9 @@ pub async fn address_page(
             }
 
             for entry in &hist_page.entries {
+                if pending_set.contains(&entry.txid) || entry.height.is_none() {
+                    continue;
+                }
                 let partials = match get_metashrew().traces_for_tx(&entry.txid) {
                     Ok(p) => p,
                     Err(e) => {
@@ -240,36 +279,112 @@ pub async fn address_page(
                 if partials.is_empty() {
                     continue;
                 }
-                if skipped_traces < off {
+                confirmed_seen += 1;
+                if skipped_traces < confirmed_offset {
                     skipped_traces += 1;
                     continue;
                 }
-                traces_partials.insert(entry.txid, partials);
-                collected.push(entry.clone());
-                if collected.len() >= limit {
+                if collected.len() < remaining_slots {
+                    traces_partials.insert(entry.txid, partials);
+                    collected.push(entry.clone());
+                }
+                if collected.len() >= target_for_count {
                     break;
                 }
             }
 
             scan_offset += hist_page.entries.len();
             has_more = hist_page.has_more;
-            if !has_more {
-                break;
-            }
         }
 
-        tx_items = collected;
-        tx_total = off + tx_items.len() + if has_more { 1 } else { 0 };
-        tx_has_next = has_more;
+        let renderable: Vec<AddressHistoryEntry> = collected.into_iter().take(remaining_slots).collect();
+        let txids: Vec<Txid> = renderable.iter().map(|h| h.txid).collect();
+        let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+
+        for (idx, entry) in renderable.iter().enumerate() {
+            let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+            if raw.is_empty() {
+                continue;
+            }
+            let tx: Transaction = match deserialize(&raw) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[address_page] failed to decode tx {}: {e}", entry.txid);
+                    continue;
+                }
+            };
+            let confirmations = entry.height.and_then(|h| {
+                chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
+            });
+            let partials = traces_partials
+                .remove(&entry.txid)
+                .unwrap_or_else(|| get_metashrew().traces_for_tx(&entry.txid).unwrap_or_default());
+            let traces = if partials.is_empty() {
+                None
+            } else {
+                Some(build_traces_from_partials(&entry.txid, &tx, &partials))
+            };
+
+            tx_renders.push(AddressTxRender {
+                txid: entry.txid,
+                tx,
+                traces,
+                confirmations,
+                is_mempool: false,
+            });
+        }
+
+        let confirmed_total_est =
+            confirmed_offset + confirmed_seen + if has_more { 1 } else { 0 };
+        tx_total = pending_total + confirmed_total_est;
+        tx_has_next = (off + tx_renders.len()) < tx_total;
     } else {
-        match electrum_like.address_history_page(&address, off, limit) {
+        let fetch_limit = remaining_slots.max(1);
+        match electrum_like.address_history_page(&address, confirmed_offset, fetch_limit) {
             Ok(hist_page) => {
-                tx_items = hist_page.entries;
-                tx_total = hist_page.total.unwrap_or(off + tx_items.len());
-                tx_has_next = hist_page.has_more;
+                let entries: Vec<AddressHistoryEntry> = hist_page
+                    .entries
+                    .into_iter()
+                    .filter(|e| !pending_set.contains(&e.txid))
+                    .collect();
+                let total_raw = hist_page.total.unwrap_or(confirmed_offset + entries.len());
+                let confirmed_total =
+                    total_raw.saturating_sub(pending_total).max(entries.len());
+                let txids: Vec<Txid> =
+                    entries.iter().take(remaining_slots).map(|h| h.txid).collect();
+                let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+
+                for (idx, entry) in entries.iter().take(remaining_slots).enumerate() {
+                    let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let tx: Transaction = match deserialize(&raw) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("[address_page] failed to decode tx {}: {e}", entry.txid);
+                            continue;
+                        }
+                    };
+                    let confirmations = entry.height.and_then(|h| {
+                        chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
+                    });
+                    tx_renders.push(AddressTxRender {
+                        txid: entry.txid,
+                        tx,
+                        traces: None,
+                        confirmations,
+                        is_mempool: false,
+                    });
+                }
+
+                tx_total = pending_total + confirmed_total;
+                tx_has_next = (off + tx_renders.len()) < tx_total || hist_page.has_more;
             }
             Err(e) => {
                 eprintln!("[address_page] failed to fetch address history for {address_str}: {e}");
+                tx_total = pending_total + tx_renders.len();
+                tx_has_next = false;
             }
         }
     }
@@ -282,44 +397,16 @@ pub async fn address_page(
     }
 
     let display_start = if tx_total > 0 && off < tx_total { off + 1 } else { 0 };
-    let display_end = (off + tx_items.len()).min(tx_total);
+    let display_end = (off + tx_renders.len()).min(tx_total);
     let last_page = if tx_total > 0 { (tx_total + limit - 1) / limit } else { 1 };
 
-    let txids: Vec<Txid> = tx_items.iter().map(|h| h.txid).collect();
-    let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
-
-    let mut tx_renders: Vec<AddressTxRender> = Vec::new();
     let mut prev_txids: Vec<Txid> = Vec::new();
-    for (idx, entry) in tx_items.iter().enumerate() {
-        let raw = raw_txs.get(idx).cloned().unwrap_or_default();
-        if raw.is_empty() {
-            continue;
-        }
-        let tx: Transaction = match deserialize(&raw) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[address_page] failed to decode tx {}: {e}", entry.txid);
-                continue;
-            }
-        };
-        for vin in &tx.input {
+    for item in &tx_renders {
+        for vin in &item.tx.input {
             if !vin.previous_output.is_null() {
                 prev_txids.push(vin.previous_output.txid);
             }
         }
-        let traces = if traces_only {
-            let partials = traces_partials
-                .remove(&entry.txid)
-                .unwrap_or_else(|| get_metashrew().traces_for_tx(&entry.txid).unwrap_or_default());
-            if partials.is_empty() {
-                None
-            } else {
-                Some(build_traces_from_partials(&entry.txid, &tx, &partials))
-            }
-        } else {
-            None
-        };
-        tx_renders.push(AddressTxRender { txid: entry.txid, tx, traces });
     }
 
     prev_txids.sort();
@@ -329,10 +416,15 @@ pub async fn address_page(
         let raw_prev = electrum_like.batch_transaction_get_raw(&prev_txids).unwrap_or_default();
         for (i, raw) in raw_prev.into_iter().enumerate() {
             if raw.is_empty() {
+                if let Some(mempool_prev) = pending_by_txid(&prev_txids[i]) {
+                    prev_map.insert(prev_txids[i], mempool_prev.tx);
+                }
                 continue;
             }
             if let Ok(prev_tx) = deserialize::<Transaction>(&raw) {
                 prev_map.insert(prev_txids[i], prev_tx);
+            } else if let Some(mempool_prev) = pending_by_txid(&prev_txids[i]) {
+                prev_map.insert(prev_txids[i], mempool_prev.tx);
             }
         }
     }
@@ -341,7 +433,7 @@ pub async fn address_page(
         get_outpoint_balances_with_spent(&state.essentials_mdb, txid, vout).unwrap_or_default()
     };
     let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
-        let mut dedup = tx_items.iter().map(|t| t.txid).collect::<Vec<_>>();
+        let mut dedup = tx_renders.iter().map(|t| t.txid).collect::<Vec<_>>();
         dedup.sort();
         dedup.dedup();
         let fetched = electrum_like.batch_transaction_get_outspends(&dedup).unwrap_or_default();
@@ -447,7 +539,17 @@ pub async fn address_page(
                     div class="list" {
                         @for item in tx_renders {
                             @let traces_ref: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, true))
+                            @let pill = if item.is_mempool {
+                                Some(TxPill { label: "Unconfirmed".to_string(), tone: TxPillTone::Danger })
+                            } else if let Some(c) = item.confirmations {
+                                Some(TxPill {
+                                    label: format!("{} confirmations", format_with_commas(c)),
+                                    tone: TxPillTone::Success,
+                                })
+                            } else {
+                                None
+                            };
+                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, true))
                         }
                     }
 

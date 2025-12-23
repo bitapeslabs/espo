@@ -64,7 +64,7 @@ impl AmmData {
     fn set_index_height(&self, new_height: u32) -> Result<()> {
         if let Some(prev) = *self.index_height.read().unwrap() {
             if new_height < prev {
-                return Ok(());
+                eprintln!("[AMMDATA] index height rollback detected ({} -> {})", prev, new_height);
             }
         }
         self.persist_index_height(new_height)?;

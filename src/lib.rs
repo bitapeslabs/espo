@@ -14,3 +14,6 @@ use std::sync::atomic::AtomicU32;
 
 // Shared ESPO height cell (used by config helpers and the indexer).
 pub static ESPO_HEIGHT: OnceLock<Arc<AtomicU32>> = OnceLock::new();
+
+// Last known safe tip height fetched from the block source.
+pub static SAFE_TIP: OnceLock<Arc<AtomicU32>> = OnceLock::new();

@@ -6,6 +6,7 @@ use bitcoin::Network;
 use crate::config::get_network;
 
 pub const ALKANE_ICON_BASE: &str = "https://ordiscan.com/alkane";
+pub const ALKANE_ICON_FALLBACK_BASE: &str = "https://cdn.ordiscan.com/alkanes";
 
 // --- Mainnet overrides ---
 const MAINNET_ALKANE_NAME_OVERRIDES: &[(&str, &str, &str)] =

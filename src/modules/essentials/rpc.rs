@@ -3,7 +3,12 @@ use crate::config::{get_metashrew, get_network};
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::main::Essentials;
 use crate::modules::essentials::storage::{
-    HoldersCountEntry, holders_count_key, outpoint_addr_key, outpoint_balances_prefix,
+    HoldersCountEntry, alkane_creation_ordered_prefix, decode_creation_record,
+    holders_count_key, load_creation_record, outpoint_addr_key, outpoint_balances_prefix,
+    trace_count_key,
+};
+use crate::runtime::mempool::{
+    MempoolEntry, decode_seen_key, get_mempool_mdb, get_tx_from_mempool, pending_for_address,
 };
 // for Essentials::k_kv
 use crate::runtime::mdb::Mdb;
@@ -20,10 +25,12 @@ use super::utils::balances::{
     get_balance_for_address, get_holders_for_alkane,
     get_outpoint_balances as get_outpoint_balances_index,
 };
-use super::utils::inspections::{inspection_to_json, load_inspection};
+use super::utils::inspections::inspection_to_json;
+use crate::modules::essentials::storage::alkane_creation_count_key;
 
 use bitcoin::Address;
 use bitcoin::hashes::Hash;
+use hex;
 use std::str::FromStr;
 
 /// Local decoder using the public BalanceEntry type
@@ -51,11 +58,127 @@ fn log_rpc(method: &str, msg: &str) {
     eprintln!("[RPC::ESSENTIALS] {method} — {msg}");
 }
 
+fn mem_entry_to_json(entry: &MempoolEntry) -> Value {
+    let mut traces_json: Vec<Value> = Vec::new();
+    if let Some(traces) = entry.traces.as_ref() {
+        for t in traces {
+            let events_val = prettyify_protobuf_trace_json(&t.protobuf_trace)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .unwrap_or(Value::Null);
+            traces_json.push(json!({
+                "outpoint": format!("{}:{}", entry.txid, t.outpoint.vout),
+                "events": events_val,
+            }));
+        }
+    }
+
+    json!({
+        "txid": entry.txid.to_string(),
+        "first_seen": entry.first_seen,
+        "traces": traces_json,
+    })
+}
+
 pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
     // Wrap once; everything else shares this.
     let mdb = Arc::new(mdb);
 
     eprintln!("[RPC::ESSENTIALS] registering RPC handlers…");
+
+    /* -------- get_mempool_traces -------- */
+    {
+        let reg_mem = reg.clone();
+        tokio::spawn(async move {
+            reg_mem
+                .register("get_mempool_traces", move |_cx, payload| async move {
+                    let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+                    let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).max(1) as usize;
+                    let addr_raw = payload.get("address").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+                    let address = addr_raw.and_then(normalize_address);
+
+                    log_rpc(
+                        "get_mempool_traces",
+                        &format!(
+                            "page={}, limit={}, address={}",
+                            page,
+                            limit,
+                            address.as_deref().unwrap_or("-")
+                        ),
+                    );
+
+                    let mut items: Vec<Value> = Vec::new();
+                    let mut has_more = false;
+                    let mut total_traces: usize = 0;
+
+                    if let Some(addr) = address {
+                        let pending = pending_for_address(&addr);
+                        let pending_len = pending.len();
+                        let offset = limit.saturating_mul(page.saturating_sub(1));
+                        for (idx, entry) in pending.into_iter().enumerate() {
+                            if idx < offset {
+                                continue;
+                            }
+                            if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
+                                continue;
+                            }
+                            if items.len() >= limit {
+                                break;
+                            }
+                            if let Some(t) = entry.traces.as_ref() {
+                                total_traces += t.len();
+                            }
+                            items.push(mem_entry_to_json(&entry));
+                        }
+                        has_more = pending_len > offset + items.len();
+                    } else {
+                        let mdb = get_mempool_mdb();
+                        let pref = mdb.prefixed(b"seen/");
+                        let it = mdb.iter_prefix_rev(&pref);
+                        let offset = limit.saturating_mul(page.saturating_sub(1));
+                        let mut idx: usize = 0;
+                        for res in it {
+                            let Ok((k_full, _)) = res else { continue };
+                            let rel = &k_full[mdb.prefix().len()..];
+                            if !rel.starts_with(b"seen/") {
+                                break;
+                            }
+                            if idx < offset {
+                                idx += 1;
+                                continue;
+                            }
+                            if items.len() >= limit {
+                                has_more = true;
+                                break;
+                            }
+                            if let Some((_, txid)) = decode_seen_key(rel) {
+                                if let Some(entry) = get_tx_from_mempool(&txid) {
+                                    if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
+                                        idx += 1;
+                                        continue;
+                                    }
+                                    if let Some(t) = entry.traces.as_ref() {
+                                        total_traces += t.len();
+                                    }
+                                    items.push(mem_entry_to_json(&entry));
+                                }
+                            }
+                            idx += 1;
+                        }
+                    }
+
+                    json!({
+                        "ok": true,
+                        "page": page,
+                        "limit": limit,
+                        "has_more": has_more,
+                        "total": total_traces,
+                        "items": items,
+                    })
+                })
+                .await;
+        });
+    }
 
     /* -------- existing: get_keys -------- */
     {
@@ -208,14 +331,102 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
         });
     }
 
-    /* -------- inspections.lookup -------- */
+    /* -------- new: get_all_alkanes -------- */
     {
-        let reg_inspection = reg.clone();
-        let mdb_inspection = Arc::clone(&mdb);
+        let reg_all = reg.clone();
+        let mdb_all = Arc::clone(&mdb);
         tokio::spawn(async move {
-            reg_inspection
-                .register("get_inspection", move |_cx, payload| {
-                    let mdb = Arc::clone(&mdb_inspection);
+            reg_all
+                .register("get_all_alkanes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_all);
+                    async move {
+                        let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+                        let limit =
+                            payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).clamp(1, 500) as usize;
+                        let offset = limit.saturating_mul(page.saturating_sub(1));
+
+                        let total = mdb
+                            .get(alkane_creation_count_key())
+                            .ok()
+                            .flatten()
+                            .and_then(|b| {
+                                if b.len() == 8 {
+                                    let mut arr = [0u8; 8];
+                                    arr.copy_from_slice(&b);
+                                    Some(u64::from_le_bytes(arr))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+
+                        let mut items: Vec<Value> = Vec::new();
+                        let mut seen: usize = 0;
+                        let prefix_full = mdb.prefixed(alkane_creation_ordered_prefix());
+                        let it = mdb.iter_prefix_rev(&prefix_full);
+                        for res in it {
+                            let Ok((_k_full, v)) = res else { continue };
+                            if seen < offset {
+                                seen += 1;
+                                continue;
+                            }
+                            if items.len() >= limit {
+                                break;
+                            }
+                            match decode_creation_record(&v) {
+                                Ok(rec) => {
+                                    let holder_count = mdb
+                                        .get(&holders_count_key(&rec.alkane))
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
+                                        .map(|hc| hc.count)
+                                        .unwrap_or(0);
+                                    let inspection_json =
+                                        rec.inspection.as_ref().map(|r| inspection_to_json(r));
+                                    let name = rec.names.first().cloned();
+                                    let symbol = rec.symbols.first().cloned();
+                                    items.push(json!({
+                                        "alkane": format!("{}:{}", rec.alkane.block, rec.alkane.tx),
+                                        "creation_txid": hex::encode(rec.txid),
+                                        "creation_height": rec.creation_height,
+                                        "creation_timestamp": rec.creation_timestamp,
+                                        "name": name,
+                                        "symbol": symbol,
+                                        "names": rec.names,
+                                        "symbols": rec.symbols,
+                                        "holder_count": holder_count,
+                                        "inspection": inspection_json,
+                                    }));
+                                }
+                                Err(e) => {
+                                    log_rpc("get_all_alkanes", &format!("decode creation record failed: {e}"));
+                                }
+                            }
+                            seen += 1;
+                        }
+
+                        json!({
+                            "ok": true,
+                            "page": page,
+                            "limit": limit,
+                            "total": total,
+                            "items": items,
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- alkane info lookup -------- */
+    {
+        let reg_info = reg.clone();
+        let mdb_info = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_info
+                .register("get_alkane_info", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_info);
                     async move {
                         let alk = match payload
                             .get("alkane")
@@ -224,7 +435,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                         {
                             Some(a) => a,
                             None => {
-                                log_rpc("get_inspection", "missing_or_invalid_alkane");
+                                log_rpc("get_alkane_info", "missing_or_invalid_alkane");
                                 return json!({
                                     "ok": false,
                                     "error": "missing_or_invalid_alkane",
@@ -233,25 +444,88 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             }
                         };
 
-                        match load_inspection(&mdb, &alk) {
-                            Ok(Some(record)) => json!({
-                                "ok": true,
-                                "inspection": inspection_to_json(&record)
-                            }),
+                        let record = match load_creation_record(&mdb, &alk) {
+                            Ok(Some(r)) => r,
                             Ok(None) => {
-                                json!({"ok": false, "error": "not_found"})
+                                return json!({"ok": false, "error": "not_found"});
                             }
                             Err(e) => {
                                 log_rpc(
-                                    "get_inspection",
+                                    "get_alkane_info",
                                     &format!(
-                                        "load_inspection failed for {}:{}: {e}",
+                                        "load_creation_record failed for {}:{}: {e}",
                                         alk.block, alk.tx
                                     ),
                                 );
-                                json!({"ok": false, "error": "lookup_failed"})
+                                return json!({"ok": false, "error": "lookup_failed"});
                             }
-                        }
+                        };
+
+                        let holder_count = mdb
+                            .get(&holders_count_key(&alk))
+                            .ok()
+                            .flatten()
+                            .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
+                            .map(|hc| hc.count)
+                            .unwrap_or(0);
+                        let inspection_json =
+                            record.inspection.as_ref().map(|r| inspection_to_json(r));
+                        let name = record.names.first().cloned();
+                        let symbol = record.symbols.first().cloned();
+
+                        json!({
+                            "ok": true,
+                            "alkane": format!("{}:{}", record.alkane.block, record.alkane.tx),
+                            "creation_txid": hex::encode(record.txid),
+                            "creation_height": record.creation_height,
+                            "creation_timestamp": record.creation_timestamp,
+                            "name": name,
+                            "symbol": symbol,
+                            "names": record.names,
+                            "symbols": record.symbols,
+                            "holder_count": holder_count,
+                            "inspection": inspection_json,
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- trace count lookup -------- */
+    {
+        let reg_trace = reg.clone();
+        let mdb_trace = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_trace
+                .register("get_trace_count", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_trace);
+                    async move {
+                        let height = match payload.get("height").and_then(|v| v.as_u64()) {
+                            Some(h) => h as u32,
+                            None => {
+                                log_rpc("get_trace_count", "missing_or_invalid_height");
+                                return json!({"ok": false, "error": "missing_or_invalid_height"});
+                            }
+                        };
+
+                        let key = trace_count_key(height);
+                        let count = mdb
+                            .get(&key)
+                            .ok()
+                            .flatten()
+                            .and_then(|b| {
+                                if b.len() == 4 {
+                                    let mut arr = [0u8; 4];
+                                    arr.copy_from_slice(&b);
+                                    Some(u32::from_le_bytes(arr))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+
+                        json!({"ok": true, "height": height, "trace_count": count})
                     }
                 })
                 .await;
@@ -292,7 +566,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             ),
                         );
 
-                        let (total, slice) = match get_holders_for_alkane(&mdb, alk, page, limit) {
+                        let (total, _supply, slice) = match get_holders_for_alkane(&mdb, alk, page, limit) {
                             Ok(tup) => tup,
                             Err(e) => {
                                 log_rpc("get_holders", &format!("failed: {e:?}"));

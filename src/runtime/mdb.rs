@@ -2,7 +2,10 @@ use rocksdb::{
     BlockBasedOptions, Cache, DB, Direction, Error as RocksError, IteratorMode, Options,
     ReadOptions, WriteBatch,
 };
+use std::collections::{HashMap, HashSet};
 use std::{path::Path, sync::Arc};
+
+use crate::runtime::aof::AofManager;
 
 /// ===== Cache / open-time tuning =====
 /// How big you want the LRU block cache (data + index/filter when enabled).
@@ -18,17 +21,37 @@ pub const BLOOM_BITS_PER_KEY: f64 = 10.0;
 pub struct Mdb {
     db: Arc<DB>,
     prefix: Vec<u8>,
+    namespace_label: String,
+    aof: Option<Arc<AofManager>>,
     // Keep the cache alive as long as this handle is alive (important!)
 }
 
 impl Mdb {
-    fn from_parts(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {
-        Self { db, prefix: prefix.as_ref().to_vec() }
+    fn from_parts(
+        db: Arc<DB>,
+        prefix: impl AsRef<[u8]>,
+        aof: Option<Arc<AofManager>>,
+        label: Option<String>,
+    ) -> Self {
+        let prefix_vec = prefix.as_ref().to_vec();
+        let namespace_label = label.unwrap_or_else(|| {
+            String::from_utf8(prefix_vec.clone()).unwrap_or_else(|_| hex::encode(&prefix_vec))
+        });
+        Self { db, prefix: prefix_vec, namespace_label, aof }
     }
 
     pub fn from_db(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {
         // Back-compat constructor (no custom options)
-        Self::from_parts(db, prefix)
+        Self::from_parts(db, prefix, None, None)
+    }
+
+    pub fn from_db_with_aof(
+        db: Arc<DB>,
+        prefix: impl AsRef<[u8]>,
+        aof: Option<Arc<AofManager>>,
+        label: Option<String>,
+    ) -> Self {
+        Self::from_parts(db, prefix, aof, label)
     }
 
     pub fn open(path: impl AsRef<Path>, prefix: impl AsRef<[u8]>) -> Result<Self, RocksError> {
@@ -52,7 +75,7 @@ impl Mdb {
 
         let db = DB::open(&opts, path)?;
 
-        let mdb = Self::from_parts(Arc::new(db), prefix);
+        let mdb = Self::from_parts(Arc::new(db), prefix, None, None);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace(); // best-effort
         }
@@ -76,7 +99,7 @@ impl Mdb {
         opts.set_block_based_table_factory(&table);
 
         let db = DB::open_for_read_only(&opts, path, error_if_log_file_exist)?;
-        let mdb = Self::from_parts(Arc::new(db), prefix);
+        let mdb = Self::from_parts(Arc::new(db), prefix, None, None);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace();
         }
@@ -137,11 +160,28 @@ impl Mdb {
     }
 
     pub fn put(&self, k: &[u8], v: &[u8]) -> Result<(), RocksError> {
-        self.db.put(self.prefixed(k), v)
+        let prefixed = self.prefixed(k);
+        let prev = if self.aof.is_some() { self.db.get(&prefixed)? } else { None };
+        self.db.put(&prefixed, v)?;
+        if let Some(aof) = &self.aof {
+            aof.record_put(
+                &self.namespace_label,
+                prefixed,
+                prev.map(|p| p.to_vec()),
+                v.to_vec(),
+            );
+        }
+        Ok(())
     }
 
     pub fn delete(&self, k: &[u8]) -> Result<(), RocksError> {
-        self.db.delete(self.prefixed(k))
+        let prefixed = self.prefixed(k);
+        let prev = if self.aof.is_some() { self.db.get(&prefixed)? } else { None };
+        self.db.delete(&prefixed)?;
+        if let Some(aof) = &self.aof {
+            aof.record_delete(&self.namespace_label, prefixed, prev.map(|p| p.to_vec()));
+        }
+        Ok(())
     }
 
     pub fn bulk_write<F>(&self, build: F) -> Result<(), RocksError>
@@ -149,11 +189,33 @@ impl Mdb {
         F: FnOnce(&mut MdbBatch<'_>),
     {
         let mut wb = WriteBatch::default();
+        let mut pending_ops: Vec<PendingChange> = Vec::new();
         {
-            let mut mb = MdbBatch { mdb: self, wb: &mut wb };
+            let mut mb = MdbBatch {
+                mdb: self,
+                wb: &mut wb,
+                pending_ops: self.aof.as_ref().map(|_| &mut pending_ops),
+            };
             build(&mut mb);
         }
-        self.db.write(wb)
+        let prev_map = if self.aof.is_some() && !pending_ops.is_empty() {
+            self.load_previous_values(&pending_ops)?
+        } else {
+            HashMap::new()
+        };
+
+        self.db.write(wb)?;
+
+        if let Some(aof) = &self.aof {
+            for op in pending_ops {
+                let prev = prev_map.get(&op.key).cloned().unwrap_or(None);
+                match op.value {
+                    Some(v) => aof.record_put(&self.namespace_label, op.key, prev, v),
+                    None => aof.record_delete(&self.namespace_label, op.key, prev),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Iterate forward over raw DB starting from namespaced key `start` (inclusive).
@@ -236,20 +298,67 @@ impl Mdb {
     pub fn prefix(&self) -> &[u8] {
         &self.prefix
     }
+
+    fn load_previous_values(
+        &self,
+        pending_ops: &[PendingChange],
+    ) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, RocksError> {
+        let mut unique: Vec<Vec<u8>> = Vec::new();
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+
+        for op in pending_ops {
+            if seen.insert(op.key.clone()) {
+                unique.push(op.key.clone());
+            }
+        }
+
+        let mut out = HashMap::new();
+        if unique.is_empty() {
+            return Ok(out);
+        }
+
+        let results = self.db.multi_get(unique.clone());
+        for (idx, res) in results.into_iter().enumerate() {
+            match res {
+                Ok(Some(slice)) => {
+                    out.insert(unique[idx].clone(), Some(slice.to_vec()));
+                }
+                Ok(None) => {
+                    out.insert(unique[idx].clone(), None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+}
+
+struct PendingChange {
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
 }
 
 pub struct MdbBatch<'a> {
     mdb: &'a Mdb,
     wb: &'a mut WriteBatch,
+    pending_ops: Option<&'a mut Vec<PendingChange>>,
 }
 
 impl<'a> MdbBatch<'a> {
     #[inline]
     pub fn put(&mut self, k: &[u8], v: &[u8]) {
-        self.wb.put(self.mdb.prefixed(k), v);
+        let key = self.mdb.prefixed(k);
+        if let Some(buf) = self.pending_ops.as_mut() {
+            buf.push(PendingChange { key: key.clone(), value: Some(v.to_vec()) });
+        }
+        self.wb.put(key, v);
     }
     #[inline]
     pub fn delete(&mut self, k: &[u8]) {
-        self.wb.delete(self.mdb.prefixed(k));
+        let key = self.mdb.prefixed(k);
+        if let Some(buf) = self.pending_ops.as_mut() {
+            buf.push(PendingChange { key: key.clone(), value: None });
+        }
+        self.wb.delete(key);
     }
 }

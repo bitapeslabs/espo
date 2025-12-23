@@ -1139,7 +1139,7 @@ pub fn get_holders_for_alkane(
     alk: SchemaAlkaneId,
     page: usize,
     limit: usize,
-) -> Result<(usize /*total*/, Vec<HolderEntry>)> {
+) -> Result<(usize /*total*/, u128 /*supply*/, Vec<HolderEntry>)> {
     let key = holders_key(&alk);
     let cur = mdb.get(&key)?;
     let mut all = match cur {
@@ -1151,12 +1151,13 @@ pub fn get_holders_for_alkane(
         o => o,
     });
     let total = all.len();
+    let supply: u128 = all.iter().map(|h| h.amount).sum();
     let p = page.max(1);
     let l = limit.max(1);
     let off = l.saturating_mul(p - 1);
     let end = (off + l).min(total);
     let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
-    Ok((total, slice))
+    Ok((total, supply, slice))
 }
 
 pub fn get_scriptpubkey_for_address(mdb: &Mdb, addr: &str) -> Result<Option<ScriptBuf>> {

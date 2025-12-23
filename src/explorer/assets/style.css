@@ -10,6 +10,7 @@
   --muted3: #818694;
   --text: #fff;
   --link: #949eff;
+  --link-dark: #625dff;
   --danger: #ff4141;
   --success: #33e183;
   --bg-success: #335c45;
@@ -198,9 +199,8 @@ a:hover {
   font-size: 16px;
 }
 .tx-conf-pill.pending {
-  background: rgba(253, 169, 72, 0.12);
-  border-color: rgba(253, 169, 72, 0.4);
-  color: #f6c58b;
+  background: rgba(255, 85, 85, 0.15);
+  color: #ff5555;
 }
 .tx-conf-pill.neutral {
   background: var(--panel);
@@ -394,6 +394,17 @@ a:hover {
   width: 100%;
   border-collapse: collapse;
 }
+
+.holders_table {
+  table-layout: fixed;
+}
+
+.alkanes-card {
+  margin-top: 20px;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--panel);
+}
 .table th,
 .table td {
   padding: 10px 10px;
@@ -405,6 +416,57 @@ a:hover {
 }
 .table tr:hover td {
   background: rgba(116, 121, 255, 0.05);
+}
+
+@media (max-width: 580px) {
+  .holders_table {
+    border-collapse: separate;
+    border-spacing: 0;
+    table-layout: fixed;
+  }
+
+  .table tr:hover td {
+    background: unset
+  }
+  .holders_table colgroup,
+  .holders_table thead {
+    display: none;
+  }
+  .holders_table tbody {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .holders_table tbody tr {
+    display: flex;
+    flex-direction: column;
+    background: var(--panel2);
+    border-radius: 6px;
+    padding: 12px;
+    gap: 8px;
+  }
+  .holders_table td {
+    display: block;
+    width: 100%;
+    padding: 0;
+  }
+  .holders_table td + td {
+    margin-top: 6px;
+  }
+  .holders_table td:first-child {
+    min-width: 0;
+  }
+}
+
+.ellipsis {
+  display: inline-block;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.alkane-name-link {
+  color: var(--link) !important;
 }
 .list {
   display: flex;
@@ -468,6 +530,22 @@ a:hover {
   background: var(--panel);
   border-radius: 8px;
   overflow: hidden;
+}
+.tx-pill-row {
+  padding: 0 12px 12px;
+}
+.tx-pill {
+  border-radius: 6px !important;
+  font-size: 15px;
+  font-weight: 500;
+}
+.tx-pill.success {
+  background: var(--bg-success);
+  color: var(--success);
+}
+.tx-pill.danger {
+  background: rgba(255, 85, 85, 0.15);
+  color: #ff5555;
 }
 .tx-title {
   padding: 12px;
@@ -589,14 +667,18 @@ a:hover {
   min-width: 0;
 }
 .addr-inline {
+  position: relative;
   display: flex;
-  align-items: baseline;
+  flex-direction: row;
   max-width: 100%;
   min-width: 0;
+  width: 100%;
   font-family: var(--sans);
+  white-space: nowrap;
+  overflow: hidden;
 }
 .addr-prefix {
-  flex: 1 1 auto;
+  display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -604,9 +686,30 @@ a:hover {
 }
 .addr-suffix {
   white-space: nowrap;
-  flex-shrink: 0;
   user-select: none;
+  flex-shrink: 0;
 }
+.addr-rank {
+  font-weight: 600;
+  color: var(--text);
+  margin-right: 6px;
+  pointer-events: none;
+  text-decoration: none !important;
+}
+.alkane-holders-card td:first-child {
+      min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.alkane-holders-card td:last-child {
+  width: 220px;
+}
+
+
+
+
 .io-amount {
   color: var(--muted3);
   font-size: 15px;
@@ -886,6 +989,158 @@ a:hover {
 }
 .alkane-hero .alk-icon-letter {
   font-size: 22px;
+}
+.alkane-page {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-top: 24px;
+}
+.alkane-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.section-title {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: 0.1px;
+}
+.alkane-hero-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 40px;
+}
+.alk-icon-lg {
+  width: 86px;
+  height: 86px;
+}
+.alk-icon-lg .alk-icon-letter {
+  font-size: 26px;
+}
+.alkane-hero-text {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.alkane-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: rgba(68, 190, 255, 0.12);
+  color: #7dd9ff;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  font-size: 13px;
+  text-transform: uppercase;
+  width: fit-content;
+}
+.alkane-hero-title {
+  margin: 0;
+  font-size: 30px;
+  line-height: 1.2;
+}
+.alkane-hero-id {
+    color: var(--muted2);
+    font-size: 15px;
+    font-weight: 700;
+    transform: translateY(-6px);
+}
+.alkane-overview-card {
+  border-radius: 8px;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+}
+.alkane-stat {
+  padding: 12px;
+  border-bottom: 1px solid var(--panel2);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.alkane-stat:last-child {
+  border-bottom: none;
+}
+.alkane-stat-line {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.alkane-stat-label {
+  color: var(--muted2);
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: 0.2px;
+}
+.alkane-stat-value {
+  font-weight: 600;
+  font-size: 15px;
+}
+.alkane-stat-sub {
+  color: var(--muted2);
+  font-size: 15px;
+  font-weight: 600;
+}
+.alkane-tabs {
+  background: var(--panel);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.alkane-tab-list {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--panel2);
+  flex-wrap: wrap;
+}
+.alkane-tab {
+  border-radius: 6px;
+  color: var(--muted2);
+  font-weight: 700;
+  padding: 8px 12px;
+  text-decoration: none;
+  border: 1px solid transparent;
+  background: transparent;
+  transition: 120ms ease;
+}
+.alkane-tab:hover {
+  text-decoration: none !important;
+  color: var(--text);
+}
+.alkane-tab.active {
+
+  color: var(--text);
+  background: var(--link-dark);
+}
+.alkane-tab-panel {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.alkane-tab-panel .pager {
+  margin-top: 12px;
+  margin-bottom: 0;
+}
+
+.alkane-panel-empty {
+  min-height: 140px;
+}
+@media (max-width: 720px) {
+  .alkane-hero-card {
+    align-items: flex-start;
+  }
+  .alkane-tab-list {
+    overflow-x: auto;
+  }
 }
 .trace-contract-name {
   display: flex;

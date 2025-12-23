@@ -1,5 +1,4 @@
 use bitcoin::Network;
-
 use crate::config::get_network;
 use crate::runtime::mdb::Mdb;
 

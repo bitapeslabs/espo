@@ -2,9 +2,7 @@ use maud::{Markup, PreEscaped, html};
 
 /// Carousel of blocks around the current height. Uses Embla (CDN) for smooth drag/scroll.
 pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
-    let Some(current_height) = current_height else {
-        return html! {};
-    };
+    let current_height = current_height.unwrap_or(espo_tip);
 
     let script = PreEscaped(format!(
         r#"

@@ -23,14 +23,82 @@ use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
 
 use crate::explorer::run_explorer;
+use bitcoincore_rpc::RpcApi;
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
-    config::{get_config, get_espo_db, init_config},
+    config::{
+        get_aof_manager, get_bitcoind_rpc_client, get_config, get_espo_db, init_config,
+        update_safe_tip,
+    },
     consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
+    runtime::aof::AOF_REORG_DEPTH,
     runtime::rpc::run_rpc,
+    runtime::mempool::{purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service},
 };
-use espo::ESPO_HEIGHT;
+pub use espo::{ESPO_HEIGHT, SAFE_TIP};
+use bitcoin::Txid;
+use tokio::runtime::Builder as TokioBuilder;
+
+fn should_watch_for_reorg(next_height: u32, safe_tip: u32) -> bool {
+    safe_tip.saturating_sub(next_height) <= AOF_REORG_DEPTH
+}
+
+fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
+    let Some(aof) = get_aof_manager() else { return None };
+    if !should_watch_for_reorg(next_height, safe_tip) {
+        return None;
+    }
+
+    let logs = match aof.recent_blocks(AOF_REORG_DEPTH as usize) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[aof] failed to load recent blocks: {e:?}");
+            return None;
+        }
+    };
+    if logs.is_empty() {
+        return None;
+    }
+
+    let rpc = get_bitcoind_rpc_client();
+    let mut mismatch = false;
+    for log in &logs {
+        match rpc.get_block_hash(log.height as u64) {
+            Ok(h) => {
+                if h.to_string() != log.block_hash {
+                    mismatch = true;
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("[aof] failed to fetch block hash for {}: {e:?}", log.height);
+                return None;
+            }
+        }
+    }
+
+    if !mismatch {
+        return None;
+    }
+
+    let revert_count = logs.len().min(AOF_REORG_DEPTH as usize);
+    eprintln!(
+        "[aof] detected reorg near height {} (safe tip {}); reverting {} blocks",
+        next_height, safe_tip, revert_count
+    );
+
+    if let Err(e) = aof.revert_last_blocks(revert_count) {
+        eprintln!("[aof] rollback failed: {e:?}");
+        return None;
+    }
+
+    if let Err(e) = reset_mempool_store() {
+        eprintln!("[mempool] failed to reset store after reorg: {e:?}");
+    }
+
+    Some(next_height.saturating_sub(revert_count as u32))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,8 +108,24 @@ async fn main() -> Result<()> {
     let cfg = get_config();
     let metashrew_sdb = get_metashrew_sdb();
 
+    if cfg.simulate_reorg {
+        match get_aof_manager() {
+            Some(aof) => match aof.revert_all_blocks() {
+                Ok(Some(h)) => {
+                    eprintln!("[aof] simulate-reorg: reverted through height {}, will reindex", h);
+                    if let Err(e) = reset_mempool_store() {
+                        eprintln!("[mempool] failed to reset store after simulated reorg: {e:?}");
+                    }
+                }
+                Ok(None) => eprintln!("[aof] simulate-reorg set but no AOF logs to revert"),
+                Err(e) => eprintln!("[aof] simulate-reorg failed: {e:?}"),
+            },
+            None => eprintln!("[aof] simulate-reorg set but AOF is disabled; nothing to revert"),
+        }
+    }
+
     // Build module registry with the global ESPO DB
-    let mut mods = ModuleRegistry::with_db(get_espo_db());
+    let mut mods = ModuleRegistry::with_db_and_aof(get_espo_db(), get_aof_manager());
     mods.register_module(AmmData::new());
     mods.register_module(Essentials::new());
     // mods.register_module(TracesData::new());
@@ -92,6 +176,15 @@ async fn main() -> Result<()> {
 
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     let mut last_tip: Option<u32> = None;
+    let mut mempool_started = false;
+    if cfg.reset_mempool_on_startup {
+        if let Err(e) = reset_mempool_store() {
+            eprintln!("[mempool] failed to reset store on startup: {e:?}");
+        }
+    }
+    if let Err(e) = purge_confirmed_from_chain() {
+        eprintln!("[mempool] failed to purge confirmed txs on startup: {e:?}");
+    }
 
     // ETA tracker
     let mut eta = EtaTracker::new(3.0); // EMA smoothing factor (tweak if you want faster/slower adaptation)
@@ -109,6 +202,7 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+        update_safe_tip(tip);
         if let Some(prev_tip) = last_tip {
             if tip > prev_tip {
                 if let Err(e) = metashrew_sdb.catch_up_now() {
@@ -154,6 +248,16 @@ async fn main() -> Result<()> {
             {
                 Ok(espo_block) => {
                     // (Optional) include hash or tx count here as you like
+                    let block_txids: Vec<Txid> = espo_block
+                        .transactions
+                        .iter()
+                        .map(|t| t.transaction.compute_txid())
+                        .collect();
+
+                    if let Some(aof) = get_aof_manager() {
+                        let block_hash = espo_block.block_header.block_hash();
+                        aof.start_block(next_height, &block_hash);
+                    }
 
                     for m in mods.modules() {
                         if next_height >= m.get_genesis_block(network) {
@@ -164,6 +268,30 @@ async fn main() -> Result<()> {
                                     next_height
                                 );
                             }
+                        }
+                    }
+
+                    match purge_confirmed_txids(&block_txids) {
+                        Ok(removed) => {
+                            if removed > 0 {
+                                eprintln!(
+                                    "[mempool] removed {} confirmed txs at height {}",
+                                    removed, next_height
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "[mempool] failed to purge confirmed txs at height {}: {e:?}",
+                            next_height
+                        ),
+                    }
+
+                    if let Some(aof) = get_aof_manager() {
+                        if let Err(e) = aof.finish_block() {
+                            eprintln!(
+                                "[aof] failed to persist block {} changes: {e:?}",
+                                next_height
+                            );
                         }
                     }
 
@@ -180,8 +308,35 @@ async fn main() -> Result<()> {
                 }
             }
         } else {
+            if let Some(new_next) = check_and_handle_reorg(next_height, tip) {
+                if new_next < next_height {
+                    next_height = new_next;
+                    if let Some(h) = ESPO_HEIGHT.get() {
+                        h.store(next_height, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    eprintln!("[aof] rollback complete, restarting from height {}", next_height);
+                }
+            }
             // Caught up; chill then poll again
             tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        if !mempool_started && next_height >= tip.saturating_sub(1) {
+            mempool_started = true;
+            let network_for_task = network;
+            std::thread::spawn(move || {
+                let rt = TokioBuilder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build mempool runtime");
+                if let Err(e) = rt.block_on(run_mempool_service(network_for_task)) {
+                    eprintln!("[mempool] service error: {e:?}");
+                }
+            });
+            eprintln!(
+                "[mempool] service started near safe tip (next_height={}, tip={})",
+                next_height, tip
+            );
         }
     }
 }

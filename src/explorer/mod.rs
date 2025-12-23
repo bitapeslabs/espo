@@ -10,6 +10,7 @@ use axum::Router;
 use axum::routing::get;
 use pages::address::address_page;
 use pages::alkane::alkane_page;
+use pages::alkanes::alkanes_page;
 use pages::block::block_page;
 use pages::home::home_page;
 use pages::search::search;
@@ -27,6 +28,7 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/tx/{txid}", get(tx_page))
         .route("/address/{address}", get(address_page))
         .route("/alkane/{alkane}", get(alkane_page))
+        .route("/alkanes", get(alkanes_page))
         .route("/api/blocks/carousel", get(carousel_blocks))
         .route("/static/style.css", get(style))
         .with_state(state)

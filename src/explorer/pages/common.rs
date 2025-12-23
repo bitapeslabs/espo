@@ -3,8 +3,16 @@ use bitcoin::Amount;
 pub const ALKANE_SCALE: u128 = 100_000_000;
 
 pub fn fmt_sats(sats: u64) -> String {
-    let btc = Amount::from_sat(sats).to_btc();
-    format!("{btc:.8} BTC")
+    const SATS_PER_BTC: u64 = 100_000_000;
+
+    let whole = sats / SATS_PER_BTC;
+    let frac = sats % SATS_PER_BTC;
+    if frac == 0 {
+        return format!("{whole} BTC");
+    }
+
+    let frac = trim_fraction(format!("{frac:08}"));
+    format!("{whole}.{frac} BTC")
 }
 
 pub fn fmt_amount(amount: Amount) -> String {
@@ -27,5 +35,14 @@ pub fn fmt_alkane_amount(raw: u128) -> String {
     if frac == 0 {
         return with_commas(whole);
     }
-    format!("{}.{}", with_commas(whole), format!("{frac:08}"))
+
+    let frac = trim_fraction(format!("{frac:08}"));
+    format!("{}.{}", with_commas(whole), frac)
+}
+
+fn trim_fraction(mut s: String) -> String {
+    while s.ends_with('0') {
+        s.pop();
+    }
+    s
 }

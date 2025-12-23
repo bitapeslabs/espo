@@ -22,11 +22,12 @@ use crate::explorer::components::header::{
 };
 use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::icon_arrow_up_right;
-use crate::explorer::components::tx_view::render_tx;
+use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::pages::state::ExplorerState;
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent,
 };
+use crate::runtime::mempool::pending_by_txid;
 
 fn format_with_commas(n: u64) -> String {
     let mut s = n.to_string();
@@ -107,22 +108,39 @@ pub async fn tx_page(
     };
 
     let electrum_like = get_electrum_like();
-    let raw = match electrum_like.transaction_get_raw(&txid) {
-        Ok(b) => b,
+    let mempool_entry = pending_by_txid(&txid);
+
+    let tx: Transaction = match electrum_like.transaction_get_raw(&txid) {
+        Ok(bytes) => match deserialize(&bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[tx_page] decode tx via electrum failed for {txid}: {e:?}");
+                match mempool_entry.as_ref() {
+                    Some(m) => {
+                        m.tx.clone()
+                    }
+                    None => {
+                        return layout(
+                            "Transaction",
+                            html! { p class="error" { (format!("Failed to decode tx: {e:?}")) } },
+                        );
+                    }
+                }
+            }
+        },
         Err(e) => {
-            return layout(
-                "Transaction",
-                html! { p class="error" { (format!("Failed to fetch raw tx: {e:?}")) } },
-            );
-        }
-    };
-    let tx: Transaction = match deserialize(&raw) {
-        Ok(t) => t,
-        Err(e) => {
-            return layout(
-                "Transaction",
-                html! { p class="error" { (format!("Failed to decode tx: {e:?}")) } },
-            );
+            eprintln!("[tx_page] electrum raw fetch failed for {txid}: {e:?}");
+            match mempool_entry.as_ref() {
+                Some(m) => {
+                    m.tx.clone()
+                }
+                None => {
+                    return layout(
+                        "Transaction",
+                        html! { p class="error" { (format!("Failed to fetch raw tx: {e:?}")) } },
+                    );
+                }
+            }
         }
     };
 
@@ -171,10 +189,15 @@ pub async fn tx_page(
         let raws = electrum_like.batch_transaction_get_raw(&prev_txids).unwrap_or_default();
         for (i, raw_prev) in raws.into_iter().enumerate() {
             if raw_prev.is_empty() {
+                if let Some(mempool_prev) = pending_by_txid(&prev_txids[i]) {
+                    prev_map.insert(prev_txids[i], mempool_prev.tx);
+                }
                 continue;
             }
             if let Ok(prev_tx) = deserialize::<Transaction>(&raw_prev) {
                 prev_map.insert(prev_txids[i], prev_tx);
+            } else if let Some(mempool_prev) = pending_by_txid(&prev_txids[i]) {
+                prev_map.insert(prev_txids[i], mempool_prev.tx);
             }
         }
     }
@@ -188,15 +211,16 @@ pub async fn tx_page(
     let (fee_sat, fee_rate) = fee_and_rate(&tx, &prev_map);
     let mempool_url = mempool_tx_url(state.network, &txid);
 
-    let traces_for_tx: Option<Vec<EspoTrace>> = tx_height
-        .and_then(|h| match fetch_traces_for_tx(h, &txid, &tx) {
+    let mempool_entry = pending_by_txid(&txid);
+    let traces_for_tx: Option<Vec<EspoTrace>> = if let Some(h) = tx_height {
+        match fetch_traces_for_tx(h, &txid, &tx) {
             Ok(v) if !v.is_empty() => Some(v),
-            Ok(_) => None,
+            Ok(_) => mempool_entry.as_ref().and_then(|m| m.traces.clone()),
             Err(e) => {
                 eprintln!("[tx_page] failed to fetch traces for {txid}: {e}");
-                None
+                mempool_entry.as_ref().and_then(|m| m.traces.clone())
             }
-        })
+        }
         .or_else(|| match fetch_traces_for_tx_noheight(&txid, &tx) {
             Ok(v) if !v.is_empty() => Some(v),
             Ok(_) => None,
@@ -204,8 +228,26 @@ pub async fn tx_page(
                 eprintln!("[tx_page] failed to fetch traces (noheight) for {txid}: {e}");
                 None
             }
-        });
+        })
+    } else {
+        mempool_entry
+            .as_ref()
+            .and_then(|m| m.traces.clone())
+            .or_else(|| match fetch_traces_for_tx_noheight(&txid, &tx) {
+                Ok(v) if !v.is_empty() => Some(v),
+                Ok(_) => None,
+                Err(e) => {
+                    eprintln!("[tx_page] failed to fetch traces (noheight) for {txid}: {e}");
+                    None
+                }
+            })
+    };
     let traces_ref: Option<&[EspoTrace]> = traces_for_tx.as_ref().map(|v| v.as_slice());
+    let tx_pill = if tx_height.is_none() {
+        Some(TxPill { label: "Unconfirmed".to_string(), tone: TxPillTone::Danger })
+    } else {
+        None
+    };
 
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
     summary_items.push(HeaderSummaryItem {
@@ -271,7 +313,7 @@ pub async fn tx_page(
                 }
             }
             h2 class="h2" { "Inputs & Outputs" }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, false))
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, false))
             (header_scripts())
         },
     )
