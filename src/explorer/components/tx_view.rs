@@ -305,12 +305,13 @@ fn kv_implementation_value(
         }
     }
     let mut meta = cache.get(alk).cloned().unwrap_or_default();
-    let implementation = mdb
-        .get(&kv_row_key(alk, KV_KEY_IMPLEMENTATION))
-        .ok()
-        .flatten()
-        .and_then(|raw| {
-            if raw.len() >= 32 { decode_kv_implementation(&raw[32..]) } else { decode_kv_implementation(&raw) }
+    let implementation =
+        mdb.get(&kv_row_key(alk, KV_KEY_IMPLEMENTATION)).ok().flatten().and_then(|raw| {
+            if raw.len() >= 32 {
+                decode_kv_implementation(&raw[32..])
+            } else {
+                decode_kv_implementation(&raw)
+            }
         });
     meta.implementation = Some(implementation);
     cache.insert(*alk, meta.clone());
@@ -476,7 +477,7 @@ fn summarize_contract_call(
             }
             EspoSandshrewLikeTraceEvent::Create(c) => {
                 if created_alkane.is_none() {
-                    created_alkane = parse_short_id_to_schema(&c.new_alkane);
+                    created_alkane = parse_short_id_to_schema(&c);
                 }
             }
         }
@@ -484,8 +485,13 @@ fn summarize_contract_call(
 
     let contract_id = contract_id?;
     let contract_inspection = lookup_inspection(&contract_id, cache, mdb).cloned();
-    let proxy_template =
-        upgradeable_proxy_target(&contract_id, contract_inspection.as_ref(), trace, impl_cache, mdb);
+    let proxy_template = upgradeable_proxy_target(
+        &contract_id,
+        contract_inspection.as_ref(),
+        trace,
+        impl_cache,
+        mdb,
+    );
     let (active_id, active_inspection, using_proxy_template) = match proxy_template {
         Some(target) => {
             let insp = lookup_inspection(&target, cache, mdb).cloned();

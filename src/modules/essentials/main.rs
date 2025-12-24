@@ -8,7 +8,7 @@ use crate::modules::essentials::storage::{
     encode_creation_record, load_creation_record, trace_count_key,
 };
 use crate::modules::essentials::utils::inspections::{
-    created_alkane_records_from_block, inspect_wasm_metadata, AlkaneCreationRecord,
+    AlkaneCreationRecord, created_alkane_records_from_block, inspect_wasm_metadata,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::SchemaAlkaneId;
@@ -154,8 +154,7 @@ impl EspoModule for Essentials {
         let mut creation_rows_by_id: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut creation_rows_ordered: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         // in-block name/symbol updates detected from storage writes
-        let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> =
-            HashMap::new();
+        let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> = HashMap::new();
         // trace count row
         let trace_count = block
             .transactions
@@ -193,22 +192,23 @@ impl EspoModule for Essentials {
                     dir_rows.insert(k_dir);
 
                     // Track name/symbol updates for the alkane (append if new)
-                    let push_if_new = |map: &mut HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)>,
-                                           alk: SchemaAlkaneId,
-                                           name: Option<String>,
-                                           symbol: Option<String>| {
-                        let entry = map.entry(alk).or_default();
-                        if let Some(n) = name {
-                            if !entry.0.iter().any(|v| v == &n) {
-                                entry.0.push(n);
+                    let push_if_new =
+                        |map: &mut HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)>,
+                         alk: SchemaAlkaneId,
+                         name: Option<String>,
+                         symbol: Option<String>| {
+                            let entry = map.entry(alk).or_default();
+                            if let Some(n) = name {
+                                if !entry.0.iter().any(|v| v == &n) {
+                                    entry.0.push(n);
+                                }
                             }
-                        }
-                        if let Some(s) = symbol {
-                            if !entry.1.iter().any(|v| v == &s) {
-                                entry.1.push(s);
+                            if let Some(s) = symbol {
+                                if !entry.1.iter().any(|v| v == &s) {
+                                    entry.1.push(s);
+                                }
                             }
-                        }
-                    };
+                        };
                     if skey.as_slice() == b"/name" {
                         if let Ok(name) = String::from_utf8(value.clone()) {
                             push_if_new(&mut meta_updates, *alk, Some(name), None);
@@ -454,6 +454,7 @@ impl EspoModule for Essentials {
             || !dir_rows.is_empty()
             || !creation_rows_by_id.is_empty()
             || !creation_rows_ordered.is_empty()
+            || trace_count > 0
         {
             // -------- Phase B: write in sorted key order (better LSM locality) --------
             let mut kv_keys: Vec<Vec<u8>> = kv_rows.keys().cloned().collect();

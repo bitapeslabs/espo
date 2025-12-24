@@ -91,7 +91,7 @@ pub fn extract_new_pools_from_espo_transaction(
         for ev in &trace.sandshrew_trace.events {
             if let EspoSandshrewLikeTraceEvent::Create(c) = ev {
                 // keep as hex-strings for quick comparison with call-stack ids
-                created_ids.insert((c.new_alkane.block.clone(), c.new_alkane.tx.clone()));
+                created_ids.insert((c.block.clone(), c.tx.clone()));
             }
         }
     }

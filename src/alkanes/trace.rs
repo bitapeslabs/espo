@@ -5,13 +5,12 @@ use crate::config::{
 use crate::core::blockfetcher::BlockSource;
 use crate::schemas::EspoOutpoint;
 use crate::schemas::SchemaAlkaneId;
+use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use alkanes_support::proto::alkanes;
-use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result};
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
-
 // use bitcoincore_rpc::RpcApi; // REMOVED: block fetch now via BlockSource
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,7 +32,7 @@ pub enum EspoSandshrewLikeTraceEvent {
     Return(EspoSandshrewLikeTraceReturnData),
 
     #[serde(rename = "create")]
-    Create(EspoSandshrewLikeTraceCreateData),
+    Create(EspoSandshrewLikeTraceShortId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +71,7 @@ pub struct EspoSandshrewLikeTraceReturnData {
     pub response: EspoSandshrewLikeTraceReturnResponse,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EspoSandshrewLikeTraceStatus {
     Success,
@@ -90,12 +89,6 @@ pub struct EspoSandshrewLikeTraceReturnResponse {
 pub struct EspoSandshrewLikeTraceStorageKV {
     pub key: String,
     pub value: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EspoSandshrewLikeTraceCreateData {
-    #[serde(rename = "newAlkane")]
-    pub new_alkane: EspoSandshrewLikeTraceShortId,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +174,8 @@ pub fn extract_alkane_storage(
                     }
                 }
                 Event::CreateAlkane(_create) => {}
+                Event::ReceiveIntent(_) => {}
+                Event::ValueTransfer(_) => {}
             }
         }
     }
@@ -331,7 +326,7 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                 }
 
                 Event::CreateAlkane(create) => {
-                    let id = create.new_alkane.as_ref();
+                    let id: Option<&alkanes::AlkaneId> = create.new_alkane.as_ref();
                     let block_hex = id
                         .and_then(|x| x.block.as_ref())
                         .map(fmt_u128_hex)
@@ -342,11 +337,12 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                         .unwrap_or_else(|| "0x0".to_string());
                     out.push(json!({
                         "event": "create",
-                        "data": {
-                            "newAlkane": { "block": block_hex, "tx": tx_hex }
-                        }
+                        "data": { "block": block_hex, "tx": tx_hex }
                     }));
                 }
+
+                Event::ReceiveIntent(_) => {}
+                Event::ValueTransfer(_) => {}
             }
         }
     }

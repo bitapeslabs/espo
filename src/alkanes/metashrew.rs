@@ -1,19 +1,25 @@
 use crate::alkanes::trace::PartialEspoTrace;
 use crate::config::get_metashrew_sdb;
 use crate::schemas::SchemaAlkaneId;
+use alkanes_cli_common::alkanes_pb::{AlkanesTrace, AlkanesTraceEvent};
 use alkanes_support::gz;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
-use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result, anyhow};
 use bitcoin::Txid;
 use bitcoin::hashes::Hash;
 use prost::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-fn try_decode_prost(raw: &[u8]) -> Option<AlkanesTrace> {
+fn try_decode_trace_prost(raw: &[u8]) -> Option<AlkanesTrace> {
     AlkanesTrace::decode(raw).ok().or_else(|| {
         if raw.len() >= 4 { AlkanesTrace::decode(&raw[..raw.len() - 4]).ok() } else { None }
+    })
+}
+
+fn try_decode_trace_event_prost(raw: &[u8]) -> Option<AlkanesTraceEvent> {
+    AlkanesTraceEvent::decode(raw).ok().or_else(|| {
+        if raw.len() >= 4 { AlkanesTraceEvent::decode(&raw[..raw.len() - 4]).ok() } else { None }
     })
 }
 
@@ -24,14 +30,28 @@ pub fn decode_trace_blob(bytes: &[u8]) -> Option<AlkanesTrace> {
     if let Ok(s) = std::str::from_utf8(bytes) {
         if let Some((_block, hex_part)) = s.split_once(':') {
             if let Ok(decoded) = hex::decode(hex_part) {
-                if let Some(trace) = try_decode_prost(&decoded) {
+                if let Some(trace) = try_decode_trace_prost(&decoded) {
                     return Some(trace);
                 }
             }
         }
     }
 
-    try_decode_prost(bytes)
+    try_decode_trace_prost(bytes)
+}
+
+pub fn decode_trace_event_blob(bytes: &[u8]) -> Option<AlkanesTraceEvent> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if let Some((_block, hex_part)) = s.split_once(':') {
+            if let Ok(decoded) = hex::decode(hex_part) {
+                if let Some(event) = try_decode_trace_event_prost(&decoded) {
+                    return Some(event);
+                }
+            }
+        }
+    }
+
+    try_decode_trace_event_prost(bytes)
 }
 
 pub struct MetashrewAdapter {
@@ -62,7 +82,11 @@ impl FromLeBytes<16> for u128 {
 
 impl MetashrewAdapter {
     pub fn new(label: Option<String>) -> MetashrewAdapter {
-        MetashrewAdapter { label }
+        let norm_label = label.and_then(|s| {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        });
+        MetashrewAdapter { label: norm_label }
     }
 
     fn next_prefix(&self, mut p: Vec<u8>) -> Option<Vec<u8>> {
@@ -230,6 +254,7 @@ impl MetashrewAdapter {
         self.read_uint_key::<4, u32>(tip_height_prefix)
     }
 
+
     /// Fetch all traces for a txid directly from the secondary DB, without needing block height.
     pub fn traces_for_tx(&self, txid: &Txid) -> Result<Vec<PartialEspoTrace>> {
         let db = get_metashrew_sdb();
@@ -239,7 +264,34 @@ impl MetashrewAdapter {
         let mut tx_le = tx_be.clone();
         tx_le.reverse();
 
-        let mut out: Vec<PartialEspoTrace> = Vec::new();
+        // Metashrew stores individual events at /trace/<tx_le><vout_le>/<idx>,
+        // so we assemble per-trace event lists here.
+        let mut traces_by_outpoint: HashMap<
+            Vec<u8>,
+            BTreeMap<u64, BTreeMap<u64, AlkanesTraceEvent>>,
+        > = HashMap::new();
+
+        let parse_index = |bytes: &[u8]| -> Option<u64> {
+            if let Ok(s) = std::str::from_utf8(bytes) {
+                if let Ok(v) = s.parse::<u64>() {
+                    return Some(v);
+                }
+            }
+
+            match bytes.len() {
+                4 => {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(bytes);
+                    Some(u32::from_le_bytes(arr) as u64)
+                }
+                8 => {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(bytes);
+                    Some(u64::from_le_bytes(arr))
+                }
+                _ => None,
+            }
+        };
 
         for search_bytes in [&tx_be, &tx_le] {
             let mut prefix = b"/trace/".to_vec();
@@ -263,13 +315,64 @@ impl MetashrewAdapter {
                     continue;
                 }
 
+                let remainder = &suffix[5..];
+                if remainder.is_empty() {
+                    continue;
+                }
+
+                let segments: Vec<&[u8]> = remainder.split(|b| *b == b'/').collect();
+                if segments.is_empty() || segments.iter().any(|s| *s == b"length") {
+                    continue;
+                }
+
+                let (trace_idx_bytes, event_idx_bytes) = if segments.len() >= 2 {
+                    (segments[0], segments[1])
+                } else {
+                    (&b"0"[..], segments[0])
+                };
+
+                let event_idx = match parse_index(event_idx_bytes) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                let trace_idx = parse_index(trace_idx_bytes).unwrap_or(0);
+
                 let vout_le: [u8; 4] = suffix[..4].try_into().unwrap_or_default();
                 let mut outpoint: Vec<u8> = tx_le.clone();
                 outpoint.extend_from_slice(&vout_le);
 
-                if let Some(protobuf_trace) = decode_trace_blob(&v) {
-                    out.push(PartialEspoTrace { protobuf_trace, outpoint });
+                if let Some(event) = decode_trace_event_blob(&v) {
+                    let trace_map =
+                        traces_by_outpoint.entry(outpoint.clone()).or_insert_with(BTreeMap::new);
+                    let events = trace_map.entry(trace_idx).or_insert_with(BTreeMap::new);
+                    events.entry(event_idx).or_insert(event);
+                    continue;
                 }
+
+                if let Some(trace) = decode_trace_blob(&v) {
+                    let trace_map =
+                        traces_by_outpoint.entry(outpoint).or_insert_with(BTreeMap::new);
+                    let events = trace_map.entry(trace_idx).or_insert_with(BTreeMap::new);
+                    for (idx, ev) in trace.events.into_iter().enumerate() {
+                        events.entry(idx as u64).or_insert(ev);
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<PartialEspoTrace> = Vec::new();
+        for (outpoint, trace_map) in traces_by_outpoint {
+            for (_trace_idx, events_map) in trace_map {
+                let events: Vec<AlkanesTraceEvent> =
+                    events_map.into_iter().map(|(_, ev)| ev).collect();
+                if events.is_empty() {
+                    continue;
+                }
+
+                out.push(PartialEspoTrace {
+                    protobuf_trace: AlkanesTrace { events },
+                    outpoint: outpoint.clone(),
+                });
             }
         }
 

@@ -8,8 +8,8 @@ use bitcoincore_rpc::RpcApi;
 use maud::html;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, PartialEspoTrace,
@@ -26,10 +26,10 @@ use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::fmt_sats;
 use crate::explorer::pages::state::ExplorerState;
+use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_balances_with_spent,
 };
-use crate::modules::essentials::storage::BalanceEntry;
 use crate::runtime::mempool::{MempoolEntry, pending_by_txid, pending_for_address};
 use crate::utils::electrum_like::{AddressHistoryEntry, ElectrumLikeBackend};
 
@@ -194,9 +194,7 @@ pub async fn address_page(
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
         .collect();
     balance_entries.sort_by(|a, b| {
-        a.alkane.block
-            .cmp(&b.alkane.block)
-            .then_with(|| a.alkane.tx.cmp(&b.alkane.tx))
+        a.alkane.block.cmp(&b.alkane.block).then_with(|| a.alkane.tx.cmp(&b.alkane.tx))
     });
 
     let chain_tip = get_bitcoind_rpc_client().get_blockchain_info().ok().map(|i| i.blocks as u64);
@@ -243,7 +241,7 @@ pub async fn address_page(
         let mut scan_offset: usize = 0;
         let mut has_more = true;
         let target_for_count = remaining_slots.max(1);
-        let page_fetch_limit = limit.saturating_mul(2).max(limit);
+        let page_fetch_limit = limit.saturating_mul(5).max(limit);
         let mut confirmed_seen: usize = 0;
 
         while has_more && collected.len() < target_for_count {
@@ -297,7 +295,8 @@ pub async fn address_page(
             has_more = hist_page.has_more;
         }
 
-        let renderable: Vec<AddressHistoryEntry> = collected.into_iter().take(remaining_slots).collect();
+        let renderable: Vec<AddressHistoryEntry> =
+            collected.into_iter().take(remaining_slots).collect();
         let txids: Vec<Txid> = renderable.iter().map(|h| h.txid).collect();
         let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
 
@@ -334,8 +333,7 @@ pub async fn address_page(
             });
         }
 
-        let confirmed_total_est =
-            confirmed_offset + confirmed_seen + if has_more { 1 } else { 0 };
+        let confirmed_total_est = confirmed_offset + confirmed_seen + if has_more { 1 } else { 0 };
         tx_total = pending_total + confirmed_total_est;
         tx_has_next = (off + tx_renders.len()) < tx_total;
     } else {
@@ -348,8 +346,7 @@ pub async fn address_page(
                     .filter(|e| !pending_set.contains(&e.txid))
                     .collect();
                 let total_raw = hist_page.total.unwrap_or(confirmed_offset + entries.len());
-                let confirmed_total =
-                    total_raw.saturating_sub(pending_total).max(entries.len());
+                let confirmed_total = total_raw.saturating_sub(pending_total).max(entries.len());
                 let txids: Vec<Txid> =
                     entries.iter().take(remaining_slots).map(|h| h.txid).collect();
                 let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();

@@ -9,6 +9,5 @@ cargo run --release -- \
   --block-source-mode rpc \
   --metashrew-rpc-url http://127.0.0.1:7044 \
   --explorer-host 0.0.0.0:5779 \
-  --reset-mempool-on-startup \
-  --enable-aof  \
-  --aof-db-path ./db/aof \
+  --reset-mempool-on-startup  \
+  --enable-aof

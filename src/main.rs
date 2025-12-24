@@ -254,7 +254,10 @@ async fn main() -> Result<()> {
                         .map(|t| t.transaction.compute_txid())
                         .collect();
 
-                    if let Some(aof) = get_aof_manager() {
+                    // Only capture AOF changes when we're near the safe tip; skip during deep catch-up.
+                    let aof_for_block =
+                        get_aof_manager().filter(|_| should_watch_for_reorg(next_height, tip));
+                    if let Some(aof) = &aof_for_block {
                         let block_hash = espo_block.block_header.block_hash();
                         aof.start_block(next_height, &block_hash);
                     }
@@ -286,7 +289,7 @@ async fn main() -> Result<()> {
                         ),
                     }
 
-                    if let Some(aof) = get_aof_manager() {
+                    if let Some(aof) = &aof_for_block {
                         if let Err(e) = aof.finish_block() {
                             eprintln!(
                                 "[aof] failed to persist block {} changes: {e:?}",

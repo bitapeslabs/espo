@@ -4,6 +4,7 @@ use maud::{Markup, html};
 use serde::Deserialize;
 use hex;
 
+use crate::explorer::components::alk_balances::render_alkane_balance_cards;
 use crate::explorer::components::header::header_scripts;
 use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::{
@@ -15,8 +16,8 @@ use crate::explorer::components::tx_view::{
 };
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
-use crate::modules::essentials::storage::load_creation_record;
-use crate::modules::essentials::utils::balances::get_holders_for_alkane;
+use crate::modules::essentials::storage::{BalanceEntry, HolderId, load_creation_record};
+use crate::modules::essentials::utils::balances::{get_alkane_balances, get_holders_for_alkane};
 
 const ADDR_SUFFIX_LEN: usize = 8;
 
@@ -74,6 +75,18 @@ pub async fn alkane_page(
     let creation_height = creation_record.as_ref().map(|r| r.creation_height);
     let creation_txid = creation_record.as_ref().map(|r| hex::encode(r.txid));
 
+    let balances_map = get_alkane_balances(&state.essentials_mdb, &alk).unwrap_or_default();
+    let mut balance_entries: Vec<BalanceEntry> = balances_map
+        .into_iter()
+        .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
+        .collect();
+    balance_entries.sort_by(|a, b| {
+        a.alkane
+            .block
+            .cmp(&b.alkane.block)
+            .then_with(|| a.alkane.tx.cmp(&b.alkane.tx))
+    });
+
     let (total, circulating_supply, holders) =
         get_holders_for_alkane(&state.essentials_mdb, alk, page, limit)
             .unwrap_or((0, 0, Vec::new()));
@@ -93,15 +106,37 @@ pub async fn alkane_page(
         .enumerate()
         .map(|(idx, h)| {
             let rank = off + idx + 1;
-            let (addr_prefix, addr_suffix) = addr_prefix_suffix(&h.address);
-            vec![
-                html! {
-                    a class="link mono addr-inline" href=(format!("/address/{}", h.address)) {
-                        span class="addr-rank" { (format!("{rank}.")) }
-                        span class="addr-prefix" { (addr_prefix) }
-                        span class="addr-suffix" { (addr_suffix) }
+            let holder_cell = match h.holder {
+                HolderId::Address(addr) => {
+                    let (addr_prefix, addr_suffix) = addr_prefix_suffix(&addr);
+                    html! {
+                        a class="link mono addr-inline" href=(format!("/address/{}", addr)) {
+                            span class="addr-rank" { (format!("{rank}.")) }
+                            span class="addr-prefix" { (addr_prefix) }
+                            span class="addr-suffix" { (addr_suffix) }
+                        }
                     }
-                },
+                }
+                HolderId::Alkane(id) => {
+                    let id_str = format!("{}:{}", id.block, id.tx);
+                    let h_meta = alkane_meta(&id, &mut kv_cache, &state.essentials_mdb);
+                    let h_fallback_letter = h_meta.name.fallback_letter();
+                    let h_fallback_icon_url = alkane_icon_fallback_url(&id);
+                    html! {
+                        a class="link mono addr-inline" href=(format!("/alkane/{id_str}")) {
+                            span class="addr-rank" { (format!("{rank}.")) }
+                            div class="alk-icon-wrap" aria-hidden="true" {
+                                img class="alk-icon-img" src=(h_meta.icon_url.clone()) alt=(h_meta.symbol.clone()) loading="lazy" onerror=(icon_onerror(&h_fallback_icon_url)) {}
+                                span class="alk-icon-letter" { (h_fallback_letter) }
+                            }
+                            span class="addr-prefix" { (h_meta.name.value.clone()) }
+                            span class="addr-suffix mono" { (format!(" ({id_str})")) }
+                        }
+                    }
+                }
+            };
+            vec![
+                holder_cell,
                 html! {
                     div class="alk-line" {
                         div class="alk-icon-wrap" aria-hidden="true" {
@@ -121,9 +156,15 @@ pub async fn alkane_page(
     } else {
         html! {
             div class="alkane-panel alkane-holders-card" {
-                (holders_table(&["Address", "Balance"], rows))
+                (holders_table(&["Holder", "Balance"], rows))
             }
         }
+    };
+
+    let balances_markup = if balance_entries.is_empty() {
+        html! { p class="muted" { "No alkanes tracked for this alkane." } }
+    } else {
+        render_alkane_balance_cards(&balance_entries, &state.essentials_mdb)
     };
 
     layout(
@@ -202,6 +243,11 @@ pub async fn alkane_page(
                             }
                         }
                     }
+                }
+
+                section class="alkane-section" {
+                    h2 class="section-title" { "Alkane Balances" }
+                    (balances_markup)
                 }
 
                 section class="alkane-section" {

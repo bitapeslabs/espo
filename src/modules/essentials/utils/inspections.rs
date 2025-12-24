@@ -8,8 +8,8 @@ use alkanes_cli_common::alkanes::inspector::types::{AlkaneMetadata, AlkaneMethod
 use alkanes_cli_common::alkanes::inspector::{AlkaneInspector, InspectionConfig, InspectionResult};
 use alkanes_cli_common::alkanes::types::AlkaneId as CliAlkaneId;
 use anyhow::{Context, Result, anyhow};
-use borsh::{BorshDeserialize, BorshSerialize};
 use bitcoin::hashes::Hash;
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::future::Future;
@@ -192,7 +192,7 @@ pub fn created_alkane_records_from_block(block: &EspoBlock) -> Vec<AlkaneCreatio
             }
             for ev in trace.sandshrew_trace.events.iter() {
                 if let EspoSandshrewLikeTraceEvent::Create(create) = ev {
-                    if let Some(id) = parse_short_id(&create.new_alkane) {
+                    if let Some(id) = parse_short_id(&create) {
                         if seen.insert(id) {
                             out.push(AlkaneCreationRecord {
                                 alkane: id,

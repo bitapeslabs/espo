@@ -5,10 +5,17 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use anyhow::Result;
 
-/// Entry in holders index (address string + amount for one alkane)
+/// Identifier for a holder: either a Bitcoin address or another Alkane.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, BorshSerialize, BorshDeserialize)]
+pub enum HolderId {
+    Address(String),
+    Alkane(SchemaAlkaneId),
+}
+
+/// Entry in holders index (holder id + amount for one alkane)
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct HolderEntry {
-    pub address: String,
+    pub holder: HolderId,
     pub amount: u128,
 }
 
@@ -59,6 +66,33 @@ pub fn holders_count_key(alkane: &SchemaAlkaneId) -> Vec<u8> {
     let mut key = b"/holders/count/".to_vec();
     key.extend_from_slice(&alkane.block.to_be_bytes());
     key.extend_from_slice(&alkane.tx.to_be_bytes());
+    key
+}
+
+// /alkane_balance_txs/{alkane block:u32be}{tx:u64be}
+pub fn alkane_balance_txs_key(alkane: &SchemaAlkaneId) -> Vec<u8> {
+    let mut key = b"/alkane_balance_txs/".to_vec();
+    key.extend_from_slice(&alkane.block.to_be_bytes());
+    key.extend_from_slice(&alkane.tx.to_be_bytes());
+    key
+}
+
+// /alkane_balance_txs_by_token/{owner block:u32be}{owner tx:u64be}/{token block:u32be}{token tx:u64be}
+pub fn alkane_balance_txs_by_token_key(owner: &SchemaAlkaneId, token: &SchemaAlkaneId) -> Vec<u8> {
+    let mut key = b"/alkane_balance_txs_by_token/".to_vec();
+    key.extend_from_slice(&owner.block.to_be_bytes());
+    key.extend_from_slice(&owner.tx.to_be_bytes());
+    key.push(b'/');
+    key.extend_from_slice(&token.block.to_be_bytes());
+    key.extend_from_slice(&token.tx.to_be_bytes());
+    key
+}
+
+// /alkane_balances/{owner block:u32be}{tx:u64be}
+pub fn alkane_balances_key(owner: &SchemaAlkaneId) -> Vec<u8> {
+    let mut key = b"/alkane_balances/".to_vec();
+    key.extend_from_slice(&owner.block.to_be_bytes());
+    key.extend_from_slice(&owner.tx.to_be_bytes());
     key
 }
 // /alkane_info/{alkane block:u32be}{tx:u64be}
@@ -158,7 +192,21 @@ pub fn decode_balances_vec(bytes: &[u8]) -> Result<Vec<BalanceEntry>> {
 }
 
 pub fn decode_holders_vec(bytes: &[u8]) -> Result<Vec<HolderEntry>> {
-    Ok(Vec::<HolderEntry>::try_from_slice(bytes)?)
+    if let Ok(parsed) = Vec::<HolderEntry>::try_from_slice(bytes) {
+        return Ok(parsed);
+    }
+
+    #[derive(BorshDeserialize)]
+    struct LegacyHolderEntry {
+        address: String,
+        amount: u128,
+    }
+
+    let legacy: Vec<LegacyHolderEntry> = Vec::<LegacyHolderEntry>::try_from_slice(bytes)?;
+    Ok(legacy
+        .into_iter()
+        .map(|h| HolderEntry { holder: HolderId::Address(h.address), amount: h.amount })
+        .collect())
 }
 
 pub fn encode_alkane_info(info: &AlkaneInfo) -> Result<Vec<u8>> {

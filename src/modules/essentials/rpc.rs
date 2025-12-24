@@ -3,9 +3,9 @@ use crate::config::{get_metashrew, get_network};
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::main::Essentials;
 use crate::modules::essentials::storage::{
-    HoldersCountEntry, alkane_creation_ordered_prefix, decode_creation_record,
-    holders_count_key, load_creation_record, outpoint_addr_key, outpoint_balances_prefix,
-    trace_count_key,
+    HolderId, HoldersCountEntry, alkane_balance_txs_by_token_key, alkane_balance_txs_key,
+    alkane_creation_ordered_prefix, decode_creation_record, holders_count_key, load_creation_record,
+    outpoint_addr_key, outpoint_balances_prefix, trace_count_key,
 };
 use crate::runtime::mempool::{
     MempoolEntry, decode_seen_key, get_mempool_mdb, get_tx_from_mempool, pending_for_address,
@@ -22,13 +22,13 @@ use borsh::BorshDeserialize;
 // <-- use the public helpers & types from balances.rs
 use super::storage::BalanceEntry;
 use super::utils::balances::{
-    get_balance_for_address, get_holders_for_alkane,
+    get_alkane_balances, get_balance_for_address, get_holders_for_alkane,
     get_outpoint_balances as get_outpoint_balances_index,
 };
 use super::utils::inspections::inspection_to_json;
 use crate::modules::essentials::storage::alkane_creation_count_key;
 
-use bitcoin::Address;
+use bitcoin::{Address, Txid};
 use bitcoin::hashes::Hash;
 use hex;
 use std::str::FromStr;
@@ -461,13 +461,16 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             }
                         };
 
-                        let holder_count = mdb
-                            .get(&holders_count_key(&alk))
-                            .ok()
-                            .flatten()
-                            .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
-                            .map(|hc| hc.count)
-                            .unwrap_or(0);
+                        let holder_count = get_holders_for_alkane(&mdb, alk, 1, 1)
+                            .map(|(total, _, _)| total as u64)
+                            .unwrap_or_else(|_| {
+                                mdb.get(&holders_count_key(&alk))
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
+                                    .map(|hc| hc.count)
+                                    .unwrap_or(0)
+                            });
                         let inspection_json =
                             record.inspection.as_ref().map(|r| inspection_to_json(r));
                         let name = record.names.first().cloned();
@@ -578,7 +581,18 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
 
                         let items: Vec<Value> = slice
                             .into_iter()
-                            .map(|h| json!({"address": h.address, "amount": h.amount.to_string()}))
+                            .map(|h| match h.holder {
+                                HolderId::Address(addr) => json!({
+                                    "type": "address",
+                                    "address": addr,
+                                    "amount": h.amount.to_string()
+                                }),
+                                HolderId::Alkane(id) => json!({
+                                    "type": "alkane",
+                                    "alkane": format!("{}:{}", id.block, id.tx),
+                                    "amount": h.amount.to_string()
+                                }),
+                            })
                             .collect();
 
                         json!({
@@ -703,6 +717,280 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                         }
 
                         resp
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- NEW: get_alkane_balances -------- */
+    {
+        let reg_alk_bal = reg.clone();
+        let mdb_alk_bal = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_alk_bal
+                .register("get_alkane_balances", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_alk_bal);
+                    async move {
+                        let alk = match payload
+                            .get("alkane")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_alkane_balances", "missing_or_invalid_alkane");
+                                return json!({"ok": false, "error": "missing_or_invalid_alkane"});
+                            }
+                        };
+
+                        log_rpc(
+                            "get_alkane_balances",
+                            &format!("alkane={}:{}", alk.block, alk.tx),
+                        );
+
+                        let agg = match get_alkane_balances(&mdb, &alk) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                log_rpc(
+                                    "get_alkane_balances",
+                                    &format!("get_alkane_balances failed: {e:?}"),
+                                );
+                                return json!({"ok": false, "error": "internal_error"});
+                            }
+                        };
+
+                        let mut balances: Map<String, Value> = Map::new();
+                        for (id, amt) in agg {
+                            balances.insert(
+                                format!("{}:{}", id.block, id.tx),
+                                Value::String(amt.to_string()),
+                            );
+                        }
+
+                        json!({
+                            "ok": true,
+                            "alkane": format!("{}:{}", alk.block, alk.tx),
+                            "balances": Value::Object(balances),
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- NEW: get_alkane_balance_metashrew -------- */
+    {
+        let reg_live_bal = reg.clone();
+        tokio::spawn(async move {
+            reg_live_bal
+                .register("get_alkane_balance_metashrew", move |_cx, payload| async move {
+                    let owner = match payload
+                        .get("owner")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_alkane_from_str)
+                    {
+                        Some(a) => a,
+                        None => {
+                            log_rpc("get_alkane_balance_metashrew", "missing_or_invalid_owner");
+                            return json!({"ok": false, "error": "missing_or_invalid_owner"});
+                        }
+                    };
+
+                    let target = match payload
+                        .get("alkane")
+                        .or_else(|| payload.get("target"))
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_alkane_from_str)
+                    {
+                        Some(a) => a,
+                        None => {
+                            log_rpc("get_alkane_balance_metashrew", "missing_or_invalid_target");
+                            return json!({"ok": false, "error": "missing_or_invalid_target"});
+                        }
+                    };
+
+                    log_rpc(
+                        "get_alkane_balance_metashrew",
+                        &format!("owner={}:{} target={}:{}", owner.block, owner.tx, target.block, target.tx),
+                    );
+
+                    match get_metashrew().get_latest_reserves_for_alkane(&owner, &target) {
+                        Ok(Some(bal)) => json!({
+                            "ok": true,
+                            "owner": format!("{}:{}", owner.block, owner.tx),
+                            "alkane": format!("{}:{}", target.block, target.tx),
+                            "balance": bal.to_string(),
+                        }),
+                        Ok(None) => json!({
+                            "ok": true,
+                            "owner": format!("{}:{}", owner.block, owner.tx),
+                            "alkane": format!("{}:{}", target.block, target.tx),
+                            "balance": "0",
+                        }),
+                        Err(e) => {
+                            log_rpc(
+                                "get_alkane_balance_metashrew",
+                                &format!("metashrew fetch failed: {e:?}"),
+                            );
+                            json!({"ok": false, "error": "metashrew_error"})
+                        }
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- NEW: get_alkane_balance_txs -------- */
+    {
+        let reg_bal_txs = reg.clone();
+        let mdb_bal_txs = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_bal_txs
+                .register("get_alkane_balance_txs", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_bal_txs);
+                    async move {
+                        let alk = match payload
+                            .get("alkane")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_alkane_balance_txs", "missing_or_invalid_alkane");
+                                return json!({"ok": false, "error": "missing_or_invalid_alkane"});
+                            }
+                        };
+
+                        let limit =
+                            payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+                        let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
+                            as usize;
+
+                        log_rpc(
+                            "get_alkane_balance_txs",
+                            &format!("alkane={}:{} page={} limit={}", alk.block, alk.tx, page, limit),
+                        );
+
+                        let mut txs: Vec<[u8; 32]> = Vec::new();
+                        if let Ok(Some(bytes)) = mdb.get(&alkane_balance_txs_key(&alk)) {
+                            if let Ok(list) = Vec::<[u8; 32]>::try_from_slice(&bytes) {
+                                txs = list;
+                            }
+                        }
+
+                        let total = txs.len();
+                        let p = page.max(1);
+                        let l = limit.max(1);
+                        let off = l.saturating_mul(p - 1);
+                        let end = (off + l).min(total);
+                        let slice = if off >= total { vec![] } else { txs[off..end].to_vec() };
+
+                        let items: Vec<Value> = slice
+                            .into_iter()
+                            .filter_map(|arr| Txid::from_slice(&arr).ok())
+                            .map(|txid| txid.to_string())
+                            .map(Value::String)
+                            .collect();
+
+                        json!({
+                            "ok": true,
+                            "alkane": format!("{}:{}", alk.block, alk.tx),
+                            "page": p,
+                            "limit": l,
+                            "total": total,
+                            "has_more": off + items.len() < total,
+                            "txids": items
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+    /* -------- NEW: get_alkane_balance_txs_by_token -------- */
+    {
+        let reg_bal_txs_tok = reg.clone();
+        let mdb_bal_txs_tok = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_bal_txs_tok
+                .register("get_alkane_balance_txs_by_token", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_bal_txs_tok);
+                    async move {
+                        let owner = match payload
+                            .get("owner")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc(
+                                    "get_alkane_balance_txs_by_token",
+                                    "missing_or_invalid_owner",
+                                );
+                                return json!({"ok": false, "error": "missing_or_invalid_owner"});
+                            }
+                        };
+                        let token = match payload
+                            .get("token")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc(
+                                    "get_alkane_balance_txs_by_token",
+                                    "missing_or_invalid_token",
+                                );
+                                return json!({"ok": false, "error": "missing_or_invalid_token"});
+                            }
+                        };
+
+                        let limit =
+                            payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+                        let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
+                            as usize;
+
+                        log_rpc(
+                            "get_alkane_balance_txs_by_token",
+                            &format!(
+                                "owner={}:{} token={}:{} page={} limit={}",
+                                owner.block, owner.tx, token.block, token.tx, page, limit
+                            ),
+                        );
+
+                        let mut txs: Vec<[u8; 32]> = Vec::new();
+                        if let Ok(Some(bytes)) =
+                            mdb.get(&alkane_balance_txs_by_token_key(&owner, &token))
+                        {
+                            if let Ok(list) = Vec::<[u8; 32]>::try_from_slice(&bytes) {
+                                txs = list;
+                            }
+                        }
+
+                        let total = txs.len();
+                        let p = page.max(1);
+                        let l = limit.max(1);
+                        let off = l.saturating_mul(p - 1);
+                        let end = (off + l).min(total);
+                        let slice = if off >= total { vec![] } else { txs[off..end].to_vec() };
+
+                        let items: Vec<Value> = slice
+                            .into_iter()
+                            .filter_map(|arr| Txid::from_slice(&arr).ok())
+                            .map(|txid| txid.to_string())
+                            .map(Value::String)
+                            .collect();
+
+                        json!({
+                            "ok": true,
+                            "owner": format!("{}:{}", owner.block, owner.tx),
+                            "token": format!("{}:{}", token.block, token.tx),
+                            "page": p,
+                            "limit": l,
+                            "total": total,
+                            "has_more": off + items.len() < total,
+                            "txids": items
+                        })
                     }
                 })
                 .await;

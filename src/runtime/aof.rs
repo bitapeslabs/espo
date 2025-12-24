@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
 use bitcoin::BlockHash;
 use hex::FromHex;
-use rocksdb::DB;
+use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -40,30 +39,30 @@ struct BlockState {
 #[derive(Clone)]
 pub struct AofManager {
     db: Arc<DB>,
-    path: PathBuf,
+    log_db: Arc<DB>,
     depth: u32,
     state: Arc<Mutex<BlockState>>,
 }
 
 impl AofManager {
     pub fn new(db: Arc<DB>, path: impl AsRef<Path>, depth: u32) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let path = path.as_ref();
         if !path.exists() {
-            fs::create_dir_all(&path)
+            fs::create_dir_all(path)
                 .with_context(|| format!("failed to create AOF directory {}", path.display()))?;
         } else if !path.is_dir() {
             anyhow::bail!("AOF path {} is not a directory", path.display());
         }
 
-        let mgr = Self { db, path, depth, state: Arc::new(Mutex::new(BlockState::default())) };
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let log_db = Arc::new(DB::open(&opts, path)?);
+
+        let mgr =
+            Self { db, log_db, depth, state: Arc::new(Mutex::new(BlockState::default())) };
         // Clean up any files beyond our retention window on startup.
         mgr.prune_old(None)?;
         Ok(mgr)
-    }
-
-    #[inline]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     pub fn start_block(&self, height: u32, hash: &BlockHash) {
@@ -143,38 +142,36 @@ impl AofManager {
         }
     }
 
+    fn block_key(height: u32) -> [u8; 5] {
+        let mut buf = [0u8; 5];
+        buf[0] = b'b';
+        buf[1..].copy_from_slice(&height.to_be_bytes());
+        buf
+    }
+
+    fn decode_height(key: &[u8]) -> Option<u32> {
+        if key.len() != 5 || key[0] != b'b' {
+            return None;
+        }
+        let mut h = [0u8; 4];
+        h.copy_from_slice(&key[1..]);
+        Some(u32::from_be_bytes(h))
+    }
+
     fn persist_block_log(&self, log: &BlockLog) -> Result<()> {
         let data = serde_json::to_vec(log)?;
-        let tmp = self.path.join(format!("{}.json.tmp", log.height));
-        let final_path = self.block_path(log.height);
-
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&data)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &final_path)
-            .with_context(|| format!("failed to move AOF tmp {} -> {}", tmp.display(), final_path.display()))?;
+        self.log_db.put(Self::block_key(log.height), data)?;
+        // Durability is important for reorg protection; flush best-effort.
+        self.log_db.flush()?;
         Ok(())
     }
 
-    fn block_path(&self, height: u32) -> PathBuf {
-        self.path.join(format!("{}.json", height))
-    }
-
-    fn list_block_files(&self) -> Result<Vec<u32>> {
+    fn list_block_heights(&self) -> Result<Vec<u32>> {
         let mut heights = Vec::new();
-        for entry in fs::read_dir(&self.path)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                if let Some(stripped) = name.strip_suffix(".json") {
-                    if let Ok(h) = stripped.parse::<u32>() {
-                        heights.push(h);
-                    }
-                }
+        for res in self.log_db.iterator(IteratorMode::Start) {
+            let (k, _) = res?;
+            if let Some(h) = Self::decode_height(&k) {
+                heights.push(h);
             }
         }
         heights.sort_unstable();
@@ -182,41 +179,52 @@ impl AofManager {
     }
 
     fn prune_old(&self, newest_height: Option<u32>) -> Result<()> {
-        let mut heights = self.list_block_files()?;
+        let mut heights = self.list_block_heights()?;
         if heights.is_empty() {
             return Ok(());
         }
 
-        let anchor = if let Some(h) = newest_height {
-            h
-        } else {
-            *heights.iter().max().unwrap_or(&0)
-        };
+        let anchor = newest_height.unwrap_or_else(|| *heights.iter().max().unwrap_or(&0));
         let keep_from = anchor.saturating_sub(self.depth.saturating_sub(1));
 
+        let mut wb = WriteBatch::default();
+        let mut delete_count = 0usize;
         for h in heights.drain(..) {
             if h < keep_from {
-                let _ = fs::remove_file(self.block_path(h));
+                wb.delete(Self::block_key(h));
+                delete_count += 1;
             }
+        }
+        if delete_count > 0 {
+            self.log_db.write(wb)?;
         }
         Ok(())
     }
 
-    pub fn recent_blocks(&self, limit: usize) -> Result<Vec<BlockLog>> {
-        let mut heights = self.list_block_files()?;
-        heights.sort_unstable();
-        heights.reverse();
-        let mut out = Vec::new();
-        for h in heights.into_iter().take(limit) {
-            let data = fs::read(self.block_path(h))?;
-            let log: BlockLog = serde_json::from_slice(&data)?;
-            out.push(log);
+    fn load_blocks_desc(&self, limit: Option<usize>) -> Result<Vec<BlockLog>> {
+        let mut logs = Vec::new();
+        for res in self.log_db.iterator(IteratorMode::End) {
+            let (k, v) = res?;
+            if Self::decode_height(&k).is_none() {
+                continue;
+            }
+            let log: BlockLog = serde_json::from_slice(&v)?;
+            logs.push(log);
+            if let Some(max) = limit {
+                if logs.len() >= max {
+                    break;
+                }
+            }
         }
-        Ok(out)
+        Ok(logs)
+    }
+
+    pub fn recent_blocks(&self, limit: usize) -> Result<Vec<BlockLog>> {
+        self.load_blocks_desc(Some(limit))
     }
 
     pub fn revert_last_blocks(&self, count: usize) -> Result<Option<u32>> {
-        let logs = self.recent_blocks(count)?;
+        let logs = self.load_blocks_desc(Some(count))?;
         if logs.is_empty() {
             return Ok(None);
         }
@@ -228,19 +236,13 @@ impl AofManager {
     /// Revert every block currently tracked by the AOF (latest → earliest).
     /// Returns the earliest height reverted, if any.
     pub fn revert_all_blocks(&self) -> Result<Option<u32>> {
-        let heights = self.list_block_files()?;
-        if heights.is_empty() {
+        let logs = self.load_blocks_desc(None)?;
+        if logs.is_empty() {
             return Ok(None);
         }
-        let earliest = *heights.iter().min().unwrap_or(&0);
-        let mut logs: Vec<BlockLog> = Vec::new();
-        for h in heights.iter().rev() {
-            let data = fs::read(self.block_path(*h))?;
-            let log: BlockLog = serde_json::from_slice(&data)?;
-            logs.push(log);
-        }
+        let earliest = logs.last().map(|l| l.height);
         self.apply_revert_logs(logs)?;
-        Ok(Some(earliest))
+        Ok(earliest)
     }
 
     fn apply_revert_logs(&self, logs: Vec<BlockLog>) -> Result<()> {
