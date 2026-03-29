@@ -1,4 +1,4 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use crate::explorer::components::svg_assets::{icon_dropdown_caret, icon_dropdown_check};
 

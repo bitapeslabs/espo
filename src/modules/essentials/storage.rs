@@ -1,20 +1,19 @@
 use crate::alkanes::trace::{
-    prettyify_protobuf_trace_json, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
 };
 use crate::config::{
     get_address_index_chunk_size, get_bitcoind_rpc_client, get_electrum_like, get_metashrew,
     get_network,
 };
 use crate::modules::essentials::utils::balances::{
-    get_address_activity_for_address, get_alkane_balances, get_alkane_balances_at_or_before,
-    get_balance_for_address, get_holders_for_alkane, get_outpoint_address,
-    get_total_received_for_alkane, get_transfer_volume_for_alkane, SignedU128,
+    SignedU128, get_address_activity_for_address, get_alkane_balances,
+    get_alkane_balances_at_or_before, get_balance_for_address, get_holders_for_alkane,
+    get_outpoint_address, get_total_received_for_alkane, get_transfer_volume_for_alkane,
 };
-use crate::modules::essentials::utils::inspections::{inspection_to_json, AlkaneCreationRecord};
+use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListNonMutatePointer, ListPointer};
 use crate::runtime::state_at::StateAt;
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -24,13 +23,13 @@ use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
-use serde_json::{json, map::Map, Value};
+use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address, MempoolEntry,
+    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::AddressHistoryEntry;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use hex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -1615,10 +1614,8 @@ impl EssentialsProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
-            return Err(anyhow!("versioned_tree_unavailable"));
-        };
-        let Some(blockhash) = tree
+        let Some(blockhash) = self
+            .mdb
             .blockhash_for_height(height_u32)
             .map_err(|e| anyhow!("tree lookup failed: {e}"))?
         else {
@@ -1644,8 +1641,7 @@ impl EssentialsProvider {
     }
 
     pub fn resolved_view_blockhash(&self) -> Option<BlockHash> {
-        self.view_blockhash
-            .or_else(|| get_global_tree_db().and_then(|tree| tree.active_blockhash()))
+        self.view_blockhash.or_else(|| self.mdb.active_blockhash())
     }
 
     pub fn blockhash_is_ancestor(
@@ -1653,24 +1649,21 @@ impl EssentialsProvider {
         ancestor: &BlockHash,
         descendant: &BlockHash,
     ) -> Result<bool> {
-        let Some(tree) = get_global_tree_db() else {
-            return Ok(false);
-        };
-        tree.is_ancestor(ancestor, descendant)
+        self.mdb
+            .is_ancestor(ancestor, descendant)
             .map_err(|e| anyhow!("tree.is_ancestor failed: {e}"))
     }
 
     pub fn blockhash_is_on_active_chain(&self, blockhash: &BlockHash) -> Result<bool> {
-        let Some(tree) = get_global_tree_db() else {
-            return Ok(false);
-        };
-        let Some(height) = tree
+        let Some(height) = self
+            .mdb
             .height_for_blockhash(blockhash)
             .map_err(|e| anyhow!("tree.height_for_blockhash failed: {e}"))?
         else {
             return Ok(false);
         };
-        let Some(active_blockhash_at_height) = tree
+        let Some(active_blockhash_at_height) = self
+            .mdb
             .blockhash_for_height(height)
             .map_err(|e| anyhow!("tree.blockhash_for_height failed: {e}"))?
         else {
@@ -1680,10 +1673,8 @@ impl EssentialsProvider {
     }
 
     pub fn blockhash_for_height(&self, height: u32) -> Result<Option<BlockHash>> {
-        let Some(tree) = get_global_tree_db() else {
-            return Ok(None);
-        };
-        tree.blockhash_for_height(height)
+        self.mdb
+            .blockhash_for_height(height)
             .map_err(|e| anyhow!("tree.blockhash_for_height failed: {e}"))
     }
 
@@ -2707,11 +2698,7 @@ impl EssentialsProvider {
             let key_str_val = utf8_or_null(k);
 
             let top_key = if try_decode_utf8 {
-                if let Value::String(s) = &key_str_val {
-                    s.clone()
-                } else {
-                    key_hex.clone()
-                }
+                if let Value::String(s) = &key_str_val { s.clone() } else { key_hex.clone() }
             } else {
                 key_hex.clone()
             };
@@ -4254,11 +4241,7 @@ impl EssentialsProvider {
                                         return None;
                                     }
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h {
-                                            Some(tip - h + 1)
-                                        } else {
-                                            None
-                                        }
+                                        if tip >= h { Some(tip - h + 1) } else { None }
                                     })
                                 });
                             let traces = summary
@@ -4316,11 +4299,7 @@ impl EssentialsProvider {
                                 let summary = load_tx_summary_v2(self, txid);
                                 let confirmations = entries_for_page[idx].height.and_then(|h| {
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h {
-                                            Some(tip - h + 1)
-                                        } else {
-                                            None
-                                        }
+                                        if tip >= h { Some(tip - h + 1) } else { None }
                                     })
                                 });
                                 let traces = summary
@@ -6351,11 +6330,7 @@ fn enriched_transaction_json(
     let has_protostones = !protostones.is_empty();
     let alkanes_traces = render.traces.as_ref().and_then(|traces| {
         let vals = traces.iter().map(enriched_trace_to_value).collect::<Vec<_>>();
-        if vals.is_empty() {
-            None
-        } else {
-            Some(Value::Array(vals))
-        }
+        if vals.is_empty() { None } else { Some(Value::Array(vals)) }
     });
 
     let mut out = Map::new();
@@ -6612,7 +6587,7 @@ mod tests {
     use super::*;
     use crate::runtime::tree_db::{get_global_tree_db, init_global_tree_db};
     use bitcoin::BlockHash;
-    use rocksdb::{Options, DB};
+    use rocksdb::{DB, Options};
     use std::sync::Arc;
     use tempfile::TempDir;
 

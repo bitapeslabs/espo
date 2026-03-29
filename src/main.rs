@@ -46,17 +46,15 @@ use crate::explorer::run_explorer;
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
     config::{
-        get_bitcoind_rpc_client, get_config, get_espo_db, get_module_config, init_config,
+        get_bitcoind_rpc_client, get_config, get_espo_module_mdb, get_module_config, init_config,
         update_safe_tip,
     },
     consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
-    runtime::mdb::Mdb,
     runtime::mempool::{
         purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service,
     },
     runtime::rpc::run_rpc,
-    runtime::tree_db::get_global_tree_db,
 };
 use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
@@ -93,7 +91,7 @@ fn detect_first_divergence_height(
     safe_tip: u32,
     genesis_height: u32,
 ) -> Option<u32> {
-    let Some(tree) = get_global_tree_db() else { return None };
+    let tree = get_espo_module_mdb("essentials");
     let check_tip = indexed_tip.min(safe_tip);
     if check_tip < genesis_height {
         return None;
@@ -346,26 +344,71 @@ async fn run_indexer_loop(
 
                     let block_hash = espo_block.block_header.block_hash();
 
-                    if let Some(tree) = get_global_tree_db() {
-                        if let Err(e) = tree.begin_block(
-                            next_height,
-                            &block_hash,
-                            &espo_block.block_header.prev_blockhash,
-                        ) {
-                            eprintln!(
-                                "[tree] failed to begin block {} ({}): {e:?}",
-                                next_height, block_hash
-                            );
-                        }
-                    }
-
                     for m in mods.modules() {
                         if next_height >= m.get_genesis_block(network) {
+                            let Some(mdb) = m.get_mdb() else {
+                                if let Err(e) = m.index_block(espo_block.clone()) {
+                                    eprintln!(
+                                        "[module:{}] height {}: {e:?}",
+                                        m.get_name(),
+                                        next_height
+                                    );
+                                }
+                                continue;
+                            };
+
+                            match mdb.has_blockhash(&block_hash) {
+                                Ok(true) => {
+                                    eprintln!(
+                                        "[module:{}] skipping already indexed block {} ({})",
+                                        m.get_name(),
+                                        next_height,
+                                        block_hash
+                                    );
+                                    continue;
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    eprintln!(
+                                        "[module:{}] failed to check block {} ({}): {e:?}",
+                                        m.get_name(),
+                                        next_height,
+                                        block_hash
+                                    );
+                                    continue;
+                                }
+                            }
+
+                            if let Err(e) = mdb.begin_block(
+                                next_height,
+                                &block_hash,
+                                &espo_block.block_header.prev_blockhash,
+                            ) {
+                                eprintln!(
+                                    "[module:{}] failed to begin block {} ({}): {e:?}",
+                                    m.get_name(),
+                                    next_height,
+                                    block_hash
+                                );
+                                continue;
+                            }
+
                             if let Err(e) = m.index_block(espo_block.clone()) {
                                 eprintln!(
                                     "[module:{}] height {}: {e:?}",
                                     m.get_name(),
                                     next_height
+                                );
+                                mdb.abort_block();
+                                continue;
+                            }
+
+                            if let Err(e) = mdb.finish_block() {
+                                eprintln!(
+                                    "[module:{}] failed to finish block {} ({}): {e:?}",
+                                    m.get_name(),
+                                    next_height,
+                                    block_hash
                                 );
                             }
                         }
@@ -390,12 +433,6 @@ async fn run_indexer_loop(
                             "[mempool] failed to purge confirmed txs at height {}: {e:?}",
                             next_height
                         ),
-                    }
-
-                    if let Some(tree) = get_global_tree_db() {
-                        if let Err(e) = tree.finish_block() {
-                            eprintln!("[tree] failed to finish block {}: {e:?}", next_height);
-                        }
                     }
 
                     if let Some(backup) = cfg.debug_backup.as_ref() {
@@ -488,7 +525,7 @@ async fn main() -> Result<()> {
     let metashrew_sdb = get_metashrew_sdb();
 
     // Build module registry with the global ESPO DB
-    let mut mods = ModuleRegistry::with_db(get_espo_db());
+    let mut mods = ModuleRegistry::new();
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
     mods.register_module(Pizzafun::new());
@@ -509,7 +546,7 @@ async fn main() -> Result<()> {
     }
     // mods.register_module(TracesData::new());
 
-    let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
+    let essentials_mdb = get_espo_module_mdb("essentials");
     let loaded = preload_block_summary_cache(&essentials_mdb);
     if loaded > 0 {
         eprintln!("[cache] preloaded {} block summaries", loaded);

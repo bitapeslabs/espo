@@ -94,7 +94,6 @@ fn ensure_primary_name(names: &mut Vec<String>, name: &str) {
 
 pub struct Essentials {
     provider: Option<Arc<EssentialsProvider>>,
-    index_height: Arc<std::sync::RwLock<Option<u32>>>,
     inspection_cache: Arc<std::sync::RwLock<HashMap<SchemaAlkaneId, StoredInspectionResult>>>,
 }
 
@@ -102,7 +101,6 @@ impl Essentials {
     pub fn new() -> Self {
         Self {
             provider: None,
-            index_height: Arc::new(std::sync::RwLock::new(None)),
             inspection_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
@@ -128,7 +126,7 @@ impl Essentials {
     }
 
     fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
-        if let Some(prev) = *self.index_height.read().unwrap() {
+        if let Some(prev) = self.load_index_height()? {
             if new_height < prev {
                 eprintln!(
                     "[ESSENTIALS] index height rollback detected ({} -> {})",
@@ -137,7 +135,6 @@ impl Essentials {
             }
         }
         self.persist_index_height(new_height, blockhash)?;
-        *self.index_height.write().unwrap() = Some(new_height);
         Ok(())
     }
 
@@ -158,10 +155,7 @@ impl EspoModule for Essentials {
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
         self.provider = Some(Arc::new(EssentialsProvider::new(mdb.clone())));
         match self.load_index_height() {
-            Ok(h) => {
-                *self.index_height.write().unwrap() = h;
-                eprintln!("[ESSENTIALS] loaded index height: {:?}", h);
-            }
+            Ok(h) => eprintln!("[ESSENTIALS] loaded index height: {:?}", h),
             Err(e) => eprintln!("[ESSENTIALS] failed to load /index_height: {e:?}"),
         }
     }
@@ -170,20 +164,17 @@ impl EspoModule for Essentials {
         essentials_genesis_block(network)
     }
 
+    fn get_mdb(&self) -> Option<Arc<Mdb>> {
+        self.provider.as_ref().map(|provider| Arc::new(provider.mdb().clone()))
+    }
+
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let t0 = std::time::Instant::now();
         let debug = debug_enabled();
         let module = self.get_name();
         let provider = self.provider();
         let table = provider.table();
-        let height = block.height;
         let block_hash = block.block_header.block_hash();
-        if let Some(prev) = *self.index_height.read().unwrap() {
-            if height <= prev {
-                eprintln!("[ESSENTIALS] skipping already indexed block #{height} (last={prev})");
-                return Ok(());
-            }
-        }
 
         // -------- Phase A: coalesce per-block writes in memory --------
         // last-write-wins for values:
@@ -646,10 +637,8 @@ impl EspoModule for Essentials {
                 let mut alkane_id_bytes = Vec::with_capacity(12);
                 alkane_id_bytes.extend_from_slice(&rec.alkane.block.to_be_bytes());
                 alkane_id_bytes.extend_from_slice(&rec.alkane.tx.to_be_bytes());
-                creation_rows_seq.insert(
-                    table.alkane_creation_seq_key(next_creation_seq),
-                    alkane_id_bytes,
-                );
+                creation_rows_seq
+                    .insert(table.alkane_creation_seq_key(next_creation_seq), alkane_id_bytes);
                 next_creation_seq = next_creation_seq.saturating_add(1);
                 holders_index_rows.insert(table.alkane_holders_ordered_key(0, &rec.alkane));
             }
@@ -842,7 +831,7 @@ impl EspoModule for Essentials {
     }
 
     fn get_index_height(&self) -> Option<u32> {
-        *self.index_height.read().unwrap()
+        self.load_index_height().ok().flatten()
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {

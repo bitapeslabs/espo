@@ -13,30 +13,31 @@ use maud::html;
 use serde::Deserialize;
 
 use crate::alkanes::trace::{
-    get_espo_block_with_opts, traces_for_block_as_prost, EspoSandshrewLikeTrace,
-    EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoTrace, GetEspoBlockOpts,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoTrace,
+    GetEspoBlockOpts, get_espo_block_with_opts, traces_for_block_as_prost,
 };
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
 };
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::header::{
-    header, header_scripts, HeaderPillTone, HeaderProps, HeaderSummaryItem,
+    HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
 };
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_arrow_up_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
-use crate::explorer::components::tx_view::{render_tx, TxPill, TxPillTone};
+use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    address_index_list_id_alkane_block_txs, get_address_index_list_len, get_address_index_list_range,
-    load_tx_pointer_blob_v3_by_id, load_tx_summary_v2, AddressIndexListKind, AlkaneTxSummary,
+    AddressIndexListKind, AlkaneTxSummary, address_index_list_id_alkane_block_txs,
+    get_address_index_list_len, get_address_index_list_range, load_tx_pointer_blob_v3_by_id,
+    load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
-    get_outpoint_balances_with_spent_batch, OutpointLookup,
+    OutpointLookup, get_outpoint_balances_with_spent_batch,
 };
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;

@@ -6,8 +6,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 const BTC_USD_HISTORICAL_REL_PATH: &str = "resources/btc_usd_historical.json";
-static BTC_USD_HISTORICAL_BACKFILL: OnceLock<Result<BTreeMap<u64, u128>, String>> =
-    OnceLock::new();
+static BTC_USD_HISTORICAL_BACKFILL: OnceLock<Result<BTreeMap<u64, u128>, String>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct BtcUsdHistoricalPoint {

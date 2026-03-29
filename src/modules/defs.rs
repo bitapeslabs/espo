@@ -7,9 +7,8 @@ use tarpc::context;
 use tokio::sync::RwLock;
 
 use crate::alkanes::trace::EspoBlock;
-use crate::config::get_module_config;
+use crate::config::{get_espo_module_mdb, get_module_config};
 use crate::runtime::mdb::Mdb;
-use rocksdb::{DB, Options};
 
 /// Object-safe handler: (Context, JSON) -> JSON (async)
 type HandlerFn = dyn Fn(context::Context, Value) -> BoxFuture<'static, Value> + Send + Sync;
@@ -104,6 +103,9 @@ pub trait EspoModule: Send + Sync {
 
     fn index_block(&self, block: EspoBlock) -> Result<()>;
     fn get_index_height(&self) -> Option<u32>;
+    fn get_mdb(&self) -> Option<Arc<Mdb>> {
+        None
+    }
 
     /// Modules can only register RPCs via a namespaced registrar.
     /// For a module named "ammdata", all methods will be "ammdata.<suffix>".
@@ -121,35 +123,36 @@ pub trait EspoModule: Send + Sync {
     }
 }
 
-/// Registry that holds modules, the RPC router, and one shared RocksDB
+/// Registry that holds modules and the RPC router.
 pub struct ModuleRegistry {
     modules: Vec<Arc<dyn EspoModule>>,
     pub router: RpcRegistry,
-    module_db: Arc<DB>,
 }
 
 impl ModuleRegistry {
-    /// Construct from an existing Arc<DB> (one global DB shared by all modules).
-    pub fn with_db(module_db: Arc<DB>) -> Self {
-        Self { modules: Vec::new(), router: RpcRegistry::default(), module_db }
+    pub fn new() -> Self {
+        Self { modules: Vec::new(), router: RpcRegistry::default() }
     }
 
-    /// Convenience: open a global read-write DB at a path, create if missing.
+    /// Back-compat constructor.
+    pub fn with_db<T>(_module_db: T) -> Self {
+        Self::new()
+    }
+
+    /// Back-compat constructor.
     pub fn with_db_path(path: impl AsRef<Path>) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        let db = Arc::new(DB::open(&opts, path)?);
-        Ok(Self::with_db(db))
+        let _ = path.as_ref();
+        Ok(Self::new())
     }
 
-    /// Convenience: open a global read-only DB at a path.
+    /// Back-compat constructor.
     pub fn with_db_path_read_only(
         path: impl AsRef<Path>,
         error_if_log_file_exist: bool,
     ) -> Result<Self> {
-        let opts = Options::default();
-        let db = Arc::new(DB::open_for_read_only(&opts, path, error_if_log_file_exist)?);
-        Ok(Self::with_db(db))
+        let _ = path.as_ref();
+        let _ = error_if_log_file_exist;
+        Ok(Self::new())
     }
 
     /// Register a module:
@@ -182,12 +185,7 @@ impl ModuleRegistry {
             }
         }
 
-        // --- Mdb prefix like "ammdata:" ---
-        let mut prefix_kv = Vec::with_capacity(name.len() + 1);
-        prefix_kv.extend_from_slice(name.as_bytes());
-        prefix_kv.push(b':');
-
-        let mdb = Arc::new(Mdb::from_db(self.module_db.clone(), prefix_kv));
+        let mdb = get_espo_module_mdb(name);
         module.set_mdb(mdb);
 
         // --- RPC prefix like "ammdata." ---

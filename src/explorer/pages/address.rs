@@ -7,7 +7,7 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Network, Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
-use maud::{html, Markup, PreEscaped};
+use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -16,14 +16,14 @@ use std::time::{Duration, Instant};
 use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
 use crate::config::{get_bitcoind_rpc_client, get_electrum_like};
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
-use crate::explorer::components::header::{header, header_scripts, HeaderProps, HeaderSummaryItem};
+use crate::explorer::components::header::{HeaderProps, HeaderSummaryItem, header, header_scripts};
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_arrow_up_right, icon_dropdown_caret, icon_left, icon_right, icon_skip_left,
     icon_skip_right,
 };
 use crate::explorer::components::tx_view::{
-    alkane_meta, icon_bg_style, render_tx, AlkaneMetaCache, TxPill, TxPillTone,
+    AlkaneMetaCache, TxPill, TxPillTone, alkane_meta, icon_bg_style, render_tx,
 };
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::fmt_sats;
@@ -31,13 +31,13 @@ use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::essentials::storage::{
-    get_address_index_list_len, get_address_index_list_range, load_tx_pointer_blob_v3_by_id,
-    load_tx_summary_v2, AddressIndexListKind, AlkaneTxSummary,
+    AddressIndexListKind, AlkaneTxSummary, get_address_index_list_len,
+    get_address_index_list_range, load_tx_pointer_blob_v3_by_id, load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
-    get_balance_for_address, get_outpoint_rows_batch, OutpointLookup,
+    OutpointLookup, get_balance_for_address, get_outpoint_rows_batch,
 };
-use crate::runtime::mempool::{pending_by_txid, pending_for_address, MempoolEntry};
+use crate::runtime::mempool::{MempoolEntry, pending_by_txid, pending_for_address};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 use crate::utils::electrum_like::{AddressHistoryEntry, ElectrumLikeBackend};

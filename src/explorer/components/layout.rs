@@ -1,10 +1,10 @@
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse};
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-use crate::config::{get_explorer_networks, get_network};
-use crate::explorer::components::dropdown::{dropdown, DropdownItem, DropdownProps};
+use crate::config::{get_explorer_networks, get_google_analytics_tag, get_network};
+use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::footer::footer;
 use crate::explorer::components::svg_assets::{
     dots, icon_btc, icon_language, icon_search, icon_signet, icon_testnet, logo_espo,
@@ -113,6 +113,7 @@ pub fn layout_with_meta(
     let base_path_js = format!("{:?}", explorer_path("/"));
     let root_base_path_js = format!("{:?}", explorer_base_path());
     let network_dropdown = network_dropdown();
+    let google_analytics = google_analytics_scripts();
     let lang_toggle_label =
         if language.is_chinese() { "Switch to English" } else { "切换到中文" };
     let page_description = description.unwrap_or(DEFAULT_DESCRIPTION);
@@ -121,11 +122,8 @@ pub fn layout_with_meta(
     let chinese_path = chinese_logical_path(&english_path);
     let english_href = with_base_path(&english_path);
     let chinese_href = with_base_path(&chinese_path);
-    let canonical_href = if language.is_chinese() {
-        chinese_href.clone()
-    } else {
-        english_href.clone()
-    };
+    let canonical_href =
+        if language.is_chinese() { chinese_href.clone() } else { english_href.clone() };
     let markup = html! {
         (DOCTYPE)
         html lang=(if language.is_chinese() { "zh-Hans" } else { "en" }) {
@@ -148,6 +146,9 @@ pub fn layout_with_meta(
                 meta name="twitter:description" content=(page_description);
                 link rel="icon" type="image/svg+xml" href=(explorer_path("/favicon.svg"));
                 link rel="stylesheet" href=(explorer_path("/static/style.css"));
+                @if let Some(ga_markup) = google_analytics {
+                    (ga_markup)
+                }
             }
             body {
                 header class="topbar" data-topbar="" {
@@ -242,11 +243,8 @@ fn normalize_canonical_path(path: &str) -> String {
     if trimmed.is_empty() || trimmed == "/" {
         return "/".to_string();
     }
-    let mut normalized = if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
-    };
+    let mut normalized =
+        if trimmed.starts_with('/') { trimmed.to_string() } else { format!("/{trimmed}") };
     if normalized.len() > 1 {
         normalized = normalized.trim_end_matches('/').to_string();
     }
@@ -264,11 +262,7 @@ fn english_logical_path(path: &str) -> String {
 }
 
 fn chinese_logical_path(english_path: &str) -> String {
-    if english_path == "/" {
-        "/zh".to_string()
-    } else {
-        format!("/zh{english_path}")
-    }
+    if english_path == "/" { "/zh".to_string() } else { format!("/zh{english_path}") }
 }
 
 fn with_base_path(path: &str) -> String {
@@ -358,11 +352,7 @@ fn network_key(network: bitcoin::Network) -> &'static str {
         bitcoin::Network::Signet => "signet",
         _ => {
             let tag = network.to_string();
-            if tag == "testnet4" {
-                "testnet4"
-            } else {
-                "testnet3"
-            }
+            if tag == "testnet4" { "testnet4" } else { "testnet3" }
         }
     }
 }
@@ -373,6 +363,24 @@ fn network_icon(key: &str) -> Markup {
         "signet" => icon_signet(),
         _ => icon_testnet(),
     }
+}
+
+fn google_analytics_scripts() -> Option<Markup> {
+    let tag = get_google_analytics_tag()?;
+    let tag_js = serde_json::to_string(tag).ok()?;
+    let inline_script = format!(
+        r#"
+window.dataLayer = window.dataLayer || [];
+function gtag(){{dataLayer.push(arguments);}}
+gtag('js', new Date());
+gtag('config', {tag_js});
+"#
+    );
+
+    Some(html! {
+        script async src=(format!("https://www.googletagmanager.com/gtag/js?id={tag}")) {}
+        script { (PreEscaped(inline_script)) }
+    })
 }
 
 fn search_scripts(base_path_js: &str) -> Markup {

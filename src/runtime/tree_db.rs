@@ -320,6 +320,11 @@ impl VersionedTreeDb {
         self.db.write(wb)
     }
 
+    pub fn abort_block(&self) {
+        let mut st = self.state.write().expect("tree state poisoned");
+        st.current_block = None;
+    }
+
     pub fn pin_active_root_until_height(&self, until_height: u32) -> Result<(), RocksError> {
         let mut st = self.state.write().expect("tree state poisoned");
         st.pinned_root = Some(st.active_root);

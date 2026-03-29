@@ -1,4 +1,4 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use crate::explorer::components::svg_assets::icon_user;
 use crate::explorer::components::tx_view::icon_bg_style;

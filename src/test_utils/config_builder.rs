@@ -50,6 +50,7 @@ impl TestConfigBuilder {
             compact_tx_trace_rows: true,
             address_index_chunk_size: 512,
             explorer_networks: None,
+            google_analytics_tag: None,
             modules: HashMap::new(),
         };
 

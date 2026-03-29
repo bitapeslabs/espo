@@ -1,6 +1,7 @@
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub enum DerivedMergeStrategy {
@@ -24,6 +25,7 @@ pub struct DerivedLiquidityConfig {
 #[derive(Clone, Debug)]
 pub struct AmmDataConfig {
     pub eth_rpc: String,
+    pub eth_rpc_headers: HashMap<String, String>,
     pub eth_call_throttle_ms: u64,
     pub use_historical_backfill: bool,
     pub search_index_enabled: bool,
@@ -65,6 +67,21 @@ impl AmmDataConfig {
         })?;
         let use_historical_backfill =
             obj.get("use_historical_backfill").and_then(|v| v.as_bool()).unwrap_or(true);
+
+        let eth_rpc_headers = match obj.get("eth_rpc_headers") {
+            Some(Value::Object(map)) => {
+                let mut headers = HashMap::new();
+                for (k, v) in map {
+                    let val = v.as_str().ok_or_else(|| {
+                        anyhow!("ammdata.eth_rpc_headers values must be strings; key '{}' is not", k)
+                    })?;
+                    headers.insert(k.clone(), val.to_string());
+                }
+                headers
+            }
+            Some(Value::Null) | None => HashMap::new(),
+            _ => anyhow::bail!("ammdata.eth_rpc_headers must be an object mapping header names to string values"),
+        };
 
         let search_index_enabled =
             obj.get("search_index_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -165,6 +182,7 @@ impl AmmDataConfig {
 
         Ok(Self {
             eth_rpc,
+            eth_rpc_headers,
             eth_call_throttle_ms,
             use_historical_backfill,
             search_index_enabled,

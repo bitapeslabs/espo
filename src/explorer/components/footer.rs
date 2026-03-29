@@ -1,4 +1,4 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use crate::explorer::components::svg_assets::{icon_github, icon_heart, logo_espo};
 

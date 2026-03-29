@@ -3,7 +3,6 @@ use super::schemas::SchemaWrapEventV1;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
-use crate::runtime::tree_db::get_global_tree_db;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -197,10 +196,8 @@ impl SubfrostProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
-            return Err(anyhow!("versioned_tree_unavailable"));
-        };
-        let Some(blockhash) = tree
+        let Some(blockhash) = self
+            .mdb
             .blockhash_for_height(height_u32)
             .map_err(|e| anyhow!("tree lookup failed: {e}"))?
         else {
@@ -211,6 +208,10 @@ impl SubfrostProvider {
 
     pub fn table(&self) -> SubfrostTable<'_> {
         SubfrostTable::new(self.mdb.as_ref())
+    }
+
+    pub fn mdb(&self) -> &Mdb {
+        self.mdb.as_ref()
     }
 
     fn raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -363,8 +364,8 @@ impl SubfrostProvider {
     pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("get_index_height");
         let table = self.table();
-        let Some(bytes) =
-            self.raw_get_at(table.INDEX_HEIGHT.key(), params.blockhash.resolve(self.view_blockhash))?
+        let Some(bytes) = self
+            .raw_get_at(table.INDEX_HEIGHT.key(), params.blockhash.resolve(self.view_blockhash))?
         else {
             return Ok(GetIndexHeightResult { height: None });
         };

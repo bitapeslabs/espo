@@ -209,7 +209,7 @@ fn translate_html_excluding_code_blocks(html: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{translate_html, ExplorerLanguage};
+    use super::{ExplorerLanguage, translate_html};
 
     #[test]
     fn chinese_translation_does_not_mutate_script_contents() {

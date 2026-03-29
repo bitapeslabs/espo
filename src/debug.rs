@@ -127,8 +127,7 @@ static DEBUG_MDB: OnceLock<Mdb> = OnceLock::new();
 static TIMER_STATE: OnceLock<Mutex<TimerState>> = OnceLock::new();
 
 fn debug_mdb() -> &'static Mdb {
-    DEBUG_MDB
-        .get_or_init(|| Mdb::from_db(crate::config::get_espo_db(), b"debug_metrics:"))
+    DEBUG_MDB.get_or_init(|| Mdb::from_db(crate::config::get_espo_db(), b"debug_metrics:"))
 }
 
 fn timer_state() -> &'static Mutex<TimerState> {
@@ -233,11 +232,7 @@ fn record_timer(kind: TimerKind, module: &str, label: &str, elapsed_ms: u64) {
     let mut guard = timer_state().lock().unwrap_or_else(|e| e.into_inner());
     ensure_loaded_locked(&mut guard);
 
-    let key = TimerKey {
-        kind,
-        module: module.to_string(),
-        label: label.to_string(),
-    };
+    let key = TimerKey { kind, module: module.to_string(), label: label.to_string() };
     let entry = guard.totals.entry(key.clone()).or_insert_with(|| TimerTotals {
         count: 0,
         total_ms: 0,
@@ -298,11 +293,8 @@ pub fn get_timer_totals(limit: Option<usize>) -> TimerTotalsSnapshot {
         .totals
         .iter()
         .map(|(key, totals)| {
-            let avg_ms = if totals.count == 0 {
-                0.0
-            } else {
-                totals.total_ms as f64 / totals.count as f64
-            };
+            let avg_ms =
+                if totals.count == 0 { 0.0 } else { totals.total_ms as f64 / totals.count as f64 };
             TimerTotalsEntry {
                 title: format!("module={} {}={}", key.module, key.kind.as_str(), key.label),
                 kind: key.kind.as_str().to_string(),

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use maud::{html, Markup};
+use maud::{Markup, html};
 
-use crate::explorer::components::tx_view::{alkane_meta, icon_bg_style, AlkaneMetaCache};
+use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta, icon_bg_style};
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::BalanceEntry;

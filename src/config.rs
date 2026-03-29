@@ -1,5 +1,7 @@
 use crate::alkanes::metashrew::MetashrewAdapter;
-use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB, tree_db::init_global_tree_db};
+use crate::runtime::{
+    dbpaths::get_sdb_path_for_metashrew, mdb::Mdb, sdb::SDB, tree_db::VersionedTreeDb,
+};
 use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
 use crate::{ESPO_HEIGHT, SAFE_TIP};
 use anyhow::{Context, Result};
@@ -14,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     fs,
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -31,6 +33,7 @@ static ELECTRUM_LIKE: OnceLock<Arc<dyn ElectrumLike>> = OnceLock::new();
 static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
 static METASHREW_SDB: OnceLock<std::sync::Arc<SDB>> = OnceLock::new();
 static ESPO_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
+static ESPO_MODULE_MDBS: OnceLock<RwLock<HashMap<String, Arc<Mdb>>>> = OnceLock::new();
 static BLOCK_SOURCE: OnceLock<BlkOrRpcBlockSource> = OnceLock::new();
 
 // NEW: Global bitcoin::Network
@@ -257,6 +260,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
+    pub google_analytics_tag: Option<String>,
+    #[serde(default)]
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -290,6 +295,7 @@ pub struct AppConfig {
     pub compact_tx_trace_rows: bool,
     pub address_index_chunk_size: u32,
     pub explorer_networks: Option<ExplorerNetworks>,
+    pub google_analytics_tag: Option<String>,
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -321,6 +327,7 @@ impl AppConfig {
             normalize_optional_string(Some(file.explorer_pizza_tv_endpoint))
                 .unwrap_or_else(default_explorer_pizza_tv_endpoint);
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
+        let google_analytics_tag = normalize_optional_string(file.google_analytics_tag);
         let debug_backup = file.debug_backup;
 
         Ok(Self {
@@ -352,6 +359,7 @@ impl AppConfig {
             compact_tx_trace_rows: file.compact_tx_trace_rows,
             address_index_chunk_size: file.address_index_chunk_size,
             explorer_networks,
+            google_analytics_tag,
             modules: file.modules,
         })
     }
@@ -389,13 +397,13 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
         anyhow::bail!("Temporary dbs dir is not a directory: {}", tmp.display());
     }
 
-    let espo_dir = db_root.join("espo");
-    if !espo_dir.exists() {
-        fs::create_dir_all(&espo_dir).map_err(|e| {
-            anyhow::anyhow!("Failed to create espo db dir {}: {e}", espo_dir.display())
+    let espo_root = db_root.join("espo");
+    if !espo_root.exists() {
+        fs::create_dir_all(&espo_root).map_err(|e| {
+            anyhow::anyhow!("Failed to create espo db root {}: {e}", espo_root.display())
         })?;
-    } else if !espo_dir.is_dir() {
-        anyhow::bail!("espo db dir is not a directory: {}", espo_dir.display());
+    } else if !espo_root.is_dir() {
+        anyhow::bail!("espo db root is not a directory: {}", espo_root.display());
     }
 
     if cfg.block_source_mode != BlockFetchMode::RpcOnly {
@@ -489,13 +497,12 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
     // --- init ESPO RocksDB once ---
     let mut espo_opts = Options::default();
     espo_opts.create_if_missing(true);
-    let espo_path = Path::new(&cfg.db_path).join("espo");
+    let espo_path = Path::new(&cfg.db_path).join("espo").join("_shared");
     let espo_db = std::sync::Arc::new(DB::open(&espo_opts, espo_path)?);
     ESPO_DB
         .set(espo_db.clone())
         .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
-
-    init_global_tree_db(espo_db.clone())?;
+    let _ = ESPO_MODULE_MDBS.set(RwLock::new(HashMap::new()));
 
     // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
     if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
@@ -566,12 +573,54 @@ pub fn get_metashrew_sdb() -> std::sync::Arc<SDB> {
 
 /// Getter for the ESPO module DB path (directory for RocksDB)
 pub fn get_espo_db_path() -> String {
+    Path::new(&get_config().db_path)
+        .join("espo")
+        .join("_shared")
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub fn get_espo_root_path() -> String {
     Path::new(&get_config().db_path).join("espo").to_string_lossy().into_owned()
+}
+
+pub fn get_espo_module_db_path(name: &str) -> String {
+    Path::new(&get_espo_root_path()).join(name).to_string_lossy().into_owned()
 }
 
 /// Cloneable handle to the global ESPO RocksDB
 pub fn get_espo_db() -> std::sync::Arc<DB> {
     std::sync::Arc::clone(ESPO_DB.get().expect("init_config() must be called once at startup"))
+}
+
+pub fn get_espo_module_mdb(name: &str) -> Arc<Mdb> {
+    let map = ESPO_MODULE_MDBS.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(existing) = map.read().expect("module mdb map poisoned").get(name).cloned() {
+        return existing;
+    }
+
+    let mut write = map.write().expect("module mdb map poisoned");
+    if let Some(existing) = write.get(name).cloned() {
+        return existing;
+    }
+
+    let path = Path::new(&get_espo_root_path()).join(name);
+    fs::create_dir_all(&path)
+        .unwrap_or_else(|e| panic!("failed to create module db dir {}: {e}", path.display()));
+
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    let db = Arc::new(
+        DB::open(&opts, &path)
+            .unwrap_or_else(|e| panic!("failed to open module db {}: {e}", path.display())),
+    );
+    let tree = Arc::new(
+        VersionedTreeDb::new(Arc::clone(&db))
+            .unwrap_or_else(|e| panic!("failed to init module tree {}: {e}", path.display())),
+    );
+    let mdb = Arc::new(Mdb::from_db_with_tree(db, b"", tree));
+    write.insert(name.to_string(), Arc::clone(&mdb));
+    mdb
 }
 
 /// Global accessor for the block source (blk files + RPC fallback)
@@ -650,6 +699,10 @@ pub fn get_explorer_pizza_tv_endpoint() -> &'static str {
 
 pub fn get_explorer_networks() -> Option<&'static ExplorerNetworks> {
     get_config().explorer_networks.as_ref()
+}
+
+pub fn get_google_analytics_tag() -> Option<&'static str> {
+    get_config().google_analytics_tag.as_deref()
 }
 
 pub fn get_espo_next_height() -> u32 {

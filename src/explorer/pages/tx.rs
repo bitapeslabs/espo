@@ -11,23 +11,23 @@ use bitcoincore_rpc::RpcApi;
 use maud::html;
 
 use crate::alkanes::trace::{
-    extract_alkane_storage, prettyify_protobuf_trace_json, traces_for_block_as_prost,
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
+    prettyify_protobuf_trace_json, traces_for_block_as_prost,
 };
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew,
 };
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::header::{
-    header, header_scripts, HeaderCta, HeaderPillTone, HeaderProps, HeaderSummaryItem,
+    HeaderCta, HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
 };
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::icon_arrow_up_right;
-use crate::explorer::components::tx_view::{render_tx, TxPill, TxPillTone};
+use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::utils::balances::{
-    get_outpoint_balances_with_spent, OutpointLookup,
+    OutpointLookup, get_outpoint_balances_with_spent,
 };
 use crate::runtime::mempool::pending_by_txid;
 use crate::runtime::state_at::StateAt;
@@ -125,10 +125,7 @@ fn fee_and_rate(
     (Some(fee), fee_rate)
 }
 
-pub async fn tx_page(
-    State(state): State<ExplorerState>,
-    Path(txid_str): Path<String>,
-) -> Response {
+pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<String>) -> Response {
     let canonical_path = format!("/tx/{txid_str}");
     let txid = match Txid::from_str(&txid_str) {
         Ok(t) => t,
@@ -142,7 +139,7 @@ pub async fn tx_page(
                     html! { p class="error" { "Invalid txid." } },
                 ),
             )
-                .into_response()
+                .into_response();
         }
     };
 

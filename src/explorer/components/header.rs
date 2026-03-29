@@ -1,4 +1,4 @@
-use maud::{html, Markup, PreEscaped};
+use maud::{Markup, PreEscaped, html};
 
 use crate::explorer::components::svg_assets::{icon_check, icon_copy};
 

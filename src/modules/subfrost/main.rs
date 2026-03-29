@@ -27,12 +27,11 @@ use std::sync::Arc;
 
 pub struct Subfrost {
     provider: Option<Arc<SubfrostProvider>>,
-    index_height: Arc<std::sync::RwLock<Option<u32>>>,
 }
 
 impl Subfrost {
     pub fn new() -> Self {
-        Self { provider: None, index_height: Arc::new(std::sync::RwLock::new(None)) }
+        Self { provider: None }
     }
 
     #[inline]
@@ -54,13 +53,12 @@ impl Subfrost {
     }
 
     fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
-        if let Some(prev) = *self.index_height.read().unwrap() {
+        if let Some(prev) = self.load_index_height()? {
             if new_height < prev {
                 eprintln!("[SUBFROST] index height rollback detected ({} -> {})", prev, new_height);
             }
         }
         self.persist_index_height(new_height, blockhash)?;
-        *self.index_height.write().unwrap() = Some(new_height);
         Ok(())
     }
 }
@@ -79,16 +77,17 @@ impl EspoModule for Subfrost {
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
         self.provider = Some(Arc::new(SubfrostProvider::new(mdb)));
         match self.load_index_height() {
-            Ok(h) => {
-                *self.index_height.write().unwrap() = h;
-                eprintln!("[SUBFROST] loaded index height: {:?}", h);
-            }
+            Ok(h) => eprintln!("[SUBFROST] loaded index height: {:?}", h),
             Err(e) => eprintln!("[SUBFROST] failed to load /index_height: {e:?}"),
         }
     }
 
     fn get_genesis_block(&self, _network: Network) -> u32 {
         0
+    }
+
+    fn get_mdb(&self) -> Option<Arc<Mdb>> {
+        self.provider.as_ref().map(|provider| Arc::new(provider.mdb().clone()))
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
@@ -99,12 +98,6 @@ impl EspoModule for Subfrost {
         let table = provider.table();
         let height = block.height;
         let block_hash = block.block_header.block_hash();
-        if let Some(prev) = *self.index_height.read().unwrap() {
-            if height <= prev {
-                eprintln!("[SUBFROST] skipping already indexed block #{height} (last={prev})");
-                return Ok(());
-            }
-        }
 
         let timer = debug::start_if(debug);
         let block_ts = block.block_header.time as u64;
@@ -288,11 +281,7 @@ impl EspoModule for Subfrost {
             debug::log_elapsed(module, "update_totals", timer);
             let timer = debug::start_if(debug);
             provider
-                .set_batch(SetBatchParams {
-                    blockhash: StateAt::Latest,
-                    puts,
-                    deletes: Vec::new(),
-                })
+                .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
                 .map_err(|e| anyhow!("[SUBFROST] set_batch failed at height {}: {e}", height))?;
             debug::log_elapsed(module, "write_batch", timer);
         }
@@ -314,7 +303,7 @@ impl EspoModule for Subfrost {
     }
 
     fn get_index_height(&self) -> Option<u32> {
-        *self.index_height.read().unwrap()
+        self.load_index_height().ok().flatten()
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {

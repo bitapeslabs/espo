@@ -8,8 +8,8 @@ use crate::modules::ammdata::schemas::{
     active_timeframes,
 };
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetListEntriesDescParams, GetRawValueParams, SearchIndexField,
-    SchemaChartChangeSetV1, SchemaChartChangeValueV1, TokenMetricsIndexField, decode_candle_v1,
+    AmmDataProvider, GetListEntriesDescParams, GetRawValueParams, SchemaChartChangeSetV1,
+    SchemaChartChangeValueV1, SearchIndexField, TokenMetricsIndexField, decode_candle_v1,
     decode_chart_change_set_v1, decode_full_candle_v1, decode_token_metrics, decode_u128_value,
     encode_alkane_id_be, encode_candle_v1, encode_chart_change_set_v1, encode_token_metrics,
     encode_u128_value, parse_change_basis_points,
@@ -37,10 +37,7 @@ fn read_m10_candles_map(
 ) -> Result<BTreeMap<u64, SchemaCandleV1>> {
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
-        .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest,
-            prefix,
-        })?
+        .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })?
         .entries
     {
         let Some(ts) = parse_bucket_ts_from_key(&k) else {
@@ -87,12 +84,10 @@ fn build_chart_change_set(
             tf.code().to_string(),
             SchemaChartChangeValueV1 {
                 usd_bp: crate::modules::ammdata::main::percent_change_basis_points(
-                    prev_usd,
-                    latest_usd,
+                    prev_usd, latest_usd,
                 ),
                 mcusd_bp: crate::modules::ammdata::main::percent_change_basis_points(
-                    prev_mcusd,
-                    now_mcusd,
+                    prev_mcusd, now_mcusd,
                 ),
             },
         );
@@ -127,10 +122,7 @@ fn read_m10_full_candles_map(
 ) -> Result<BTreeMap<u64, SchemaFullCandleV1>> {
     let mut per_bucket: BTreeMap<u64, SchemaFullCandleV1> = BTreeMap::new();
     for (k, v) in provider
-        .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest,
-            prefix,
-        })?
+        .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })?
         .entries
     {
         let Some(ts) = parse_bucket_ts_from_key(&k) else {
@@ -368,9 +360,10 @@ pub fn derive_token_data(
                 continue;
             };
             state.pool_candle_overrides.insert((pool, tf, bucket_ts), agg);
-            state
-                .candle_writes
-                .push((table.candle_key(&pool, tf, bucket_ts), crate::modules::ammdata::storage::encode_full_candle_v1(&agg)?));
+            state.candle_writes.push((
+                table.candle_key(&pool, tf, bucket_ts),
+                crate::modules::ammdata::storage::encode_full_candle_v1(&agg)?,
+            ));
         }
     }
 
@@ -1123,7 +1116,6 @@ pub fn derive_token_data(
                         .insert(bucket_ts, derived);
                 }
             }
-
         }
 
         for ((token, quote, tf, bucket_ts), candle) in token_derived_usd_candle_overrides.iter() {
@@ -1195,8 +1187,10 @@ pub fn derive_token_data(
             }
         }
         for token in tokens_with_usd_m10 {
-            let mut per_bucket =
-                read_m10_candles_map(provider, table.token_usd_candle_ns_prefix(&token, Timeframe::M10))?;
+            let mut per_bucket = read_m10_candles_map(
+                provider,
+                table.token_usd_candle_ns_prefix(&token, Timeframe::M10),
+            )?;
             for ((tok, tf, bucket_ts), candle) in token_usd_candle_overrides.iter() {
                 if *tok == token && *tf == Timeframe::M10 {
                     per_bucket.insert(*bucket_ts, *candle);
@@ -1218,8 +1212,10 @@ pub fn derive_token_data(
             }
         }
         for token in tokens_with_mcusd_m10 {
-            let mut per_bucket =
-                read_m10_candles_map(provider, table.token_mcusd_candle_ns_prefix(&token, Timeframe::M10))?;
+            let mut per_bucket = read_m10_candles_map(
+                provider,
+                table.token_mcusd_candle_ns_prefix(&token, Timeframe::M10),
+            )?;
             for ((tok, tf, bucket_ts), candle) in token_mcusd_candle_overrides.iter() {
                 if *tok == token && *tf == Timeframe::M10 {
                     per_bucket.insert(*bucket_ts, *candle);
@@ -1698,7 +1694,8 @@ pub fn derive_token_data(
                 continue;
             }
 
-            let mc_prefix = table.token_derived_mcusd_candle_ns_prefix(token, quote, Timeframe::M10);
+            let mc_prefix =
+                table.token_derived_mcusd_candle_ns_prefix(token, quote, Timeframe::M10);
             let mut mc_per_bucket = read_m10_candles_map(provider, mc_prefix.clone())?;
             for ((tok, q, tf, bucket), candle) in token_derived_mcusd_candle_overrides.iter() {
                 if tok == token && q == quote && *tf == Timeframe::M10 {
@@ -1794,10 +1791,8 @@ pub fn derive_token_data(
                     latest_close,
                 ),
             };
-            let chart_name = format!(
-                "{}:{}-derived_{}:{}-usd",
-                token.block, token.tx, quote.block, quote.tx
-            );
+            let chart_name =
+                format!("{}:{}-derived_{}:{}-usd", token.block, token.tx, quote.block, quote.tx);
             let next_chart_set = build_chart_change_set(now_bucket, &per_bucket, &mc_per_bucket);
             let prev_chart_set = provider
                 .get_raw_value(GetRawValueParams {

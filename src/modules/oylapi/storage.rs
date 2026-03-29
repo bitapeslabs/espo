@@ -1,10 +1,12 @@
 use crate::config::{debug_enabled, get_config, get_electrum_like, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
-use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, canonical_quotes};
+use crate::modules::ammdata::consts::{
+    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, canonical_quotes,
+};
 use crate::modules::ammdata::schemas::{
-    ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
-    SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe,
+    ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolCreationInfoV1, SchemaPoolSnapshot,
+    SchemaTokenMetricsV1, Timeframe,
 };
 use crate::modules::ammdata::storage::{
     AmmDataProvider, AmmHistoryEntry, GetActivityEntryParams, GetAddressPoolBurnsPageParams,
@@ -14,10 +16,9 @@ use crate::modules::ammdata::storage::{
     GetListEntriesDescParams, GetPoolActivityEntriesParams, GetPoolCreationInfoParams,
     GetPoolCreationsPageParams, GetPoolDefsParams, GetPoolFactoryParams,
     GetPoolIdsByNamePrefixParams, GetPoolLpSupplyLatestParams, GetPoolMetricsParams,
-    GetPoolMetricsV2Params,
-    GetTokenDerivedMetricsByIdParams, GetTokenDerivedMetricsIndexCountParams,
-    GetTokenDerivedMetricsIndexPageParams, GetTokenDerivedMetricsParams,
-    GetTokenDerivedSearchIndexPageParams, GetTokenMetricsByIdParams,
+    GetPoolMetricsV2Params, GetTokenDerivedMetricsByIdParams,
+    GetTokenDerivedMetricsIndexCountParams, GetTokenDerivedMetricsIndexPageParams,
+    GetTokenDerivedMetricsParams, GetTokenDerivedSearchIndexPageParams, GetTokenMetricsByIdParams,
     GetTokenMetricsIndexCountParams, GetTokenMetricsIndexPageParams, GetTokenMetricsParams,
     GetTokenPoolsParams, GetTokenSearchIndexPageParams, GetTokenSwapsPageParams, SearchIndexField,
     TokenMetricsIndexField, decode_full_candle_v1,
@@ -2942,11 +2943,10 @@ pub async fn get_alkane_swap_pair_details(
         };
         let Some(defs) = defs else { continue };
 
-        let mut balances =
-            match get_alkane_balances(blockhash.clone(), &state.essentials, &pool) {
-                Ok(v) => v,
-                Err(err) => return internal_error(err),
-            };
+        let mut balances = match get_alkane_balances(blockhash.clone(), &state.essentials, &pool) {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        };
         let base_reserve = balances.remove(&defs.base_alkane_id).unwrap_or(0);
         let quote_reserve = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
 

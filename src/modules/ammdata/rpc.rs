@@ -1,7 +1,7 @@
 use crate::modules::ammdata::storage::{
     AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
-    RpcGetBestMevSwapParams, RpcGetCandlesParams, RpcGetChartChangeBlockParams,
-    RpcGetChartChangesBlockParams, RpcGetPoolsParams, RpcPingParams,
+    RpcGetBestMevSwapParams, RpcGetBtcUsdPriceParams, RpcGetCandlesParams,
+    RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetPoolsParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -62,10 +62,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                 let mdb_for_handler = Arc::clone(&mdb_ptr_chart_change);
                 async move {
                     let params = RpcGetChartChangeBlockParams {
-                        chart: payload
-                            .get("chart")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
+                        chart: payload.get("chart").and_then(|v| v.as_str()).map(|s| s.to_string()),
                         height: payload.get("height").and_then(|v| v.as_u64()),
                     };
                     let view = match mdb_for_handler.with_height(
@@ -305,6 +302,36 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         }
                     };
                     view.rpc_get_best_mev_swap(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_btc = reg.clone();
+    let mdb_btc = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_btc
+            .register("get_btc_usd_price", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_btc);
+                async move {
+                    let params = RpcGetBtcUsdPriceParams {
+                        height: payload.get("height").and_then(|v| v.as_u64()),
+                    };
+                    let view = match mdb_for_handler
+                        .with_height(params.height, payload.get("height").is_some())
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_btc_usd_price(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }

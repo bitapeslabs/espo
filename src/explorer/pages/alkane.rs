@@ -3,7 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use hex;
-use maud::{html, Markup, PreEscaped};
+use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
@@ -14,7 +14,7 @@ use crate::explorer::components::svg_assets::{
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
-    alkane_icon_url_unfiltered, alkane_meta, icon_bg_style, AlkaneMetaCache,
+    AlkaneMetaCache, alkane_icon_url_unfiltered, alkane_meta, icon_bg_style,
 };
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
@@ -23,15 +23,14 @@ use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::schemas::Timeframe;
 use crate::modules::ammdata::storage::{AmmDataProvider, AmmDataTable, GetListKeysByPrefixParams};
 use crate::modules::essentials::storage::{
-    load_creation_record, BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId,
+    BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
 };
 use crate::modules::essentials::utils::balances::{
     get_alkane_balances, get_holders_for_alkane, get_total_received_for_alkane,
     get_transfer_volume_for_alkane,
 };
-use crate::modules::essentials::utils::inspections::{load_inspection, StoredInspectionMethod};
+use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
 use crate::modules::pizzafun::storage::{GetSeriesByAlkaneParams, PizzafunProvider};
-use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -182,10 +181,8 @@ pub async fn alkane_page(
     let supply_f64 = circulating_supply as f64;
 
     let tv_iframe_src: Option<String> = {
-        let db = crate::config::get_espo_db();
-
         let series_id = {
-            let pizzafun_mdb = Arc::new(Mdb::from_db(Arc::clone(&db), b"pizzafun:"));
+            let pizzafun_mdb = crate::config::get_espo_module_mdb("pizzafun");
             let pizzafun = PizzafunProvider::new(pizzafun_mdb);
             pizzafun
                 .get_series_by_alkane(GetSeriesByAlkaneParams {
@@ -208,12 +205,10 @@ pub async fn alkane_page(
                 .map(|dl| dl.derived_quotes.into_iter().map(|q| q.alkane).collect())
                 .unwrap_or_default();
 
-            let amm_mdb = Mdb::from_db(Arc::clone(&db), b"ammdata:");
+            let amm_mdb = crate::config::get_espo_module_mdb("ammdata");
             let table = AmmDataTable::new(&amm_mdb);
-            let amm_provider = AmmDataProvider::new(
-                Arc::new(amm_mdb.clone()),
-                Arc::new(state.essentials_provider()),
-            );
+            let amm_provider =
+                AmmDataProvider::new(Arc::clone(&amm_mdb), Arc::new(state.essentials_provider()));
 
             let has_prefix = |rel_prefix: Vec<u8>| -> bool {
                 amm_provider
@@ -849,11 +844,7 @@ fn fmt_activity_amount(raw: u128) -> String {
     let whole = units / unit;
     let rem = units % unit;
     let dec = (rem * 10) / unit;
-    if dec == 0 {
-        format!("{whole}{suffix}")
-    } else {
-        format!("{whole}.{dec}{suffix}")
-    }
+    if dec == 0 { format!("{whole}{suffix}") } else { format!("{whole}.{dec}{suffix}") }
 }
 
 fn split_methods(

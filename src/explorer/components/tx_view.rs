@@ -2,30 +2,30 @@ use std::collections::{HashMap, HashSet};
 
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::hashes::Hash;
-use bitcoin::{opcodes, Address, Amount, Network, ScriptBuf, Transaction, Txid};
-use maud::{html, Markup, PreEscaped};
+use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, Txid, opcodes};
+use maud::{Markup, PreEscaped, html};
 
 use crate::alkanes::trace::{
-    prettyify_protobuf_trace_json, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
-    EspoSandshrewLikeTraceStatus, EspoTrace,
+    EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoSandshrewLikeTraceStatus,
+    EspoTrace, prettyify_protobuf_trace_json,
 };
 use crate::explorer::components::svg_assets::{
     arrow_svg, icon_arrow_bend_down_right, icon_caret_right, icon_magic_wand,
 };
 use crate::explorer::consts::{
-    alkane_contract_name_overrides, alkane_factory_icon_blacklist, alkane_icon_overrides,
-    alkane_name_overrides, ALKANE_CONTRACT_ICON_BASE, ALKANE_TOKEN_ICON_BASE,
+    ALKANE_CONTRACT_ICON_BASE, ALKANE_TOKEN_ICON_BASE, alkane_contract_name_overrides,
+    alkane_factory_icon_blacklist, alkane_icon_overrides, alkane_name_overrides,
 };
 use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount};
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{load_creation_record, BalanceEntry, EssentialsProvider};
+use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider, load_creation_record};
 use crate::modules::essentials::utils::balances::OutpointLookup;
-use crate::modules::essentials::utils::inspections::{load_inspection, StoredInspectionResult};
+use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 const ADDR_SUFFIX_LEN: usize = 8;
@@ -269,11 +269,7 @@ fn decode_trace_response(data_hex: &str) -> Option<String> {
     }
     let text = String::from_utf8_lossy(&bytes).to_string();
     let trimmed = text.trim_matches('\u{0}').to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
 fn kv_row_key(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {

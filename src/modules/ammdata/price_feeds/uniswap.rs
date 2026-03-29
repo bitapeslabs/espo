@@ -5,9 +5,11 @@ use crate::modules::ammdata::consts::PRICE_SCALE_DECIMALS;
 use anyhow::{Result, anyhow};
 use bitcoincore_rpc::RpcApi;
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
@@ -57,9 +59,21 @@ struct EthBlock {
 }
 
 impl UniswapPriceFeed {
-    pub fn new(rpc_url: impl Into<String>, eth_call_throttle_ms: u64) -> Self {
+    pub fn new(rpc_url: impl Into<String>, eth_call_throttle_ms: u64, headers: HashMap<String, String>) -> Self {
+        let mut default_headers = HeaderMap::new();
+        for (k, v) in &headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            ) {
+                default_headers.insert(name, value);
+            } else {
+                eprintln!("[ammdata] warning: skipping invalid header: {k}: {v}");
+            }
+        }
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
+            .default_headers(default_headers)
             .build()
             .expect("build reqwest client");
         Self {
@@ -71,7 +85,7 @@ impl UniswapPriceFeed {
 
     pub fn from_global_config() -> Result<Self> {
         let cfg = AmmDataConfig::load_from_global_config()?;
-        Ok(Self::new(cfg.eth_rpc, cfg.eth_call_throttle_ms))
+        Ok(Self::new(cfg.eth_rpc, cfg.eth_call_throttle_ms, cfg.eth_rpc_headers))
     }
 
     fn rpc_call_with_url<T: DeserializeOwned>(

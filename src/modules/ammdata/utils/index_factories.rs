@@ -30,9 +30,7 @@ pub fn prepare_factories(
     let table = provider.table();
     let blockhash = StateAt::Block(block.block_header.block_hash());
     let mut amm_factories: HashSet<SchemaAlkaneId> = provider
-        .get_amm_factories(GetAmmFactoriesParams {
-            blockhash: blockhash.clone(),
-        })
+        .get_amm_factories(GetAmmFactoriesParams { blockhash: blockhash.clone() })
         .map(|res| res.factories.into_iter().collect())
         .unwrap_or_default();
     let mut amm_factory_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -62,7 +60,8 @@ pub fn prepare_factories(
                     if let Some(factory_id) = inspection.factory_alkane {
                         if !amm_factories.contains(&factory_id) {
                             amm_factories.insert(factory_id);
-                            amm_factory_writes.push((table.amm_factory_key(&factory_id), Vec::new()));
+                            amm_factory_writes
+                                .push((table.amm_factory_key(&factory_id), Vec::new()));
                         }
                     }
                 }

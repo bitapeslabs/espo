@@ -1,3 +1,4 @@
+use crate::config::get_espo_module_mdb;
 use crate::config::get_network;
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::runtime::mdb::Mdb;
@@ -12,7 +13,7 @@ pub struct ExplorerState {
 
 impl ExplorerState {
     pub fn new() -> Self {
-        let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+        let essentials_mdb = get_espo_module_mdb("essentials").as_ref().clone();
         let network = get_network();
         Self { essentials_mdb, network }
     }

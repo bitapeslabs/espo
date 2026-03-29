@@ -239,11 +239,7 @@ pub fn bootstrap_pools_from_creation_records(
     if debug_enabled() || load_elapsed_ms >= 250 {
         eprintln!(
             "[debug] module=ammdata fn=bootstrap_pools_from_creation_records stage=load_creation_records blockhash={:?} height={} scanned={} inserted={} elapsed_ms={}",
-            blockhash,
-            height,
-            scanned,
-            inserted,
-            load_elapsed_ms
+            blockhash, height, scanned, inserted, load_elapsed_ms
         );
     }
 

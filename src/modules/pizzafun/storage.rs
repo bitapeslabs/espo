@@ -1,7 +1,6 @@
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
@@ -193,10 +192,8 @@ impl PizzafunProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
-            return Err(anyhow!("versioned_tree_unavailable"));
-        };
-        let Some(blockhash) = tree
+        let Some(blockhash) = self
+            .mdb
             .blockhash_for_height(height_u32)
             .map_err(|e| anyhow!("tree lookup failed: {e}"))?
         else {
@@ -382,7 +379,8 @@ impl PizzafunProvider {
                 let Ok(series_id) = std::str::from_utf8(suffix) else {
                     continue;
                 };
-                if series_id_matches_name(series_id, name) && seen_ids.insert(series_id.to_string()) {
+                if series_id_matches_name(series_id, name) && seen_ids.insert(series_id.to_string())
+                {
                     filtered_ids.push(series_id.to_string());
                 }
             }
@@ -416,8 +414,7 @@ impl PizzafunProvider {
             deletes.push(table.series_all_entry_key(&entry.series_id));
         }
 
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(updated.len() * 3);
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(updated.len() * 3);
         for entry in updated {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
@@ -460,8 +457,7 @@ impl PizzafunProvider {
             }
         }
 
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(entries.len() * 3);
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len() * 3);
         for entry in entries {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));

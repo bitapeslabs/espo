@@ -1,5 +1,5 @@
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{debug_enabled, get_espo_db};
+use crate::config::{debug_enabled, get_espo_module_mdb};
 use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
@@ -14,7 +14,7 @@ use anyhow::Result;
 use bitcoin::Network;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use super::consts::PRIORITY_SERIES_ALKANES;
 use super::rpc;
@@ -45,16 +45,11 @@ fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
 pub struct Pizzafun {
     essentials_provider: Option<Arc<EssentialsProvider>>,
     provider: Option<Arc<PizzafunProvider>>,
-    index_height: Arc<RwLock<Option<u32>>>,
 }
 
 impl Pizzafun {
     pub fn new() -> Self {
-        Self {
-            essentials_provider: None,
-            provider: None,
-            index_height: Arc::new(RwLock::new(None)),
-        }
+        Self { essentials_provider: None, provider: None }
     }
 
     #[inline]
@@ -135,15 +130,19 @@ impl EspoModule for Pizzafun {
     }
 
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
-        let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
-        let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
+        let essentials_provider =
+            Arc::new(EssentialsProvider::new(get_espo_module_mdb("essentials")));
         self.essentials_provider = Some(essentials_provider);
         self.provider = Some(Arc::new(PizzafunProvider::new(mdb)));
-        *self.index_height.write().unwrap() = self.load_index_height();
+        eprintln!("[PIZZAFUN] loaded index height: {:?}", self.load_index_height());
     }
 
     fn get_genesis_block(&self, network: Network) -> u32 {
         crate::modules::essentials::consts::essentials_genesis_block(network)
+    }
+
+    fn get_mdb(&self) -> Option<Arc<Mdb>> {
+        self.provider.as_ref().map(|provider| Arc::new(provider.mdb().clone()))
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
@@ -233,8 +232,6 @@ impl EspoModule for Pizzafun {
             blockhash: StateAt::Latest,
             height: block.height,
         })?;
-        *self.index_height.write().expect("pizzafun index height lock poisoned") =
-            Some(block.height);
         debug::log_elapsed(module, "store_height", timer);
 
         let timer = debug::start_if(debug);
@@ -249,7 +246,7 @@ impl EspoModule for Pizzafun {
     }
 
     fn get_index_height(&self) -> Option<u32> {
-        *self.index_height.read().unwrap()
+        self.load_index_height()
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {

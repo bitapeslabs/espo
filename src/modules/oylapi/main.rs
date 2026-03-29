@@ -1,4 +1,4 @@
-use crate::config::{debug_enabled, get_config, get_espo_db};
+use crate::config::{debug_enabled, get_config, get_espo_module_mdb};
 use crate::debug;
 use crate::modules::ammdata::storage::AmmDataProvider;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 pub struct OylApi {
     config: Option<OylApiConfig>,
+    mdb: Option<Arc<Mdb>>,
     essentials: Option<Arc<EssentialsProvider>>,
     ammdata: Option<Arc<AmmDataProvider>>,
     subfrost: Option<Arc<SubfrostProvider>>,
@@ -22,7 +23,7 @@ pub struct OylApi {
 
 impl OylApi {
     pub fn new() -> Self {
-        Self { config: None, essentials: None, ammdata: None, subfrost: None }
+        Self { config: None, mdb: None, essentials: None, ammdata: None, subfrost: None }
     }
 }
 
@@ -37,13 +38,12 @@ impl EspoModule for OylApi {
         "oylapi"
     }
 
-    fn set_mdb(&mut self, _mdb: Arc<Mdb>) {
-        let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
-        let essentials = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
-        let amm_mdb = Mdb::from_db(get_espo_db(), b"ammdata:");
-        let ammdata = Arc::new(AmmDataProvider::new(Arc::new(amm_mdb), essentials.clone()));
-        let subfrost_mdb = Mdb::from_db(get_espo_db(), b"subfrost:");
-        let subfrost = Arc::new(SubfrostProvider::new(Arc::new(subfrost_mdb)));
+    fn set_mdb(&mut self, mdb: Arc<Mdb>) {
+        let essentials = Arc::new(EssentialsProvider::new(get_espo_module_mdb("essentials")));
+        let ammdata =
+            Arc::new(AmmDataProvider::new(get_espo_module_mdb("ammdata"), essentials.clone()));
+        let subfrost = Arc::new(SubfrostProvider::new(get_espo_module_mdb("subfrost")));
+        self.mdb = Some(mdb);
         self.essentials = Some(essentials);
         self.ammdata = Some(ammdata);
         self.subfrost = Some(subfrost);
@@ -51,6 +51,10 @@ impl EspoModule for OylApi {
 
     fn get_genesis_block(&self, _network: Network) -> u32 {
         u32::MAX
+    }
+
+    fn get_mdb(&self) -> Option<Arc<Mdb>> {
+        self.mdb.clone()
     }
 
     fn index_block(&self, block: crate::alkanes::trace::EspoBlock) -> Result<()> {

@@ -5,7 +5,7 @@ use rocksdb::{
 };
 use std::{path::Path, sync::Arc};
 
-use crate::runtime::tree_db::{get_global_tree_db, is_tree_internal_key};
+use crate::runtime::tree_db::{VersionedTreeDb, get_global_tree_db, is_tree_internal_key};
 
 /// ===== Cache / open-time tuning =====
 /// How big you want the LRU block cache (data + index/filter when enabled).
@@ -21,31 +21,34 @@ pub const BLOOM_BITS_PER_KEY: f64 = 10.0;
 pub struct Mdb {
     db: Arc<DB>,
     prefix: Vec<u8>,
-    versioned: bool,
+    tree: Option<Arc<VersionedTreeDb>>,
 }
 
 impl Mdb {
-    fn should_enable_versioned_namespace(prefix: &[u8]) -> bool {
-        matches!(prefix, b"essentials:" | b"ammdata:" | b"subfrost:" | b"pizzafun:" | b"oylapi:")
-    }
-
-    fn from_parts(db: Arc<DB>, prefix: impl AsRef<[u8]>, versioned: bool) -> Self {
+    fn from_parts(
+        db: Arc<DB>,
+        prefix: impl AsRef<[u8]>,
+        tree: Option<Arc<VersionedTreeDb>>,
+    ) -> Self {
         let prefix_vec = prefix.as_ref().to_vec();
-        Self { db, prefix: prefix_vec, versioned }
+        Self { db, prefix: prefix_vec, tree }
     }
 
     pub fn from_db(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {
-        // Back-compat constructor (no custom options)
-        let p = prefix.as_ref().to_vec();
-        let versioned = Self::should_enable_versioned_namespace(&p);
-        Self::from_parts(db, p, versioned)
+        Self::from_parts(db, prefix, None)
+    }
+
+    pub fn from_db_with_tree(
+        db: Arc<DB>,
+        prefix: impl AsRef<[u8]>,
+        tree: Arc<VersionedTreeDb>,
+    ) -> Self {
+        Self::from_parts(db, prefix, Some(tree))
     }
 
     /// Clone this handle onto the same underlying RocksDB with a different namespace prefix.
     pub fn clone_with_prefix(&self, prefix: impl AsRef<[u8]>) -> Self {
-        let p = prefix.as_ref().to_vec();
-        let versioned = Self::should_enable_versioned_namespace(&p);
-        Self::from_parts(Arc::clone(&self.db), p, versioned)
+        Self::from_parts(Arc::clone(&self.db), prefix, self.tree.clone())
     }
 
     pub fn open(path: impl AsRef<Path>, prefix: impl AsRef<[u8]>) -> Result<Self, RocksError> {
@@ -69,9 +72,7 @@ impl Mdb {
 
         let db = DB::open(&opts, path)?;
 
-        let p = prefix.as_ref().to_vec();
-        let versioned = Self::should_enable_versioned_namespace(&p);
-        let mdb = Self::from_parts(Arc::new(db), p, versioned);
+        let mdb = Self::from_parts(Arc::new(db), prefix, None);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace(); // best-effort
         }
@@ -95,9 +96,7 @@ impl Mdb {
         opts.set_block_based_table_factory(&table);
 
         let db = DB::open_for_read_only(&opts, path, error_if_log_file_exist)?;
-        let p = prefix.as_ref().to_vec();
-        let versioned = Self::should_enable_versioned_namespace(&p);
-        let mdb = Self::from_parts(Arc::new(db), p, versioned);
+        let mdb = Self::from_parts(Arc::new(db), prefix, None);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace();
         }
@@ -386,11 +385,80 @@ impl Mdb {
         self.versioned_manager().is_some()
     }
 
-    fn versioned_manager(&self) -> Option<Arc<crate::runtime::tree_db::VersionedTreeDb>> {
-        if !self.versioned {
-            return None;
+    pub fn tree(&self) -> Option<Arc<VersionedTreeDb>> {
+        self.versioned_manager()
+    }
+
+    pub fn begin_block(
+        &self,
+        height: u32,
+        block_hash: &BlockHash,
+        parent_hash: &BlockHash,
+    ) -> Result<(), RocksError> {
+        let Some(tree) = self.versioned_manager() else {
+            return Ok(());
+        };
+        tree.begin_block(height, block_hash, parent_hash)
+    }
+
+    pub fn finish_block(&self) -> Result<(), RocksError> {
+        let Some(tree) = self.versioned_manager() else {
+            return Ok(());
+        };
+        tree.finish_block()
+    }
+
+    pub fn abort_block(&self) {
+        if let Some(tree) = self.versioned_manager() {
+            tree.abort_block();
         }
-        get_global_tree_db()
+    }
+
+    pub fn has_blockhash(&self, block_hash: &BlockHash) -> Result<bool, RocksError> {
+        let Some(tree) = self.versioned_manager() else {
+            return Ok(false);
+        };
+        Ok(tree.root_for_blockhash(block_hash)?.is_some())
+    }
+
+    pub fn blockhash_for_height(&self, height: u32) -> Result<Option<BlockHash>, RocksError> {
+        let Some(tree) = self.versioned_manager() else {
+            return Ok(None);
+        };
+        tree.blockhash_for_height(height)
+    }
+
+    pub fn active_blockhash(&self) -> Option<BlockHash> {
+        self.versioned_manager().and_then(|tree| tree.active_blockhash())
+    }
+
+    pub fn height_for_blockhash(&self, block_hash: &BlockHash) -> Result<Option<u32>, RocksError> {
+        let Some(tree) = self.versioned_manager() else {
+            return Ok(None);
+        };
+        tree.height_for_blockhash(block_hash)
+    }
+
+    pub fn is_ancestor(
+        &self,
+        ancestor: &BlockHash,
+        descendant: &BlockHash,
+    ) -> Result<bool, RocksError> {
+        let Some(tree) = self.versioned_manager() else {
+            return Ok(false);
+        };
+        tree.is_ancestor(ancestor, descendant)
+    }
+
+    pub fn indexed_height_bounds(&self) -> Result<Option<(u32, u32)>, RocksError> {
+        let Some(tree) = self.versioned_manager() else {
+            return Ok(None);
+        };
+        tree.indexed_height_bounds()
+    }
+
+    fn versioned_manager(&self) -> Option<Arc<VersionedTreeDb>> {
+        self.tree.clone().or_else(get_global_tree_db)
     }
 }
 

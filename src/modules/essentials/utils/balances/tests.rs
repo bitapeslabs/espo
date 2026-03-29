@@ -37,6 +37,7 @@ fn init_test_config_from_run_sh() {
         compact_tx_trace_rows: true,
         address_index_chunk_size: 512,
         explorer_networks: None,
+        google_analytics_tag: None,
         modules: HashMap::new(),
     };
     if let Err(err) = init_config_from(cfg) {

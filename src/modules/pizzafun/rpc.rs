@@ -41,8 +41,8 @@ fn parse_height_payload(payload: &Value) -> Result<(Option<u64>, bool), ()> {
 }
 
 fn resolve_view(provider: &PizzafunProvider, payload: &Value) -> Result<PizzafunProvider, Value> {
-    let (height, height_present) =
-        parse_height_payload(payload).map_err(|_| json!({"ok": false, "error": "invalid_height"}))?;
+    let (height, height_present) = parse_height_payload(payload)
+        .map_err(|_| json!({"ok": false, "error": "invalid_height"}))?;
     provider
         .with_height(height, height_present)
         .map_err(|_| json!({"ok": false, "error": "invalid_height"}))

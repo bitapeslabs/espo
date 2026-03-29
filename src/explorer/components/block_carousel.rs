@@ -1,4 +1,4 @@
-use maud::{html, Markup, PreEscaped};
+use maud::{Markup, PreEscaped, html};
 
 use crate::explorer::paths::{current_language, explorer_path};
 

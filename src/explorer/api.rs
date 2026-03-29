@@ -1,11 +1,13 @@
 use crate::runtime::state_at::StateAt;
-use axum::extract::Query;
 use axum::Json;
+use axum::extract::Query;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::config::{get_config, get_espo_next_height, get_metashrew_rpc_url, get_network};
-use crate::explorer::components::tx_view::{alkane_meta, AlkaneMetaCache};
+use crate::config::{
+    get_config, get_espo_module_mdb, get_espo_next_height, get_metashrew_rpc_url, get_network,
+};
+use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
 use crate::explorer::pages::common::ALKANE_SCALE;
 use crate::explorer::paths::explorer_path;
@@ -14,13 +16,11 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
 };
 use crate::modules::essentials::storage::{
-    get_cached_block_summary, load_creation_record, BlockSummary, EssentialsProvider,
-    EssentialsTable, GetAlkaneIdsByNamePrefixPageParams, GetListEntriesDescParams,
-    HoldersCountEntry,
+    BlockSummary, EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
+    GetListEntriesDescParams, HoldersCountEntry, get_cached_block_summary, load_creation_record,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
@@ -29,8 +29,8 @@ use alkanes_support::proto::alkanes::{
 };
 use anyhow::Context;
 use bitcoin::blockdata::block::Header;
-use bitcoin::consensus::encode::deserialize;
 use bitcoin::consensus::Encodable;
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bitcoin::transaction::Version;
@@ -41,7 +41,7 @@ use ordinals::Runestone;
 use prost::Message;
 use protorune_support::protostone::{Protostone, Protostones};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
@@ -157,7 +157,7 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
     let start = center.saturating_sub(radius);
     let end = (center + radius).min(espo_tip);
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb = get_espo_module_mdb("essentials");
     let table = EssentialsTable::new(essentials_mdb.as_ref());
     let mut blocks: Vec<CarouselBlock> = Vec::with_capacity((end - start + 1) as usize);
 
@@ -189,7 +189,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         return Json(SearchGuessResponse { query, groups: Vec::new() });
     }
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb = get_espo_module_mdb("essentials");
     let essentials_provider = EssentialsProvider::new(essentials_mdb.clone());
     let table = EssentialsTable::new(essentials_mdb.as_ref());
     let mut meta_cache: AlkaneMetaCache = HashMap::new();
@@ -301,7 +301,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
         if search_index_enabled && query_len >= search_prefix_min && query_len <= search_prefix_max
         {
-            let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
+            let ammdata_mdb = get_espo_module_mdb("ammdata");
             let ammdata_provider =
                 AmmDataProvider::new(ammdata_mdb, Arc::new(essentials_provider.clone()));
             let ids = ammdata_provider
@@ -598,9 +598,9 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
         }
     };
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb = get_espo_module_mdb("essentials");
     let essentials_provider = Arc::new(EssentialsProvider::new(essentials_mdb));
-    let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
+    let ammdata_mdb = get_espo_module_mdb("ammdata");
     let provider = AmmDataProvider::new(ammdata_mdb, essentials_provider);
 
     let mut source = q
@@ -726,7 +726,7 @@ pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressCh
     let range = normalize_address_chart_range(q.range.as_deref());
     let (lookback_blocks, range_interval) = address_chart_range_params(&range);
     let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
+        get_espo_module_mdb("essentials").indexed_height_bounds().ok().flatten()
     else {
         return Json(AddressChartResponse {
             ok: true,
@@ -873,7 +873,7 @@ pub async fn alkane_balance_chart(
     let range = normalize_address_chart_range(q.range.as_deref());
     let (lookback_blocks, range_interval) = address_chart_range_params(&range);
     let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
+        get_espo_module_mdb("essentials").indexed_height_bounds().ok().flatten()
     else {
         return Json(AddressChartResponse {
             ok: true,
@@ -1228,10 +1228,10 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
     } else if let Some(exec) = sim.execution {
         let returns_norm = normalize_returns(req.returns.as_deref());
         let formatted = format_simulation_data(&exec.data, &returns_norm);
-        let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+        let essentials_mdb = get_espo_module_mdb("essentials");
         let mut meta_cache: AlkaneMetaCache = HashMap::new();
         let (alkanes, alkanes_overflow) = if should_decode_alkanes(&returns_norm) {
-            let cards = decode_alkane_cards(&exec.data, &mut meta_cache, &essentials_mdb);
+            let cards = decode_alkane_cards(&exec.data, &mut meta_cache, essentials_mdb.as_ref());
             match cards {
                 Some(batch) => (Some(batch.items), batch.overflow),
                 None => (None, None),
@@ -1476,11 +1476,7 @@ fn decode_support_alkane_ids_prefixed(bytes: &[u8], total: usize) -> Option<Alka
         let schema = schema_from_support_id(parsed)?;
         ids.push(schema);
     }
-    if ids.is_empty() {
-        None
-    } else {
-        Some(AlkaneDecodeResult { ids, total })
-    }
+    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
 }
 
 fn decode_support_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
@@ -1501,11 +1497,7 @@ fn decode_support_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
             ids.push(schema);
         }
     }
-    if ids.is_empty() {
-        None
-    } else {
-        Some(AlkaneDecodeResult { ids, total })
-    }
+    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
 }
 
 fn decode_proto_alkane_id(bytes: &[u8]) -> Option<SchemaAlkaneId> {
@@ -1524,11 +1516,7 @@ fn schema_from_support_id(id: SupportAlkaneId) -> Option<SchemaAlkaneId> {
 }
 
 fn validate_schema_alkane(id: SchemaAlkaneId) -> Option<SchemaAlkaneId> {
-    if (id.block as u128) <= MAX_ALKANE_BLOCK {
-        Some(id)
-    } else {
-        None
-    }
+    if (id.block as u128) <= MAX_ALKANE_BLOCK { Some(id) } else { None }
 }
 
 fn decode_utf8(bytes: &[u8]) -> Option<String> {

@@ -11,13 +11,13 @@ use api::{
     address_chart, alkane_balance_chart, alkane_chart, carousel_blocks, search_guess,
     simulate_contract,
 };
+use axum::Router;
 use axum::extract::Request;
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use i18n::ExplorerLanguage;
 use pages::address::address_page;
 use pages::alkane::alkane_page;
@@ -29,7 +29,9 @@ use pages::state::ExplorerState;
 use pages::tx::tx_page;
 use tokio::net::TcpListener;
 
-use crate::config::{get_espo_next_height, get_explorer_base_path, get_explorer_networks, get_network};
+use crate::config::{
+    get_espo_next_height, get_explorer_base_path, get_explorer_networks, get_network,
+};
 use components::layout::{favicon, style};
 use paths::with_language;
 
@@ -115,12 +117,8 @@ async fn sitemap_xml() -> impl IntoResponse {
 
     let tip = get_espo_next_height().saturating_sub(1) as u64;
     let latest_start = tip.saturating_sub(49);
-    let mut paths: Vec<String> = vec![
-        "/".to_string(),
-        "/zh".to_string(),
-        "/alkanes".to_string(),
-        "/zh/alkanes".to_string(),
-    ];
+    let mut paths: Vec<String> =
+        vec!["/".to_string(), "/zh".to_string(), "/alkanes".to_string(), "/zh/alkanes".to_string()];
     for height in (latest_start..=tip).rev() {
         paths.push(format!("/block/{height}"));
         paths.push(format!("/zh/block/{height}"));
@@ -171,9 +169,5 @@ fn current_public_base_url() -> Option<String> {
         }
     }?;
     let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
 }
