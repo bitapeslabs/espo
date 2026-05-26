@@ -1,0 +1,8 @@
+# espo runtime artifacts (added during mainnet sync — not canonical)
+config.json
+config.json.save
+btc_usd_active_points.json
+espo-*.log
+dumps/
+.codex
+.vscode/
