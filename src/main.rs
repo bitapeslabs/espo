@@ -1088,7 +1088,7 @@ async fn main() -> Result<()> {
     let mut service_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // Start RPC server
-    let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
+    let addr: SocketAddr = SocketAddr::new(cfg.host, cfg.port);
     let rpc_router = mods.router.clone();
     service_handles.push(tokio::spawn(async move {
         if let Err(e) = run_rpc(rpc_router, addr).await {

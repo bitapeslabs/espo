@@ -8,7 +8,7 @@ use electrum_client::Client;
 use rocksdb::{BlockBasedOptions, Cache, DB, Options};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
@@ -99,6 +99,10 @@ fn default_sdb_poll_ms() -> u16 {
 
 fn default_port() -> u16 {
     8080
+}
+
+fn default_host() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 
 fn default_explorer_base_path() -> String {
@@ -385,6 +389,8 @@ pub struct ConfigFile {
     pub indexer_block_delay_ms: u64,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_host")]
+    pub host: IpAddr,
     #[serde(default)]
     pub explorer_host: Option<SocketAddr>,
     #[serde(default = "default_explorer_base_path")]
@@ -447,6 +453,7 @@ pub struct AppConfig {
     pub sdb_poll_ms: u16,
     pub indexer_block_delay_ms: u64,
     pub port: u16,
+    pub host: IpAddr,
     pub explorer_host: Option<SocketAddr>,
     pub explorer_base_path: String,
     pub explorer_pizza_tv_endpoint: String,
@@ -520,6 +527,7 @@ impl AppConfig {
             sdb_poll_ms: file.sdb_poll_ms,
             indexer_block_delay_ms: file.indexer_block_delay_ms,
             port: file.port,
+            host: file.host,
             explorer_host: file.explorer_host,
             explorer_base_path,
             explorer_pizza_tv_endpoint,
