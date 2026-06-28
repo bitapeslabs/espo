@@ -36,6 +36,7 @@ use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
 use crate::modules::essentials::storage::preload_block_summary_cache;
+use crate::modules::explorerextensions::main::ExplorerExtensions;
 use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
 use crate::modules::subfrost::main::Subfrost;
@@ -492,6 +493,9 @@ async fn main() -> Result<()> {
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
     mods.register_module(Pizzafun::new());
+    // explorerextensions: trace-derived per-alkane tx indexes (top-level
+    // cellpack target + internal calls). No config section required.
+    mods.register_module(ExplorerExtensions::new());
     if get_module_config("ammdata").is_some() {
         mods.register_module(AmmData::new());
     } else {

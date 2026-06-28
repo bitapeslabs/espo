@@ -36,7 +36,7 @@ wasm-bindgen = "0.2.100"
 alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 ordinals = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 protorune-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
-metashrew-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+metashrew-support = { git = "https://github.com/kungfuflex/metashrew", branch = "develop" }
 
 # Non-WASM dependencies (server, network, DB, CLI, etc.)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -58,18 +58,18 @@ tower-http = { version = "0.5", features = ["cors"] }
 alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 
 # Required dependencies for alkanes support (from alkanes-rs)
-metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+metashrew-core = { git = "https://github.com/kungfuflex/metashrew", branch = "develop" }
 protorune = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 
 # Optional dependencies for test utilities
 alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
-metashrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
-rockshrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
+metashrew-runtime = { git = "https://github.com/kungfuflex/metashrew", branch = "develop", optional = true }
+rockshrew-runtime = { git = "https://github.com/kungfuflex/metashrew", branch = "develop", optional = true }
 wasmtime = { version = "18.0", features = ["async"], optional = true }
 
 [dev-dependencies]
 alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
-metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
+metashrew-core = { git = "https://github.com/kungfuflex/metashrew", branch = "develop", features = ["test-utils"] }
 protorune = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
 alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 tower = { version = "0.5", features = ["util"] }

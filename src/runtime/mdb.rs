@@ -26,7 +26,15 @@ pub struct Mdb {
 
 impl Mdb {
     fn should_enable_versioned_namespace(prefix: &[u8]) -> bool {
-        matches!(prefix, b"essentials:" | b"ammdata:" | b"subfrost:" | b"pizzafun:" | b"oylapi:")
+        matches!(
+            prefix,
+            b"essentials:"
+                | b"ammdata:"
+                | b"subfrost:"
+                | b"pizzafun:"
+                | b"oylapi:"
+                | b"explorerextensions:"
+        )
     }
 
     fn from_parts(db: Arc<DB>, prefix: impl AsRef<[u8]>, versioned: bool) -> Self {
