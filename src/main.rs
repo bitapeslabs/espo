@@ -42,6 +42,7 @@ use crate::modules::essentials::main::Essentials;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetBlockSummaryParams, cache_block_summary, preload_block_summary_cache,
 };
+use crate::modules::memgraph::main::Memgraph;
 use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
 use crate::modules::runes::main::{Runes, runes_enabled_from_global_config};
@@ -1066,6 +1067,11 @@ async fn main() -> Result<()> {
     } else {
         eprintln!("[modules] ammdata disabled (missing config)");
     }
+    if Memgraph::enabled_from_global_config() {
+        mods.register_module(Memgraph::new());
+    } else {
+        eprintln!("[modules] memgraph disabled (requires modules.memgraph.enable=true)");
+    }
     if runes_enabled_from_global_config() {
         mods.register_module(Runes::new());
     } else {
@@ -1116,6 +1122,7 @@ async fn main() -> Result<()> {
     let mut start_height = mods
         .modules()
         .iter()
+        .filter(|m| m.contributes_to_start_height())
         .map(|m| {
             let g = m.get_genesis_block(network);
             match m.get_index_height() {

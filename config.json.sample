@@ -58,6 +58,14 @@
     "regtest": "http://127.0.0.1:5081"
   },
   "modules": {
+    "memgraph": {
+      "enable": false,
+      "uri": "bolt://127.0.0.1:7690",
+      "username": null,
+      "password": null,
+      "connect_timeout_secs": 5,
+      "request_timeout_secs": 30
+    },
     "runes": {
       "enable": false,
       "load_live_outpoints": true

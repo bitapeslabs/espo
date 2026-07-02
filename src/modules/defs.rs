@@ -105,6 +105,10 @@ pub trait EspoModule: Send + Sync {
     fn index_block(&self, block: EspoBlock) -> Result<()>;
     fn get_index_height(&self) -> Option<u32>;
 
+    fn contributes_to_start_height(&self) -> bool {
+        true
+    }
+
     fn preflight_reorg(&self, _next_height: u32) -> Result<()> {
         Ok(())
     }

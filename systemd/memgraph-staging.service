@@ -1,0 +1,18 @@
+[Unit]
+Description=Memgraph Graph Database (staging)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=0
+ExecStartPre=/usr/bin/mkdir -p /root/.memgraph-staging
+ExecStartPre=/usr/bin/chown -R 101:103 /root/.memgraph-staging
+ExecStartPre=-/usr/bin/docker rm -f memgraph-staging
+ExecStart=/usr/bin/docker run --name memgraph-staging --publish 0.0.0.0:7690:7687 --volume /root/.memgraph-staging:/var/lib/memgraph memgraph/memgraph:latest
+ExecStop=/usr/bin/docker stop memgraph-staging
+ExecStopPost=-/usr/bin/docker rm -f memgraph-staging
+
+[Install]
+WantedBy=multi-user.target
