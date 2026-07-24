@@ -35,7 +35,6 @@ use std::time::{Duration, Instant};
 
 use crate::config::{DebugBackupConfig, get_block_source, init_block_source};
 //modules
-use crate::config::get_metashrew_sdb;
 use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
@@ -1118,7 +1117,9 @@ async fn main() -> Result<()> {
             "[mode] view-only enabled: indexer and mempool are disabled; serving existing data only"
         );
     }
-    let metashrew_sdb = get_metashrew_sdb();
+    // Absent only in remote-explorer deployments without a local metashrew db;
+    // view-only mode never reaches the indexer loop that needs it.
+    let metashrew_sdb_opt = crate::config::try_get_metashrew_sdb();
 
     // Build module registry with the global ESPO DB
     let mut mods = ModuleRegistry::with_db(get_espo_db());
@@ -1147,6 +1148,16 @@ async fn main() -> Result<()> {
         eprintln!("[modules] oylapi disabled (missing config)");
     }
     // mods.register_module(TracesData::new());
+
+    if crate::config::internal_rpc_enabled() {
+        let internal_ns =
+            crate::modules::defs::RpcNsRegistrar::new(mods.router.clone(), "internal");
+        crate::runtime::internal_rpc::register_internal_rpc(internal_ns);
+    } else {
+        eprintln!(
+            "[RPC::INTERNAL] storage-primitive RPC disabled (set enable_internal_rpc=true to serve remote explorers)"
+        );
+    }
 
     // Decide initial start height (resume at last+1 per module)
     let mut start_height = module_resume_start_height(&mods, network);
@@ -1203,6 +1214,28 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("espo height client already initialized"))?;
     let next_height: u32 = start_height;
 
+    // Remote-explorer mode: this instance's height displays should reflect the
+    // REMOTE espo's indexed tip, not the (typically empty) local database.
+    // Poll the remote root get_espo_height and mirror it into ESPO_HEIGHT.
+    if let Some(remote) = crate::config::get_explorer_remote_mdb_client() {
+        let cell = height_cell.clone();
+        std::thread::spawn(move || {
+            loop {
+                match remote.call("get_espo_height", serde_json::json!({})) {
+                    Ok(result) => {
+                        if let Some(h) = result.get("height").and_then(|v| v.as_u64()) {
+                            let next = (h as u32).saturating_add(1);
+                            cell.store(next, std::sync::atomic::Ordering::Relaxed);
+                            crate::config::update_safe_tip(h as u32);
+                        }
+                    }
+                    Err(e) => eprintln!("[explorer] remote espo height poll failed: {e}"),
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        });
+    }
+
     if view_only {
         let indexed_height = start_height.saturating_sub(1);
         update_safe_tip(indexed_height);
@@ -1220,6 +1253,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let metashrew_sdb = metashrew_sdb_opt
+        .expect("indexing requires a local metashrew database (readonly_metashrew_db_dir)");
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_for_indexer = shutdown_requested.clone();
     let db_write_active = Arc::new(AtomicBool::new(false));

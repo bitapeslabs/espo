@@ -400,10 +400,8 @@ pub async fn block_page(
         .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
         .unwrap_or(false);
     let runes_provider = RunesProvider::new(Arc::new(state.runes_mdb.clone()));
-    let tokendata_provider = TokenDataProvider::new(Arc::new(crate::runtime::mdb::Mdb::from_db(
-        crate::config::get_espo_db(),
-        b"tokendata:",
-    )));
+    let tokendata_provider =
+        TokenDataProvider::new(Arc::new(crate::config::explorer_mdb(b"tokendata:")));
     let canonical_path = format!("/block/{height}");
 
     let block_hash = match rpc.get_block_hash(height) {

@@ -9,8 +9,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::{
-    get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_db, get_espo_next_height,
-    get_metashrew_rpc_url, get_network,
+    explorer_indexed_height_bounds, get_bitcoind_rpc_client, get_config, get_electrum_like,
+    get_espo_next_height, get_metashrew_rpc_url, get_network,
 };
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
@@ -40,7 +40,6 @@ use crate::runtime::mempool::{
     current_mempool_compact_snapshot, get_mempool_block_transaction_ids, pending_by_txid,
     subscribe_mempool_events,
 };
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
@@ -699,7 +698,7 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
         return Json(CarouselResponse { espo_tip, blocks: Vec::new() });
     }
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb = Arc::new(crate::config::explorer_mdb(b"essentials:"));
     let essentials_provider = EssentialsProvider::new(essentials_mdb.clone());
     let summary_heights: Vec<u32> =
         (start..=end).filter(|h| *h >= first_summary_height).map(|h| h as u32).collect();
@@ -782,7 +781,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         return Json(SearchGuessResponse { query, groups: Vec::new() });
     }
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb = Arc::new(crate::config::explorer_mdb(b"essentials:"));
     let essentials_provider = EssentialsProvider::new(essentials_mdb.clone());
     let table = EssentialsTable::new(essentials_mdb.as_ref());
     let mut meta_cache: AlkaneMetaCache = HashMap::new();
@@ -936,7 +935,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
         if search_index_enabled && query_len >= search_prefix_min && query_len <= search_prefix_max
         {
-            let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
+            let ammdata_mdb = Arc::new(crate::config::explorer_mdb(b"ammdata:"));
             let ammdata_provider =
                 AmmDataProvider::new(ammdata_mdb, Arc::new(essentials_provider.clone()));
             let ids = ammdata_provider
@@ -1039,7 +1038,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     }
 
     if runes_enabled_from_global_config() {
-        let runes_provider = RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")));
+        let runes_provider = RunesProvider::new(Arc::new(crate::config::explorer_mdb(b"runes:")));
         if let Ok(Some(entry)) = runes_provider.get_rune_by_query(&query) {
             let _ = push_rune_item(&runes_provider, &mut seen_runes, &mut runes, entry);
         }
@@ -1231,7 +1230,7 @@ pub async fn alkane_holders_export(Query(q): Query<AlkaneHoldersExportQuery>) ->
         None => "json",
     };
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb = Arc::new(crate::config::explorer_mdb(b"essentials:"));
     let essentials_provider = EssentialsProvider::new(essentials_mdb);
     let Ok((total, supply, holders)) =
         get_holders_for_alkane(StateAt::Latest, &essentials_provider, alkane, 1, usize::MAX)
@@ -1267,7 +1266,36 @@ pub async fn alkane_abi_export(Query(q): Query<AlkaneAbiExportQuery>) -> Respons
 
     let extraction_format = format;
     let generated = tokio::task::spawn_blocking(move || {
-        let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        // Remote-explorer mode has no local metashrew wasm to analyze; fetch
+        // the rendered ABI from the remote espo's get_alkabi RPC instead.
+        if crate::config::try_get_metashrew_sdb().is_none() {
+            let Some(client) = crate::config::get_explorer_remote_mdb_client() else {
+                anyhow::bail!("metashrew unavailable");
+            };
+            let result = client
+                .call(
+                    "essentials.get_alkabi",
+                    serde_json::json!({
+                        "alkane": format!("{}:{}", alkane.block, alkane.tx),
+                        "format": extraction_format.as_str(),
+                    }),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let contract = result
+                .get("abi")
+                .and_then(|abi| abi.get("contract"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("contract")
+                .to_string();
+            let filename = alkabi_download_filename(&contract, extraction_format.as_str());
+            let body = match result.get("abi") {
+                Some(serde_json::Value::String(ts)) => ts.clone(),
+                Some(abi) => serde_json::to_string_pretty(abi)?,
+                None => anyhow::bail!("remote get_alkabi returned no abi"),
+            };
+            return anyhow::Ok((filename, body));
+        }
+        let essentials_mdb = Arc::new(crate::config::explorer_mdb(b"essentials:"));
         let essentials_provider = EssentialsProvider::new(essentials_mdb);
         let abi = extract_contract_alkabi(&essentials_provider, &alkane)?;
         let filename = alkabi_download_filename(&abi.contract, extraction_format.as_str());
@@ -1309,7 +1337,28 @@ pub async fn alkane_wasm_export(Query(q): Query<AlkaneWasmExportQuery>) -> Respo
     };
 
     let generated = tokio::task::spawn_blocking(move || {
-        let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        // Remote-explorer mode has no local metashrew; pull the bytes from
+        // the remote espo's get_alkane_wasm RPC instead.
+        if crate::config::try_get_metashrew_sdb().is_none() {
+            let Some(client) = crate::config::get_explorer_remote_mdb_client() else {
+                anyhow::bail!("metashrew unavailable");
+            };
+            let result = client
+                .call(
+                    "essentials.get_alkane_wasm",
+                    serde_json::json!({ "alkane": format!("{}:{}", alkane.block, alkane.tx) }),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let payload = result
+                .get("wasm_base64")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("remote get_alkane_wasm returned no payload"))?;
+            use base64::Engine as _;
+            return base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .map_err(|e| anyhow::anyhow!("decode remote wasm: {e}"));
+        }
+        let essentials_mdb = Arc::new(crate::config::explorer_mdb(b"essentials:"));
         let essentials_provider = EssentialsProvider::new(essentials_mdb);
         load_contract_wasm(&essentials_provider, &alkane)
     })
@@ -1352,7 +1401,7 @@ pub async fn rune_holders_export(Query(q): Query<RuneHoldersExportQuery>) -> Res
         None => "json",
     };
 
-    let provider = RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")));
+    let provider = RunesProvider::new(Arc::new(crate::config::explorer_mdb(b"runes:")));
     let Ok(Some(entry)) = provider.get_rune_by_query(raw_rune) else {
         return text_response(StatusCode::NOT_FOUND, "rune_not_found");
     };
@@ -1416,9 +1465,9 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
         }
     };
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb = Arc::new(crate::config::explorer_mdb(b"essentials:"));
     let essentials_provider = Arc::new(EssentialsProvider::new(essentials_mdb));
-    let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
+    let ammdata_mdb = Arc::new(crate::config::explorer_mdb(b"ammdata:"));
     let provider = AmmDataProvider::new(ammdata_mdb, essentials_provider);
 
     let mut source = q
@@ -1560,7 +1609,7 @@ pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressCh
                 error: None,
             });
         }
-        let provider = RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")));
+        let provider = RunesProvider::new(Arc::new(crate::config::explorer_mdb(b"runes:")));
         let Some(index_height) = provider.get_index_height().ok().flatten() else {
             return Json(AddressChartResponse {
                 ok: true,
@@ -1633,9 +1682,7 @@ pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressCh
             error: Some("missing_or_invalid_alkane".to_string()),
         });
     };
-    let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
-    else {
+    let Some((indexed_min, indexed_max)) = explorer_indexed_height_bounds() else {
         return Json(AddressChartResponse {
             ok: true,
             available: false,
@@ -1780,9 +1827,7 @@ pub async fn alkane_balance_chart(
 
     let range = normalize_address_chart_range(q.range.as_deref());
     let (lookback_blocks, range_interval) = address_chart_range_params(&range);
-    let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
-    else {
+    let Some((indexed_min, indexed_max)) = explorer_indexed_height_bounds() else {
         return Json(AddressChartResponse {
             ok: true,
             available: false,
@@ -1896,9 +1941,7 @@ pub async fn minting_price_chart(
 ) -> Json<AddressChartResponse> {
     let range = normalize_address_chart_range(q.range.as_deref());
     let (lookback_blocks, range_interval) = address_chart_range_params(&range);
-    let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
-    else {
+    let Some((indexed_min, indexed_max)) = explorer_indexed_height_bounds() else {
         return Json(AddressChartResponse {
             ok: true,
             available: false,
@@ -1926,14 +1969,14 @@ pub async fn minting_price_chart(
     let rows = match kind.as_str() {
         "alkane" | "diesel" => {
             let provider =
-                TokenDataProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"tokendata:")));
+                TokenDataProvider::new(Arc::new(crate::config::explorer_mdb(b"tokendata:")));
             provider.get_diesel_avg_price_paid_usd_points_through_height(range_max)
         }
         "rune" | "ug" | "uncommon_goods" => {
             if !runes_enabled_from_global_config() {
                 Ok(Vec::new())
             } else {
-                let provider = RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")));
+                let provider = RunesProvider::new(Arc::new(crate::config::explorer_mdb(b"runes:")));
                 provider.get_uncommon_goods_avg_price_paid_usd_points_through_height(range_max)
             }
         }
@@ -2209,7 +2252,7 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
     } else if let Some(exec) = sim.execution {
         let returns_norm = normalize_returns(req.returns.as_deref());
         let formatted = format_simulation_data(&exec.data, &returns_norm);
-        let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+        let essentials_mdb = crate::config::explorer_mdb(b"essentials:");
         let mut meta_cache: AlkaneMetaCache = HashMap::new();
         let (alkanes, alkanes_overflow) = if should_decode_alkanes(&returns_norm) {
             let cards = decode_alkane_cards(&exec.data, &mut meta_cache, &essentials_mdb);

@@ -4,11 +4,10 @@ use bitcoincore_rpc::RpcApi;
 use serde::Deserialize;
 use std::str::FromStr;
 
-use crate::config::{get_bitcoind_rpc_client, get_espo_db, get_network};
+use crate::config::{get_bitcoind_rpc_client, get_network};
 use crate::explorer::paths::explorer_path;
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::RunesProvider;
-use crate::runtime::mdb::Mdb;
 use bitcoin::Address;
 use std::sync::Arc;
 
@@ -36,7 +35,7 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
     }
 
     if runes_enabled_from_global_config() {
-        let provider = RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")));
+        let provider = RunesProvider::new(Arc::new(crate::config::explorer_mdb(b"runes:")));
         if let Ok(Some(entry)) = provider.get_rune_by_query(&query) {
             return Redirect::to(&explorer_path(&format!("/rune/{}", entry.id))).into_response();
         }

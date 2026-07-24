@@ -971,8 +971,7 @@ pub fn render_tx(
 ) -> Markup {
     let mut alkane_meta_cache: AlkaneMetaCache = HashMap::new();
     let mut alkane_impl_cache: AlkaneImplCache = HashMap::new();
-    let runes_provider =
-        RunesProvider::new(Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"runes:")));
+    let runes_provider = RunesProvider::new(Arc::new(crate::config::explorer_mdb(b"runes:")));
     let tx_rune_io = projected_rune_io_override
         .cloned()
         .or_else(|| runes_provider.get_tx_io(txid).ok().flatten());

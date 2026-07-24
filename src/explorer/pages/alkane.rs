@@ -735,9 +735,8 @@ pub async fn alkane_page(
     } else {
         format!("Alkane {alk_str}")
     };
-    let db = crate::config::get_espo_db();
-    let amm_mdb = Mdb::from_db(Arc::clone(&db), b"ammdata:");
-    let tokendata_mdb = Mdb::from_db(Arc::clone(&db), b"tokendata:");
+    let amm_mdb = crate::config::explorer_mdb(b"ammdata:");
+    let tokendata_mdb = crate::config::explorer_mdb(b"tokendata:");
     let amm_table = AmmDataTable::new(&amm_mdb);
     let amm_provider =
         AmmDataProvider::new(Arc::new(amm_mdb.clone()), Arc::new(state.essentials_provider()));
@@ -894,7 +893,7 @@ pub async fn alkane_page(
     };
     let tv_iframe_src: Option<String> = {
         let series_id = {
-            let pizzafun_mdb = Arc::new(Mdb::from_db(Arc::clone(&db), b"pizzafun:"));
+            let pizzafun_mdb = Arc::new(crate::config::explorer_mdb(b"pizzafun:"));
             let pizzafun = PizzafunProvider::new(pizzafun_mdb);
             pizzafun
                 .get_series_by_alkane(GetSeriesByAlkaneParams {

@@ -1805,6 +1805,61 @@ fn docs_modules() -> Vec<ModuleDoc> {
             intro: "HTTP and websocket endpoints used by the explorer interface.",
             methods: explorer_http_docs(),
         },
+        ModuleDoc {
+            slug: "internal-rpc",
+            title: "Internal storage RPC",
+            intro: "Read-only storage primitives that let a remote espo explorer (configured with explorer_espo_rpc_host) fulfil its server-side rendering data needs against this instance. Every module getter bottoms out in these Mdb primitives, so serving them powers the entire remote explorer. Registered only when enable_internal_rpc is true; the methods expose raw namespace reads and scans, so keep them off untrusted public endpoints. All keys and values are hex encoded; prefix is a module namespace like \"essentials:\"; the optional blockhash (32 hex bytes, internal byte order) reads versioned namespaces at that block's state instead of latest.",
+            methods: vec![
+                rpc_doc(
+                    "internal.mdb_get",
+                    "Reads one value by relative key inside a module namespace, resolved through the versioned tree when the namespace is versioned.",
+                    json!({ "prefix": "essentials:", "key": "2f696e6465785f686569676874" }),
+                    json!({ "ok": true, "value": "40100e00" }),
+                ),
+                rpc_doc(
+                    "internal.mdb_multi_get",
+                    "Batched point lookups. Returns one entry per requested key, null where the key is absent, in request order.",
+                    json!({ "prefix": "essentials:", "keys": ["6b65792d61", "6b65792d62"] }),
+                    json!({ "ok": true, "values": ["0011ff", null] }),
+                ),
+                rpc_doc(
+                    "internal.mdb_scan_prefix_entries",
+                    "Returns all (key, value) pairs whose relative key starts with scan_prefix. Capped at 1,000,000 entries; narrow the prefix beyond that.",
+                    json!({ "prefix": "essentials:", "scan_prefix": "686f6c646572732f" }),
+                    json!({ "ok": true, "entries": [["686f6c646572732f0001", "01"]] }),
+                ),
+                rpc_doc(
+                    "internal.mdb_scan_prefix_keys",
+                    "Like mdb_scan_prefix_entries but returns only the keys.",
+                    json!({ "prefix": "essentials:", "scan_prefix": "686f6c646572732f" }),
+                    json!({ "ok": true, "keys": ["686f6c646572732f0001"] }),
+                ),
+                rpc_doc(
+                    "internal.mdb_scan_range_entries",
+                    "Returns (key, value) pairs from start (inclusive) to end (exclusive, optional) in relative-key order.",
+                    json!({ "prefix": "essentials:", "start": "61", "end": "62" }),
+                    json!({ "ok": true, "entries": [["6161", "01"]] }),
+                ),
+                rpc_doc(
+                    "internal.mdb_scan_range_entries_page",
+                    "Paged range scan with offset, limit and reverse ordering — the primitive behind paginated explorer lists.",
+                    json!({ "prefix": "essentials:", "start": "61", "end": "62", "offset": 0, "limit": 100, "reverse": true }),
+                    json!({ "ok": true, "entries": [["6161", "01"]] }),
+                ),
+                rpc_doc(
+                    "internal.tree_blockhash_for_height",
+                    "Resolves an indexed height to its canonical blockhash (internal byte order, hex). Used by remote explorers to serve height-pinned views.",
+                    json!({ "height": 946000 }),
+                    json!({ "ok": true, "height": 946000, "blockhash": "0000000000000000000000000000000000000000000000000000000000000000" }),
+                ),
+                rpc_doc(
+                    "internal.tree_indexed_height_bounds",
+                    "Returns the (min, max) indexed heights of the versioned tree, or nulls when nothing is indexed.",
+                    json!({}),
+                    json!({ "ok": true, "min": 880000, "max": 946000 }),
+                ),
+            ],
+        },
     ]
 }
 

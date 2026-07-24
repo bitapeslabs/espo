@@ -13,8 +13,8 @@ pub struct ExplorerState {
 
 impl ExplorerState {
     pub fn new() -> Self {
-        let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
-        let runes_mdb = Mdb::from_db(crate::config::get_espo_db(), b"runes:");
+        let essentials_mdb = crate::config::explorer_mdb(b"essentials:");
+        let runes_mdb = crate::config::explorer_mdb(b"runes:");
         let network = get_network();
         Self { essentials_mdb, runes_mdb, network }
     }

@@ -6441,6 +6441,28 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
 }
 
 fn lookup_self_balance(alk: &SchemaAlkaneId) -> Option<u128> {
+    // Remote-explorer deployments have no local metashrew; ask the remote
+    // espo's equivalent RPC for the self-balance instead.
+    if crate::config::try_get_metashrew_sdb().is_none() {
+        let client = crate::config::get_explorer_remote_mdb_client()?;
+        let id = format!("{}:{}", alk.block, alk.tx);
+        return match client.call(
+            "essentials.get_alkane_balance_metashrew",
+            serde_json::json!({ "owner": id, "alkane": id }),
+        ) {
+            Ok(result) => result
+                .get("balance")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u128>().ok()),
+            Err(e) => {
+                eprintln!(
+                    "[balances] WARN: remote self-balance lookup failed for {}:{} ({e})",
+                    alk.block, alk.tx
+                );
+                None
+            }
+        };
+    }
     match get_metashrew().get_reserves_for_alkane(alk, alk, None) {
         Ok(val) => val,
         Err(e) => {

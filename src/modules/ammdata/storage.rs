@@ -1794,10 +1794,10 @@ impl AmmDataProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
-            return Err(anyhow!("versioned_tree_unavailable"));
-        };
-        let Some(blockhash) = tree
+        // Resolve via the Mdb so remote-backed handles (explorer_espo_rpc_host)
+        // ask the remote espo instead of the local versioned tree.
+        let Some(blockhash) = self
+            .mdb
             .blockhash_for_height(height_u32)
             .map_err(|e| anyhow!("tree lookup failed: {e}"))?
         else {

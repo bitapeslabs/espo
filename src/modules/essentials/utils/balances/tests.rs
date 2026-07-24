@@ -31,6 +31,8 @@ fn init_test_config_from_run_sh() {
         sdb_poll_ms: 5000,
         indexer_block_delay_ms: 0,
         port: 5778,
+        explorer_espo_rpc_host: None,
+        enable_internal_rpc: false,
         explorer_host: Some("0.0.0.0:5779".parse().expect("parse explorer_host")),
         explorer_base_path: "/".to_string(),
         explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),

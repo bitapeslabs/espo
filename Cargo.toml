@@ -49,6 +49,7 @@ axum = { version = "0.8.4", features = ["ws"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 electrum-client = "0.24.0"
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+ureq = { version = "2.12", features = ["json"] }
 tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "tcp"] }
 tokio-stream = "0.1.17"
 tokio-serde = {version = "0.9.0", features = ["json"]}

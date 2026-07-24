@@ -540,6 +540,10 @@ pub struct ConfigFile {
     pub port: u16,
     #[serde(default)]
     pub explorer_host: Option<SocketAddr>,
+    #[serde(default)]
+    pub explorer_espo_rpc_host: Option<String>,
+    #[serde(default)]
+    pub enable_internal_rpc: bool,
     #[serde(default = "default_explorer_base_path")]
     pub explorer_base_path: String,
     #[serde(default = "default_explorer_pizza_tv_endpoint")]
@@ -608,6 +612,8 @@ pub struct AppConfig {
     pub indexer_block_delay_ms: u64,
     pub port: u16,
     pub explorer_host: Option<SocketAddr>,
+    pub explorer_espo_rpc_host: Option<String>,
+    pub enable_internal_rpc: bool,
     pub explorer_base_path: String,
     pub explorer_pizza_tv_endpoint: String,
     pub explorer_amm_prefix: String,
@@ -692,6 +698,8 @@ impl AppConfig {
             indexer_block_delay_ms: file.indexer_block_delay_ms,
             port: file.port,
             explorer_host: file.explorer_host,
+            explorer_espo_rpc_host: normalize_optional_string(file.explorer_espo_rpc_host),
+            enable_internal_rpc: file.enable_internal_rpc,
             explorer_base_path,
             explorer_pizza_tv_endpoint,
             explorer_amm_prefix,
@@ -731,11 +739,21 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
     // --- validations ---
     let db = Path::new(&cfg.readonly_metashrew_db_dir);
-    if !db.exists() {
-        anyhow::bail!("Database path does not exist: {}", cfg.readonly_metashrew_db_dir);
-    }
-    if !db.is_dir() {
-        anyhow::bail!("Database path is not a directory: {}", cfg.readonly_metashrew_db_dir);
+    let metashrew_dir_ok = db.exists() && db.is_dir();
+    if !metashrew_dir_ok {
+        // A remote-explorer deployment (explorer_espo_rpc_host) may not have a
+        // local metashrew database; SSR data comes from the remote espo, so a
+        // missing metashrew dir is survivable there and fatal otherwise.
+        if cfg.explorer_espo_rpc_host.is_some() {
+            eprintln!(
+                "[config] metashrew db dir missing or invalid ({}); continuing because explorer_espo_rpc_host is set — metashrew-backed features are disabled",
+                cfg.readonly_metashrew_db_dir
+            );
+        } else if !db.exists() {
+            anyhow::bail!("Database path does not exist: {}", cfg.readonly_metashrew_db_dir);
+        } else {
+            anyhow::bail!("Database path is not a directory: {}", cfg.readonly_metashrew_db_dir);
+        }
     }
 
     if cfg.metashrew_rpc_url.trim().is_empty() {
@@ -863,16 +881,28 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
     // --- init Secondary RocksDB (SDB) once ---
     // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
-    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() && metashrew_dir_ok {
         let secondary_path = get_sdb_path_for_metashrew()?;
-        let sdb = SDB::open(
+        match SDB::open(
             cfg.readonly_metashrew_db_dir.clone(),
             secondary_path,
             Duration::from_millis(cfg.sdb_poll_ms as u64),
-        )?;
-        METASHREW_SDB
-            .set(std::sync::Arc::new(sdb))
-            .map_err(|_| anyhow::anyhow!("metashrew SDB already initialized"))?;
+        ) {
+            Ok(sdb) => {
+                METASHREW_SDB
+                    .set(std::sync::Arc::new(sdb))
+                    .map_err(|_| anyhow::anyhow!("metashrew SDB already initialized"))?;
+            }
+            // A remote-explorer deployment (explorer_espo_rpc_host) may not have
+            // a local metashrew database; SSR data comes from the remote espo,
+            // so a missing metashrew db is survivable there and fatal otherwise.
+            Err(e) if cfg.explorer_espo_rpc_host.is_some() => {
+                eprintln!(
+                    "[config] metashrew db unavailable ({e:#}); continuing because explorer_espo_rpc_host is set — metashrew-backed features are disabled"
+                );
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // --- init ESPO RocksDB once ---
@@ -975,6 +1005,13 @@ pub fn get_metashrew_sdb() -> std::sync::Arc<SDB> {
     )
 }
 
+/// Like `get_metashrew_sdb`, but survives deployments without a local
+/// metashrew database (remote-explorer mode). Callers that can degrade
+/// should prefer this.
+pub fn try_get_metashrew_sdb() -> Option<std::sync::Arc<SDB>> {
+    METASHREW_SDB.get().map(std::sync::Arc::clone)
+}
+
 /// Getter for the ESPO module DB path (directory for RocksDB)
 pub fn get_espo_db_path() -> String {
     Path::new(&get_config().db_path).join("espo").to_string_lossy().into_owned()
@@ -988,6 +1025,55 @@ pub fn get_espo_db() -> std::sync::Arc<DB> {
 /// Optional writable cache database for derived, reproducible results.
 pub fn get_cache_db() -> Option<std::sync::Arc<DB>> {
     CACHE_DB.get().map(std::sync::Arc::clone)
+}
+
+/// When set, the explorer fulfils its SSR data needs by calling this remote
+/// espo's JSON-RPC endpoint instead of reading the local database.
+pub fn get_explorer_espo_rpc_host() -> Option<&'static str> {
+    get_config().explorer_espo_rpc_host.as_deref()
+}
+
+/// Whether this instance serves the `internal.*` storage-primitive RPC
+/// methods that a remote explorer needs (see `explorer_espo_rpc_host`).
+pub fn internal_rpc_enabled() -> bool {
+    get_config().enable_internal_rpc
+}
+
+static EXPLORER_REMOTE_MDB_CLIENT: OnceLock<
+    Option<std::sync::Arc<crate::runtime::remote_mdb::RemoteMdbClient>>,
+> = OnceLock::new();
+
+/// Shared remote-Mdb client for the explorer, present only when
+/// `explorer_espo_rpc_host` is configured.
+pub fn get_explorer_remote_mdb_client()
+-> Option<std::sync::Arc<crate::runtime::remote_mdb::RemoteMdbClient>> {
+    EXPLORER_REMOTE_MDB_CLIENT
+        .get_or_init(|| {
+            get_explorer_espo_rpc_host().map(|host| {
+                eprintln!("[explorer] SSR data source: remote espo rpc at {host}");
+                std::sync::Arc::new(crate::runtime::remote_mdb::RemoteMdbClient::new(host))
+            })
+        })
+        .clone()
+}
+
+/// The Mdb the explorer should use for a module namespace: remote-backed when
+/// `explorer_espo_rpc_host` is configured, the local espo DB otherwise.
+pub fn explorer_mdb(prefix: &[u8]) -> crate::runtime::mdb::Mdb {
+    match get_explorer_remote_mdb_client() {
+        Some(client) => crate::runtime::mdb::Mdb::remote(client, prefix),
+        None => crate::runtime::mdb::Mdb::from_db(get_espo_db(), prefix),
+    }
+}
+
+/// Indexed height bounds for explorer views: the remote espo's bounds when
+/// `explorer_espo_rpc_host` is configured, the local versioned tree otherwise.
+pub fn explorer_indexed_height_bounds() -> Option<(u32, u32)> {
+    match get_explorer_remote_mdb_client() {
+        Some(client) => client.indexed_height_bounds().ok().flatten(),
+        None => crate::runtime::tree_db::get_global_tree_db()
+            .and_then(|db| db.indexed_height_bounds().ok().flatten()),
+    }
 }
 
 /// Global accessor for the block source (blk files + RPC fallback)
