@@ -23,6 +23,28 @@ fn err(error: &str, hint: &str) -> Value {
     json!({ "ok": false, "error": error, "hint": hint })
 }
 
+/// Constant-time-ish comparison of the request key against the configured
+/// `internal_rpc_key`. Requests without the correct key are rejected outright.
+fn check_key(payload: &Value) -> Result<(), Value> {
+    let Some(expected) = crate::config::internal_rpc_key() else {
+        // enable_internal_rpc without a key is refused at startup; if we ever
+        // get here anyway, fail closed.
+        return Err(err("unauthorized", "internal rpc key not configured"));
+    };
+    let provided = payload.get("auth").and_then(Value::as_str).unwrap_or("");
+    let expected_bytes = expected.as_bytes();
+    let provided_bytes = provided.as_bytes();
+    let mut diff = expected_bytes.len() ^ provided_bytes.len();
+    for i in 0..expected_bytes.len() {
+        let p = provided_bytes.get(i).copied().unwrap_or(0);
+        diff |= (expected_bytes[i] ^ p) as usize;
+    }
+    if diff != 0 {
+        return Err(err("unauthorized", "missing or invalid auth key"));
+    }
+    Ok(())
+}
+
 fn parse_prefix(payload: &Value) -> Result<Vec<u8>, Value> {
     let Some(prefix) = payload.get("prefix").and_then(Value::as_str) else {
         return Err(err("missing_prefix", "provide prefix like \"essentials:\""));
@@ -90,6 +112,9 @@ pub fn register_internal_rpc(reg: RpcNsRegistrar) {
         tokio::spawn(async move {
             reg_get
                 .register("mdb_get", move |_cx, payload| async move {
+                    if let Err(e) = check_key(&payload) {
+                        return e;
+                    }
                     let prefix = match parse_prefix(&payload) {
                         Ok(p) => p,
                         Err(e) => return e,
@@ -123,6 +148,9 @@ pub fn register_internal_rpc(reg: RpcNsRegistrar) {
         tokio::spawn(async move {
             reg_multi
                 .register("mdb_multi_get", move |_cx, payload| async move {
+                    if let Err(e) = check_key(&payload) {
+                        return e;
+                    }
                     let prefix = match parse_prefix(&payload) {
                         Ok(p) => p,
                         Err(e) => return e,
@@ -172,6 +200,9 @@ pub fn register_internal_rpc(reg: RpcNsRegistrar) {
         tokio::spawn(async move {
             reg_scan
                 .register("mdb_scan_prefix_entries", move |_cx, payload| async move {
+                    if let Err(e) = check_key(&payload) {
+                        return e;
+                    }
                     let prefix = match parse_prefix(&payload) {
                         Ok(p) => p,
                         Err(e) => return e,
@@ -206,6 +237,9 @@ pub fn register_internal_rpc(reg: RpcNsRegistrar) {
         tokio::spawn(async move {
             reg_keys
                 .register("mdb_scan_prefix_keys", move |_cx, payload| async move {
+                    if let Err(e) = check_key(&payload) {
+                        return e;
+                    }
                     let prefix = match parse_prefix(&payload) {
                         Ok(p) => p,
                         Err(e) => return e,
@@ -248,6 +282,9 @@ pub fn register_internal_rpc(reg: RpcNsRegistrar) {
         tokio::spawn(async move {
             reg_range
                 .register("mdb_scan_range_entries", move |_cx, payload| async move {
+                    if let Err(e) = check_key(&payload) {
+                        return e;
+                    }
                     let prefix = match parse_prefix(&payload) {
                         Ok(p) => p,
                         Err(e) => return e,
@@ -292,6 +329,9 @@ pub fn register_internal_rpc(reg: RpcNsRegistrar) {
         tokio::spawn(async move {
             reg_page
                 .register("mdb_scan_range_entries_page", move |_cx, payload| async move {
+                    if let Err(e) = check_key(&payload) {
+                        return e;
+                    }
                     let prefix = match parse_prefix(&payload) {
                         Ok(p) => p,
                         Err(e) => return e,
@@ -353,6 +393,9 @@ pub fn register_internal_rpc(reg: RpcNsRegistrar) {
         tokio::spawn(async move {
             reg_bh
                 .register("tree_blockhash_for_height", move |_cx, payload| async move {
+                    if let Err(e) = check_key(&payload) {
+                        return e;
+                    }
                     let Some(height) = payload.get("height").and_then(Value::as_u64) else {
                         return err("missing_field", "height (u32) is required");
                     };
@@ -379,7 +422,10 @@ pub fn register_internal_rpc(reg: RpcNsRegistrar) {
         let reg_bounds = reg.clone();
         tokio::spawn(async move {
             reg_bounds
-                .register("tree_indexed_height_bounds", move |_cx, _payload| async move {
+                .register("tree_indexed_height_bounds", move |_cx, payload| async move {
+                    if let Err(e) = check_key(&payload) {
+                        return e;
+                    }
                     let Some(tree) = get_global_tree_db() else {
                         return json!({ "ok": true, "min": Value::Null, "max": Value::Null });
                     };

@@ -117,6 +117,10 @@ fn default_port() -> u16 {
     8080
 }
 
+fn default_explorer_espo_rpc_cache_ms() -> u64 {
+    2000
+}
+
 fn default_explorer_base_path() -> String {
     "/".to_string()
 }
@@ -543,7 +547,13 @@ pub struct ConfigFile {
     #[serde(default)]
     pub explorer_espo_rpc_host: Option<String>,
     #[serde(default)]
+    pub explorer_espo_rpc_key: Option<String>,
+    #[serde(default = "default_explorer_espo_rpc_cache_ms")]
+    pub explorer_espo_rpc_cache_ms: u64,
+    #[serde(default)]
     pub enable_internal_rpc: bool,
+    #[serde(default)]
+    pub internal_rpc_key: Option<String>,
     #[serde(default = "default_explorer_base_path")]
     pub explorer_base_path: String,
     #[serde(default = "default_explorer_pizza_tv_endpoint")]
@@ -613,7 +623,10 @@ pub struct AppConfig {
     pub port: u16,
     pub explorer_host: Option<SocketAddr>,
     pub explorer_espo_rpc_host: Option<String>,
+    pub explorer_espo_rpc_key: Option<String>,
+    pub explorer_espo_rpc_cache_ms: u64,
     pub enable_internal_rpc: bool,
+    pub internal_rpc_key: Option<String>,
     pub explorer_base_path: String,
     pub explorer_pizza_tv_endpoint: String,
     pub explorer_amm_prefix: String,
@@ -699,7 +712,10 @@ impl AppConfig {
             port: file.port,
             explorer_host: file.explorer_host,
             explorer_espo_rpc_host: normalize_optional_string(file.explorer_espo_rpc_host),
+            explorer_espo_rpc_key: normalize_optional_string(file.explorer_espo_rpc_key),
+            explorer_espo_rpc_cache_ms: file.explorer_espo_rpc_cache_ms,
             enable_internal_rpc: file.enable_internal_rpc,
+            internal_rpc_key: normalize_optional_string(file.internal_rpc_key),
             explorer_base_path,
             explorer_pizza_tv_endpoint,
             explorer_amm_prefix,
@@ -758,6 +774,17 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
     if cfg.metashrew_rpc_url.trim().is_empty() {
         anyhow::bail!("metashrew_rpc_url must be provided");
+    }
+
+    if cfg.enable_internal_rpc && cfg.internal_rpc_key.is_none() {
+        anyhow::bail!(
+            "enable_internal_rpc requires internal_rpc_key: the internal.* storage methods must never run unauthenticated"
+        );
+    }
+    if cfg.explorer_espo_rpc_host.is_some() && cfg.explorer_espo_rpc_key.is_none() {
+        eprintln!(
+            "[config] WARN: explorer_espo_rpc_host is set without explorer_espo_rpc_key; internal.* calls to the remote espo will be rejected unless it runs without a key"
+        );
     }
 
     let db_root = Path::new(&cfg.db_path);
@@ -1039,6 +1066,12 @@ pub fn internal_rpc_enabled() -> bool {
     get_config().enable_internal_rpc
 }
 
+/// The shared key `internal.*` requests must carry. Always present when
+/// `enable_internal_rpc` is true (enforced at startup).
+pub fn internal_rpc_key() -> Option<&'static str> {
+    get_config().internal_rpc_key.as_deref()
+}
+
 static EXPLORER_REMOTE_MDB_CLIENT: OnceLock<
     Option<std::sync::Arc<crate::runtime::remote_mdb::RemoteMdbClient>>,
 > = OnceLock::new();
@@ -1051,7 +1084,12 @@ pub fn get_explorer_remote_mdb_client()
         .get_or_init(|| {
             get_explorer_espo_rpc_host().map(|host| {
                 eprintln!("[explorer] SSR data source: remote espo rpc at {host}");
-                std::sync::Arc::new(crate::runtime::remote_mdb::RemoteMdbClient::new(host))
+                let cfg = get_config();
+                std::sync::Arc::new(crate::runtime::remote_mdb::RemoteMdbClient::new_with(
+                    host,
+                    cfg.explorer_espo_rpc_key.clone(),
+                    Duration::from_millis(cfg.explorer_espo_rpc_cache_ms),
+                ))
             })
         })
         .clone()

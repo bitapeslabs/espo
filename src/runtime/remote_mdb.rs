@@ -11,11 +11,26 @@
 use bitcoin::BlockHash;
 use bitcoin::hashes::Hash;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// Bounded, short-TTL memo for point lookups: SSR pages re-read the same hot
+/// rows (icons, inspections, counters) on every page view, so a couple of
+/// seconds of reuse collapses most repeat round-trips without meaningfully
+/// staleing an explorer. Cleared wholesale when it grows past the cap.
+const GET_CACHE_MAX_ENTRIES: usize = 100_000;
 
 pub struct RemoteMdbClient {
     rpc_url: String,
     agent: ureq::Agent,
+    /// Shared secret attached to `internal.*` calls; the remote rejects those
+    /// methods without it.
+    key: Option<String>,
+    cache_ttl: Duration,
+    get_cache: Mutex<HashMap<(Vec<u8>, Vec<u8>), (Instant, Option<Vec<u8>>)>>,
+    calls_total: AtomicU64,
 }
 
 pub type RemoteResult<T> = Result<T, String>;
@@ -38,6 +53,10 @@ fn parse_opt_hex(value: &Value, what: &str) -> RemoteResult<Option<Vec<u8>>> {
 
 impl RemoteMdbClient {
     pub fn new(host: &str) -> Self {
+        Self::new_with(host, None, Duration::ZERO)
+    }
+
+    pub fn new_with(host: &str, key: Option<String>, cache_ttl: Duration) -> Self {
         let trimmed = host.trim_end_matches('/');
         let rpc_url =
             if trimmed.ends_with("/rpc") { trimmed.to_string() } else { format!("{trimmed}/rpc") };
@@ -45,7 +64,19 @@ impl RemoteMdbClient {
             .timeout_connect(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
             .build();
-        Self { rpc_url, agent }
+        Self {
+            rpc_url,
+            agent,
+            key,
+            cache_ttl,
+            get_cache: Mutex::new(HashMap::new()),
+            calls_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Total JSON-RPC round-trips issued by this client (cache hits excluded).
+    pub fn total_calls(&self) -> u64 {
+        self.calls_total.load(Ordering::Relaxed)
     }
 
     pub fn rpc_url(&self) -> &str {
@@ -53,6 +84,16 @@ impl RemoteMdbClient {
     }
 
     pub fn call(&self, method: &str, params: Value) -> RemoteResult<Value> {
+        let mut params = params;
+        if let Some(key) = &self.key {
+            if method.starts_with("internal.") {
+                params["auth"] = json!(key);
+            }
+        }
+        let total = self.calls_total.fetch_add(1, Ordering::Relaxed) + 1;
+        if std::env::var_os("ESPO_REMOTE_MDB_LOG_CALLS").is_some() {
+            eprintln!("[remote_mdb] call={method} total={total}");
+        }
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -94,12 +135,31 @@ impl RemoteMdbClient {
         key: &[u8],
         blockhash: Option<&BlockHash>,
     ) -> RemoteResult<Option<Vec<u8>>> {
+        // Only latest-state point reads are memoized; blockhash-pinned views
+        // are rare on SSR paths and stay uncached for correctness.
+        let cache_key = (blockhash.is_none() && !self.cache_ttl.is_zero())
+            .then(|| (prefix.to_vec(), key.to_vec()));
+        if let Some(ck) = &cache_key {
+            if let Some((stored_at, value)) = self.get_cache.lock().unwrap().get(ck) {
+                if stored_at.elapsed() <= self.cache_ttl {
+                    return Ok(value.clone());
+                }
+            }
+        }
         let params = Self::with_blockhash(
             json!({ "prefix": String::from_utf8_lossy(prefix), "key": hex_bytes(key) }),
             blockhash,
         );
         let result = self.call("internal.mdb_get", params)?;
-        parse_opt_hex(result.get("value").unwrap_or(&Value::Null), "mdb_get value")
+        let value = parse_opt_hex(result.get("value").unwrap_or(&Value::Null), "mdb_get value")?;
+        if let Some(ck) = cache_key {
+            let mut cache = self.get_cache.lock().unwrap();
+            if cache.len() >= GET_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(ck, (Instant::now(), value.clone()));
+        }
+        Ok(value)
     }
 
     pub fn multi_get(
@@ -377,6 +437,69 @@ mod tests {
         let bh = mdb.blockhash_for_height(5).expect("blockhash").expect("some blockhash");
         assert_eq!(bh.to_byte_array(), [0x11u8; 32]);
         assert_eq!(mdb.indexed_height_bounds().expect("bounds"), Some((880000, 946000)));
+    }
+
+    #[test]
+    fn internal_calls_carry_auth_key_and_get_cache_collapses_repeats() {
+        // Mock serves exactly ONE request and asserts the auth key is present;
+        // the second identical get must be served from the client-side cache
+        // (a second network hit would make accept() block and the test fail).
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let body = loop {
+                let n = stream.read(&mut tmp).expect("read");
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    let body_start = pos + 4;
+                    while buf.len() < body_start + content_length {
+                        let n = stream.read(&mut tmp).expect("read body");
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    break buf[body_start..body_start + content_length].to_vec();
+                }
+            };
+            let request: Value = serde_json::from_slice(&body).expect("request json");
+            assert_eq!(request["params"]["auth"].as_str(), Some("sekrit"));
+            // the storage key param must NOT be clobbered by the auth key
+            assert_eq!(request["params"]["key"].as_str(), Some(hex::encode(b"row").as_str()));
+            let reply = serde_json::to_string(
+                &json!({ "jsonrpc": "2.0", "id": 1, "result": { "ok": true, "value": "beef" } }),
+            )
+            .unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+            stream.write_all(response.as_bytes()).expect("write response");
+        });
+
+        let client = RemoteMdbClient::new_with(
+            &format!("http://{addr}"),
+            Some("sekrit".to_string()),
+            Duration::from_secs(60),
+        );
+        let mdb = Mdb::remote(Arc::new(client), b"essentials:");
+
+        assert_eq!(mdb.get(b"row").expect("first get"), Some(vec![0xbe, 0xef]));
+        // Served from cache; no second connection is accepted by the mock.
+        assert_eq!(mdb.get(b"row").expect("cached get"), Some(vec![0xbe, 0xef]));
     }
 
     #[test]

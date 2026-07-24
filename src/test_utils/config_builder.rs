@@ -44,7 +44,10 @@ impl TestConfigBuilder {
             indexer_block_delay_ms: 0,
             port: 0, // Let OS assign port
             explorer_espo_rpc_host: None,
+            explorer_espo_rpc_key: None,
+            explorer_espo_rpc_cache_ms: 0,
             enable_internal_rpc: false,
+            internal_rpc_key: None,
             explorer_host: None,
             explorer_base_path: "/".to_string(),
             explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),

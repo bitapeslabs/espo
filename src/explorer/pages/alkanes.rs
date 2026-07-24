@@ -129,15 +129,23 @@ pub async fn alkanes_page(
         })
         .unwrap_or(0);
 
-    let holders_for = |rec: &AlkaneCreationRecord| {
-        state
-            .essentials_mdb
-            .get(&table.holders_count_key(&rec.alkane))
-            .ok()
-            .flatten()
-            .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
-            .map(|hc| hc.count)
-            .unwrap_or(0)
+    // One multi_get for the whole page instead of a point read per record —
+    // this keeps remote-backed explorers (explorer_espo_rpc_host) at a single
+    // round-trip for the column.
+    let holders_for_records = |records: &[AlkaneCreationRecord]| -> Vec<u64> {
+        let keys: Vec<Vec<u8>> =
+            records.iter().map(|rec| table.holders_count_key(&rec.alkane)).collect();
+        let values =
+            state.essentials_mdb.multi_get(&keys).unwrap_or_else(|_| vec![None; keys.len()]);
+        values
+            .into_iter()
+            .map(|value| {
+                value
+                    .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
+                    .map(|hc| hc.count)
+                    .unwrap_or(0)
+            })
+            .collect()
     };
 
     let build_row = |rec: &AlkaneCreationRecord, holders: u64| {
@@ -179,9 +187,9 @@ pub async fn alkanes_page(
                 })
                 .map(|res| res.records)
                 .unwrap_or_default();
-            for rec in records {
-                let holders = holders_for(&rec);
-                rows.push(build_row(&rec, holders));
+            let holders = holders_for_records(&records);
+            for (rec, holders) in records.iter().zip(holders) {
+                rows.push(build_row(rec, holders));
             }
         }
         (SortField::Age, SortDir::Asc) => {
@@ -194,9 +202,9 @@ pub async fn alkanes_page(
                 })
                 .map(|res| res.records)
                 .unwrap_or_default();
-            for rec in records {
-                let holders = holders_for(&rec);
-                rows.push(build_row(&rec, holders));
+            let holders = holders_for_records(&records);
+            for (rec, holders) in records.iter().zip(holders) {
+                rows.push(build_row(rec, holders));
             }
         }
         (SortField::Holders, SortDir::Desc) => {
@@ -209,13 +217,13 @@ pub async fn alkanes_page(
                 })
                 .map(|res| res.ids)
                 .unwrap_or_default();
-            for alk in ids {
-                let Some(rec) = load_creation_record(&state.essentials_mdb, &alk).ok().flatten()
-                else {
-                    continue;
-                };
-                let holders = holders_for(&rec);
-                rows.push(build_row(&rec, holders));
+            let records: Vec<AlkaneCreationRecord> = ids
+                .iter()
+                .filter_map(|alk| load_creation_record(&state.essentials_mdb, alk).ok().flatten())
+                .collect();
+            let holders = holders_for_records(&records);
+            for (rec, holders) in records.iter().zip(holders) {
+                rows.push(build_row(rec, holders));
             }
         }
         (SortField::Holders, SortDir::Asc) => {
@@ -228,13 +236,13 @@ pub async fn alkanes_page(
                 })
                 .map(|res| res.ids)
                 .unwrap_or_default();
-            for alk in ids {
-                let Some(rec) = load_creation_record(&state.essentials_mdb, &alk).ok().flatten()
-                else {
-                    continue;
-                };
-                let holders = holders_for(&rec);
-                rows.push(build_row(&rec, holders));
+            let records: Vec<AlkaneCreationRecord> = ids
+                .iter()
+                .filter_map(|alk| load_creation_record(&state.essentials_mdb, alk).ok().flatten())
+                .collect();
+            let holders = holders_for_records(&records);
+            for (rec, holders) in records.iter().zip(holders) {
+                rows.push(build_row(rec, holders));
             }
         }
     }
