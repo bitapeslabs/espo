@@ -1,7 +1,7 @@
 mod api;
 pub mod components;
 pub mod consts;
-mod faucet;
+pub mod faucet;
 pub mod i18n;
 pub mod mining_pools;
 mod pages;

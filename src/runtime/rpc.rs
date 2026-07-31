@@ -56,6 +56,15 @@ const PRECISE_FEE_INCREMENT: f64 = 0.001;
 /// Bitcoin Core caps a package at 25 transactions.
 const MAX_PACKAGE_TRANSACTIONS: usize = 25;
 
+/// Who is calling, for the handful of methods that must pass the caller's
+/// identity onward. The faucet rate-limits per IP, so a request arriving over
+/// RPC has to carry the same forwarded headers and peer address the explorer's
+/// own faucet endpoints send.
+pub struct CallerContext {
+    pub headers: axum::http::HeaderMap,
+    pub peer: Option<SocketAddr>,
+}
+
 /// Methods espo answers itself, before the module registry is consulted.
 ///
 /// The `btc.*` ones are proxies onto the Bitcoin backends — electrs/Esplora and
@@ -70,6 +79,7 @@ enum BuiltinMethod {
     BtcBroadcastTransaction,
     BtcSubmitPackage,
     BtcFeeEstimates,
+    BtcFaucetRequest,
 }
 
 /// Resolves a method name to a built-in, or `None` to fall through to the
@@ -89,6 +99,11 @@ fn builtin_method(method: &str) -> Option<BuiltinMethod> {
         "btc.broadcast_transaction" => Some(BuiltinMethod::BtcBroadcastTransaction),
         "btc.submit_package" => Some(BuiltinMethod::BtcSubmitPackage),
         "btc.fee_estimates" => Some(BuiltinMethod::BtcFeeEstimates),
+        // Regtest-only, and only when a faucet is configured: anywhere else the
+        // name is not a method at all and resolves to -32601.
+        "btc.faucet_request" if crate::explorer::faucet::faucet_enabled() => {
+            Some(BuiltinMethod::BtcFaucetRequest)
+        }
         _ => None,
     }
 }
@@ -132,6 +147,7 @@ fn is_builtin_root_method(method: &str) -> bool {
 async fn builtin_response(
     builtin: BuiltinMethod,
     state: &RpcState,
+    caller: &CallerContext,
     id: Value,
     params: Value,
 ) -> JsonRpcResponse {
@@ -145,6 +161,7 @@ async fn builtin_response(
         BuiltinMethod::BtcBroadcastTransaction => broadcast_transaction_response(id, params).await,
         BuiltinMethod::BtcSubmitPackage => submit_package_response(id, params).await,
         BuiltinMethod::BtcFeeEstimates => fee_estimates_response(id),
+        BuiltinMethod::BtcFaucetRequest => faucet_request_response(caller, id, params).await,
     }
 }
 
@@ -438,6 +455,89 @@ async fn submit_package_response(id: Value, params: Value) -> JsonRpcResponse {
             Some(json!({ "detail": format!("{error}") })),
         ),
         Err(error) => internal_error(id, &format!("package submission task failed: {error}")),
+    }
+}
+
+/// `{ address, amount?, asset? }`, mirroring the body the explorer's
+/// `POST /api/faucet/send` accepts.
+fn parse_faucet_request_params(
+    params: Value,
+) -> Result<(String, Option<f64>, Option<String>), String> {
+    let Value::Object(params) = params else {
+        return Err("params must be an object".to_string());
+    };
+    let address = parse_required_non_empty_string_param(&params, "address")?.to_string();
+
+    let amount = match params.get("amount") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let Some(amount) = value.as_f64() else {
+                return Err("amount must be a number".to_string());
+            };
+            Some(amount)
+        }
+    };
+    let asset = match params.get("asset") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(asset)) => Some(asset.clone()),
+        Some(_) => return Err("asset must be a string".to_string()),
+    };
+
+    Ok((address, amount, asset))
+}
+
+/// Requests regtest coins from the configured faucet, the same proxy the
+/// explorer's faucet page uses. Only resolvable on regtest with a faucet
+/// configured; elsewhere the method does not exist.
+async fn faucet_request_response(
+    caller: &CallerContext,
+    id: Value,
+    params: Value,
+) -> JsonRpcResponse {
+    let (address, amount, asset) = match parse_faucet_request_params(params) {
+        Ok(parsed) => parsed,
+        Err(detail) => return invalid_params(id, &detail),
+    };
+
+    match crate::explorer::faucet::faucet_request_rpc(
+        &address,
+        amount,
+        asset.as_deref(),
+        &caller.headers,
+        caller.peer,
+    )
+    .await
+    {
+        // The faucet answers in JSON-RPC itself, so its envelope is unwrapped
+        // rather than nested inside this one: its result becomes the result and
+        // its error becomes an error, code and message intact. A body shaped
+        // like neither is passed through as it came.
+        Ok(mut body) => match body.get("error") {
+            Some(error) if !error.is_null() => {
+                let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Faucet request failed")
+                    .to_string();
+                let data = error.get("data").cloned();
+                err_response(id, code, &message, data)
+            }
+            _ => {
+                let result = body.get_mut("result").map(Value::take).unwrap_or(body);
+                JsonRpcResponse { jsonrpc: JSONRPC_VERSION, result: Some(result), error: None, id }
+            }
+        },
+        Err("invalid_address") => invalid_params(id, "address must be a regtest address"),
+        Err("invalid_asset") => invalid_params(id, "asset must be rbtc or diesel"),
+        Err("invalid_amount") => invalid_params(id, "amount must be a non-negative number"),
+        Err("not_configured") => err_response(id, -32004, "Faucet is not available", None),
+        Err(detail) => err_response(
+            id,
+            -32002,
+            "Unable to reach the faucet service",
+            Some(json!({ "detail": detail })),
+        ),
     }
 }
 
@@ -848,6 +948,7 @@ fn extract_id(obj: &serde_json::Map<String, Value>) -> Option<Value> {
 
 async fn handle_single_request(
     state: &RpcState,
+    caller: &CallerContext,
     req_obj: &serde_json::Map<String, Value>,
 ) -> Option<JsonRpcResponse> {
     let id_opt = extract_id(req_obj);
@@ -903,7 +1004,7 @@ async fn handle_single_request(
 
     // If a built-in is requested, handle immediately.
     if let Some(builtin) = builtin_method(method) {
-        return Some(builtin_response(builtin, state, id, params).await);
+        return Some(builtin_response(builtin, state, caller, id, params).await);
     }
 
     // Check method existence to produce -32601 at the protocol layer
@@ -936,7 +1037,7 @@ pub async fn run_rpc(registry: RpcRegistry, addr: SocketAddr) -> anyhow::Result<
 
     eprintln!("[rpc] listening on {}", addr);
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -945,7 +1046,13 @@ fn json_ok(body: Vec<u8>) -> Response {
     (StatusCode::OK, [(CONTENT_TYPE, "application/json")], body).into_response()
 }
 
-async fn handle_rpc(State(state): State<Arc<RpcState>>, body: Bytes) -> Response {
+async fn handle_rpc(
+    State(state): State<Arc<RpcState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let caller = CallerContext { headers, peer: Some(peer) };
     // 1) Try to parse raw JSON (to distinguish -32700 from other errors)
     let parsed: serde_json::Result<Value> = serde_json::from_slice(&body);
 
@@ -973,7 +1080,7 @@ async fn handle_rpc(State(state): State<Arc<RpcState>>, body: Bytes) -> Response
             for item in items {
                 match item {
                     Value::Object(obj) => {
-                        if let Some(resp) = handle_single_request(&state, &obj).await {
+                        if let Some(resp) = handle_single_request(&state, &caller, &obj).await {
                             responses.push(resp);
                         }
                     }
@@ -992,7 +1099,7 @@ async fn handle_rpc(State(state): State<Arc<RpcState>>, body: Bytes) -> Response
             let body = serde_json::to_vec(&responses).unwrap();
             json_ok(body)
         }
-        Value::Object(obj) => match handle_single_request(&state, &obj).await {
+        Value::Object(obj) => match handle_single_request(&state, &caller, &obj).await {
             Some(resp) => {
                 let body = serde_json::to_vec(&resp).unwrap();
                 json_ok(body)

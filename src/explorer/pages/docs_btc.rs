@@ -20,7 +20,7 @@ pub(super) fn btc_module_doc() -> ModuleDoc {
 }
 
 fn btc_methods() -> Vec<MethodDoc> {
-    vec![
+    let mut methods = vec![
         rpc_doc(
             "btc.get_transaction",
             "Returns one transaction in the configured electrs/Esplora JSON shape, passed through unchanged, together with its raw hex. Covers mempool as well as confirmed transactions. A transaction the index has never seen returns ok with found false rather than an error. Requires electrs_esplora_url; native Electrum RPC does not expose this shape.",
@@ -97,5 +97,18 @@ fn btc_methods() -> Vec<MethodDoc> {
                 "minimumFee": 0.1
             }),
         ),
-    ]
+    ];
+
+    // The faucet method only exists on regtest with a faucet configured, so it
+    // is only documented where it can actually be called.
+    if crate::explorer::faucet::faucet_enabled() {
+        methods.push(rpc_doc(
+            "btc.faucet_request",
+            "Requests regtest coins from the configured faucet — the same proxy behind the explorer's faucet page, including the caller IP it rate-limits on. `amount` and `asset` are optional; `asset` is rbtc or diesel. The faucet's own reply is returned unchanged. This method exists only on regtest with a faucet configured; elsewhere it is not a method at all.",
+            json!({ "address": "bcrt1q9d4ywgfnd8h43da5tpcxcn6ajv590cg6d3tg6axemvljvt2k76zqwq2fs3", "amount": 0.001, "asset": "rbtc" }),
+            json!({ "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90" }),
+        ));
+    }
+
+    methods
 }

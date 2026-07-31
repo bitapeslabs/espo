@@ -120,6 +120,30 @@ async fn call_faucet(
     Ok((status, body))
 }
 
+/// The `btc.faucet_request` RPC, serving the same proxy the explorer's
+/// `POST /api/faucet/send` does so an RPC caller gets what the front end gets:
+/// the faucet's own reply, and the same caller IP forwarded to it, since the
+/// faucet rate-limits on that.
+///
+/// Returns the faucet's JSON on success, or a short reason code on failure —
+/// the caller-facing wording is chosen by the RPC layer.
+pub async fn faucet_request_rpc(
+    address: &str,
+    amount: Option<f64>,
+    asset: Option<&str>,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<Value, &'static str> {
+    let address = address.trim();
+    if !valid_regtest_address(address) {
+        return Err("invalid_address");
+    }
+    let params = faucet_send_params(address, amount, asset)?;
+    let (_status, body) =
+        call_faucet("faucet_send", Some(params), headers, peer.map(ConnectInfo)).await?;
+    Ok(body)
+}
+
 pub async fn faucet_status(headers: HeaderMap, peer: ConnectInfo<SocketAddr>) -> Response {
     match call_faucet("faucet_status", None, &headers, Some(peer)).await {
         Ok((status, body)) => (status, Json(body)).into_response(),
