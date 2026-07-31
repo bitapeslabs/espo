@@ -23,6 +23,7 @@
   "enable_internal_rpc": false,
   "internal_rpc_key": null,
   "explorer_base_path": "/",
+  "explorer_amm_prefix": null,
   "google_analytics_tag": null,
   "sync_banner": null,
   "mempool": {

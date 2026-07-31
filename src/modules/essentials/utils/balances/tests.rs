@@ -41,7 +41,7 @@ fn init_test_config_from_run_sh() {
         internal_rpc_key: None,
         explorer_base_path: "/".to_string(),
         explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),
-        explorer_amm_prefix: "https://www.oyl.io/swap".to_string(),
+        explorer_amm_prefix: Some("https://www.oyl.io/swap".to_string()),
         sync_banner: None,
         network: bitcoin::Network::Bitcoin,
         metashrew_db_label: None,

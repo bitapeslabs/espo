@@ -1566,9 +1566,11 @@ pub async fn alkane_page(
                                                 div class="alkane-market-price-value" { (summary.price_usd) }
                                                 div class="alkane-market-price-change mono" { (summary.change_text) }
                                             }
-                                            a class="alkane-method-btn alkane-market-buy-btn" href=(buy_url.clone()) target="_blank" rel="noopener noreferrer" {
-                                                span { "Trade" }
-                                                (icon_arrow_up_right_thick())
+                                            @if let Some(buy_url) = buy_url.as_ref() {
+                                                a class="alkane-method-btn alkane-market-buy-btn" href=(buy_url) target="_blank" rel="noopener noreferrer" {
+                                                    span { "Trade" }
+                                                    (icon_arrow_up_right_thick())
+                                                }
                                             }
                                         }
                                     }
@@ -2191,10 +2193,15 @@ fn pizza_tv_iframe_src(series_id: &str) -> String {
     )
 }
 
-fn alkane_buy_url(alkane_id: &str) -> String {
-    let prefix = get_explorer_amm_prefix().trim().trim_end_matches('?').trim_end_matches('&');
+/// Where the Trade button points, or `None` when `explorer_amm_prefix` is
+/// unset — a deployment with no swap venue configured shows no Trade button.
+fn alkane_buy_url(alkane_id: &str) -> Option<String> {
+    let prefix = get_explorer_amm_prefix()?.trim().trim_end_matches('?').trim_end_matches('&');
+    if prefix.is_empty() {
+        return None;
+    }
     let separator = if prefix.contains('?') { "&" } else { "?" };
-    format!("{prefix}{separator}from=btc&to={alkane_id}")
+    Some(format!("{prefix}{separator}from=btc&to={alkane_id}"))
 }
 
 fn fmt_activity_amount(raw: u128) -> String {

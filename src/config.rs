@@ -133,10 +133,6 @@ fn default_explorer_pizza_tv_endpoint() -> String {
     "https://tv.pizza.fun".to_string()
 }
 
-fn default_explorer_amm_prefix() -> String {
-    "https://www.oyl.io/swap".to_string()
-}
-
 fn default_network() -> String {
     "mainnet".to_string()
 }
@@ -568,8 +564,11 @@ pub struct ConfigFile {
     pub explorer_base_path: String,
     #[serde(default = "default_explorer_pizza_tv_endpoint")]
     pub explorer_pizza_tv_endpoint: String,
-    #[serde(default = "default_explorer_amm_prefix")]
-    pub explorer_amm_prefix: String,
+    /// Base URL of the swap UI the explorer links its Trade button to. Unset
+    /// means this deployment has no swap venue to point at, and the button is
+    /// not rendered at all.
+    #[serde(default)]
+    pub explorer_amm_prefix: Option<String>,
     #[serde(default)]
     pub sync_banner: Option<SyncBannerConfig>,
     #[serde(default = "default_network")]
@@ -641,7 +640,7 @@ pub struct AppConfig {
     pub internal_rpc_key: Option<String>,
     pub explorer_base_path: String,
     pub explorer_pizza_tv_endpoint: String,
-    pub explorer_amm_prefix: String,
+    pub explorer_amm_prefix: Option<String>,
     pub sync_banner: Option<SyncBannerConfig>,
     pub network: Network,
     pub metashrew_db_label: Option<String>,
@@ -694,8 +693,7 @@ impl AppConfig {
         let explorer_pizza_tv_endpoint =
             normalize_optional_string(Some(file.explorer_pizza_tv_endpoint))
                 .unwrap_or_else(default_explorer_pizza_tv_endpoint);
-        let explorer_amm_prefix = normalize_optional_string(Some(file.explorer_amm_prefix))
-            .unwrap_or_else(default_explorer_amm_prefix);
+        let explorer_amm_prefix = normalize_optional_string(file.explorer_amm_prefix);
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
         let google_analytics_tag = normalize_optional_string(file.google_analytics_tag);
         let sync_banner = file.sync_banner.and_then(|b| b.normalized());
@@ -1304,8 +1302,9 @@ pub fn get_explorer_pizza_tv_endpoint() -> &'static str {
     &get_config().explorer_pizza_tv_endpoint
 }
 
-pub fn get_explorer_amm_prefix() -> &'static str {
-    &get_config().explorer_amm_prefix
+/// The swap UI to link Trade buttons at, if this deployment has one.
+pub fn get_explorer_amm_prefix() -> Option<&'static str> {
+    get_config().explorer_amm_prefix.as_deref()
 }
 
 pub fn get_sync_banner() -> Option<&'static SyncBannerConfig> {
