@@ -1,8 +1,7 @@
-use crate::config::{get_cache_db, get_config, get_metashrew, get_network};
+use crate::config::{get_cache_db, get_metashrew, get_network};
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::modules::essentials::utils::inspections::resolve_contract_wasm_source;
 use crate::schemas::SchemaAlkaneId;
-use alkabi::analysis::{AnalysisConfig, attach_plans};
 use anyhow::{Context, Result};
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
@@ -11,8 +10,10 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-const ALKABI_CACHE_KEY_PREFIX: &[u8] =
-    b"alkabi:56a98f830be4100c666a238986abf05c6c285272:analysis-v1:";
+/// The alkabi revision is part of the cache key: an export produced by one
+/// revision must never be served after the dependency moves, since what the
+/// ABI contains is exactly what changes between revisions.
+const ALKABI_CACHE_KEY_PREFIX: &[u8] = b"alkabi:86d04e040416910acfb08012334261b0c27e1575:abi-v1:";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderedAlkabi {
@@ -72,14 +73,13 @@ pub fn extract_contract_alkabi(
     alkane: &SchemaAlkaneId,
 ) -> Result<Arc<RenderedAlkabi>> {
     let source = contract_wasm_source(provider, alkane);
-    let verify_trials = get_config().alkabi_verify_trials;
     let Some(cache) = get_cache_db() else {
         let wasm = load_contract_wasm_from_source(&source)?;
-        return render_alkabi_with_plans(&wasm, verify_trials).map(Arc::new);
+        return render_alkabi(&wasm).map(Arc::new);
     };
-    load_or_generate(cache, alkabi_cache_key(&source, verify_trials), || {
+    load_or_generate(cache, alkabi_cache_key(&source), || {
         let wasm = load_contract_wasm_from_source(&source)?;
-        render_alkabi_with_plans(&wasm, verify_trials)
+        render_alkabi(&wasm)
     })
 }
 
@@ -135,10 +135,8 @@ fn load_contract_wasm_from_source(source: &SchemaAlkaneId) -> Result<Vec<u8>> {
         .context("contract wasm not found")
 }
 
-fn render_alkabi_with_plans(wasm: &[u8], verify_trials: u32) -> Result<RenderedAlkabi> {
-    let mut abi = alkabi::extract::extract_abi(wasm).context("extract Alkabi ABI")?;
-    let analysis = AnalysisConfig { verify_trials, ..AnalysisConfig::default() };
-    attach_plans(&mut abi, wasm, &analysis).context("attach Alkabi view plans")?;
+fn render_alkabi(wasm: &[u8]) -> Result<RenderedAlkabi> {
+    let abi = alkabi::extract::extract_abi(wasm).context("extract Alkabi ABI")?;
     Ok(RenderedAlkabi {
         contract: abi.contract.clone(),
         json: abi.to_json_pretty(),
@@ -146,15 +144,14 @@ fn render_alkabi_with_plans(wasm: &[u8], verify_trials: u32) -> Result<RenderedA
     })
 }
 
-fn alkabi_cache_key(source: &SchemaAlkaneId, verify_trials: u32) -> Vec<u8> {
+fn alkabi_cache_key(source: &SchemaAlkaneId) -> Vec<u8> {
     let network = get_network().to_string();
-    alkabi_cache_key_for(&network, source, verify_trials)
+    alkabi_cache_key_for(&network, source)
 }
 
-fn alkabi_cache_key_for(network: &str, source: &SchemaAlkaneId, verify_trials: u32) -> Vec<u8> {
+fn alkabi_cache_key_for(network: &str, source: &SchemaAlkaneId) -> Vec<u8> {
     let mut key = Vec::with_capacity(ALKABI_CACHE_KEY_PREFIX.len() + network.len() + 1 + 16);
     key.extend_from_slice(ALKABI_CACHE_KEY_PREFIX);
-    key.extend_from_slice(&verify_trials.to_be_bytes());
     key.extend_from_slice(network.as_bytes());
     key.push(0);
     key.extend_from_slice(&source.block.to_be_bytes());
@@ -241,8 +238,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        AlkabiFormat, RenderedAlkabi, alkabi_cache_key_for, load_or_generate,
-        render_alkabi_with_plans,
+        AlkabiFormat, RenderedAlkabi, alkabi_cache_key_for, load_or_generate, render_alkabi,
     };
     use crate::schemas::SchemaAlkaneId;
     use rocksdb::DB;
@@ -254,7 +250,7 @@ mod tests {
     #[test]
     fn bundled_factory_wasm_renders_json_and_typescript() {
         let wasm = include_bytes!("../../../../test_data/factory.wasm");
-        let abi = render_alkabi_with_plans(wasm, 8).expect("extract Alkabi ABI with view plans");
+        let abi = render_alkabi(wasm).expect("extract Alkabi ABI");
         let json = AlkabiFormat::Json.render(&abi).expect("render Alkabi JSON");
         let typescript = AlkabiFormat::TypeScript
             .render(&abi)
@@ -265,11 +261,6 @@ mod tests {
 
         assert_eq!(json["contract"], abi.contract);
         assert!(json["methods"].as_array().is_some_and(|methods| !methods.is_empty()));
-        assert!(
-            json["methods"]
-                .as_array()
-                .is_some_and(|methods| methods.iter().any(|method| method["plan"]["trials"] == 8))
-        );
         assert!(typescript.contains(&format!("export const {}Abi", abi.contract)));
     }
 
@@ -277,7 +268,7 @@ mod tests {
     fn concurrent_requests_share_one_job_and_persist_the_result() {
         let dir = tempfile::tempdir_in(".").expect("cache tempdir");
         let cache = Arc::new(DB::open_default(dir.path()).expect("open cache DB"));
-        let key = alkabi_cache_key_for("regtest", &SchemaAlkaneId { block: 2, tx: 12345 }, 128);
+        let key = alkabi_cache_key_for("regtest", &SchemaAlkaneId { block: 2, tx: 12345 });
         let calls = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(2));
         let handles = (0..2)
@@ -320,16 +311,12 @@ mod tests {
         let source = SchemaAlkaneId { block: 2, tx: 12345 };
 
         assert_ne!(
-            alkabi_cache_key_for("mainnet", &source, 128),
-            alkabi_cache_key_for("regtest", &source, 128)
+            alkabi_cache_key_for("mainnet", &source),
+            alkabi_cache_key_for("regtest", &source)
         );
         assert_ne!(
-            alkabi_cache_key_for("regtest", &source, 128),
-            alkabi_cache_key_for("regtest", &SchemaAlkaneId { block: 2, tx: 12346 }, 128)
-        );
-        assert_ne!(
-            alkabi_cache_key_for("regtest", &source, 128),
-            alkabi_cache_key_for("regtest", &source, 256)
+            alkabi_cache_key_for("regtest", &source),
+            alkabi_cache_key_for("regtest", &SchemaAlkaneId { block: 2, tx: 12346 })
         );
     }
 
