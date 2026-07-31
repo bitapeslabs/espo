@@ -120,6 +120,18 @@ async fn call_faucet(
     Ok((status, body))
 }
 
+/// The `btc.faucet_status` RPC, serving the same proxy the explorer's
+/// `GET /api/faucet/status` does — per-asset availability, limits and the
+/// remaining balance, as the faucet reports them.
+pub async fn faucet_status_rpc(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<Value, &'static str> {
+    let (_status, body) =
+        call_faucet("faucet_status", None, headers, peer.map(ConnectInfo)).await?;
+    Ok(body)
+}
+
 /// The `btc.faucet_request` RPC, serving the same proxy the explorer's
 /// `POST /api/faucet/send` does so an RPC caller gets what the front end gets:
 /// the faucet's own reply, and the same caller IP forwarded to it, since the

@@ -80,6 +80,7 @@ enum BuiltinMethod {
     BtcSubmitPackage,
     BtcFeeEstimates,
     BtcFaucetRequest,
+    BtcFaucetStatus,
 }
 
 /// Resolves a method name to a built-in, or `None` to fall through to the
@@ -103,6 +104,9 @@ fn builtin_method(method: &str) -> Option<BuiltinMethod> {
         // name is not a method at all and resolves to -32601.
         "btc.faucet_request" if crate::explorer::faucet::faucet_enabled() => {
             Some(BuiltinMethod::BtcFaucetRequest)
+        }
+        "btc.faucet_status" if crate::explorer::faucet::faucet_enabled() => {
+            Some(BuiltinMethod::BtcFaucetStatus)
         }
         _ => None,
     }
@@ -162,6 +166,7 @@ async fn builtin_response(
         BuiltinMethod::BtcSubmitPackage => submit_package_response(id, params).await,
         BuiltinMethod::BtcFeeEstimates => fee_estimates_response(id),
         BuiltinMethod::BtcFaucetRequest => faucet_request_response(caller, id, params).await,
+        BuiltinMethod::BtcFaucetStatus => faucet_status_response(caller, id).await,
     }
 }
 
@@ -508,31 +513,51 @@ async fn faucet_request_response(
     )
     .await
     {
-        // The faucet answers in JSON-RPC itself, so its envelope is unwrapped
-        // rather than nested inside this one: its result becomes the result and
-        // its error becomes an error, code and message intact. A body shaped
-        // like neither is passed through as it came.
-        Ok(mut body) => match body.get("error") {
-            Some(error) if !error.is_null() => {
-                let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Faucet request failed")
-                    .to_string();
-                let data = error.get("data").cloned();
-                err_response(id, code, &message, data)
-            }
-            _ => {
-                let result = body.get_mut("result").map(Value::take).unwrap_or(body);
-                JsonRpcResponse { jsonrpc: JSONRPC_VERSION, result: Some(result), error: None, id }
-            }
-        },
+        Ok(body) => faucet_body_response(id, body),
         Err("invalid_address") => invalid_params(id, "address must be a regtest address"),
-        Err("invalid_asset") => invalid_params(id, "asset must be rbtc or diesel"),
-        Err("invalid_amount") => invalid_params(id, "amount must be a non-negative number"),
-        Err("not_configured") => err_response(id, -32004, "Faucet is not available", None),
-        Err(detail) => err_response(
+        Err(detail) => faucet_error_response(id, detail),
+    }
+}
+
+/// Requests the faucet's per-asset availability and limits — the same proxy
+/// behind the explorer's `GET /api/faucet/status`. Same regtest-and-configured
+/// gate as `btc.faucet_request`.
+async fn faucet_status_response(caller: &CallerContext, id: Value) -> JsonRpcResponse {
+    match crate::explorer::faucet::faucet_status_rpc(&caller.headers, caller.peer).await {
+        Ok(body) => faucet_body_response(id, body),
+        Err(detail) => faucet_error_response(id, detail),
+    }
+}
+
+/// The faucet answers in JSON-RPC itself, so its envelope is unwrapped rather
+/// than nested inside this one: its result becomes the result and its error
+/// becomes an error, code and message intact. A body shaped like neither is
+/// passed through as it came.
+fn faucet_body_response(id: Value, mut body: Value) -> JsonRpcResponse {
+    match body.get("error") {
+        Some(error) if !error.is_null() => {
+            let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Faucet request failed")
+                .to_string();
+            let data = error.get("data").cloned();
+            err_response(id, code, &message, data)
+        }
+        _ => {
+            let result = body.get_mut("result").map(Value::take).unwrap_or(body);
+            JsonRpcResponse { jsonrpc: JSONRPC_VERSION, result: Some(result), error: None, id }
+        }
+    }
+}
+
+fn faucet_error_response(id: Value, detail: &str) -> JsonRpcResponse {
+    match detail {
+        "invalid_asset" => invalid_params(id, "asset must be rbtc or diesel"),
+        "invalid_amount" => invalid_params(id, "amount must be a non-negative number"),
+        "not_configured" => err_response(id, -32004, "Faucet is not available", None),
+        _ => err_response(
             id,
             -32002,
             "Unable to reach the faucet service",

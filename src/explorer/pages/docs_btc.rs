@@ -103,6 +103,27 @@ fn btc_methods() -> Vec<MethodDoc> {
     // is only documented where it can actually be called.
     if crate::explorer::faucet::faucet_enabled() {
         methods.push(rpc_doc(
+            "btc.faucet_status",
+            "Returns the faucet's per-asset availability, limits and remaining balance, as it reports them — the same proxy behind the explorer's faucet page. Takes no parameters. This method exists only on regtest with a faucet configured; elsewhere it is not a method at all.",
+            json!({}),
+            json!({
+                "rbtc": {
+                    "enabled": true,
+                    "min_amount": 0.0001,
+                    "max_amount": 0.01,
+                    "total_available": 12.5,
+                    "max_per_ip_per_day": 0.05
+                },
+                "diesel": {
+                    "enabled": true,
+                    "min_amount": 1,
+                    "max_amount": 100,
+                    "total_available": 50000,
+                    "max_per_ip_per_day": 500
+                }
+            }),
+        ));
+        methods.push(rpc_doc(
             "btc.faucet_request",
             "Requests regtest coins from the configured faucet — the same proxy behind the explorer's faucet page, including the caller IP it rate-limits on. `amount` and `asset` are optional; `asset` is rbtc or diesel. The faucet's own reply is returned unchanged. This method exists only on regtest with a faucet configured; elsewhere it is not a method at all.",
             json!({ "address": "bcrt1q9d4ywgfnd8h43da5tpcxcn6ajv590cg6d3tg6axemvljvt2k76zqwq2fs3", "amount": 0.001, "asset": "rbtc" }),
