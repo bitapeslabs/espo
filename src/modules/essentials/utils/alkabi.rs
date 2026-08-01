@@ -13,7 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 /// The alkabi revision is part of the cache key: an export produced by one
 /// revision must never be served after the dependency moves, since what the
 /// ABI contains is exactly what changes between revisions.
-const ALKABI_CACHE_KEY_PREFIX: &[u8] = b"alkabi:86d04e040416910acfb08012334261b0c27e1575:abi-v1:";
+const ALKABI_CACHE_KEY_PREFIX: &[u8] = b"alkabi:5982b11f9138de7db22a1e27de9f3d8b8f322655:abi-v1:";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderedAlkabi {
