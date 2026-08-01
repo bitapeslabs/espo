@@ -20,6 +20,7 @@ use crate::runtime::shutdown::is_shutdown_requested;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result};
+use bitcoin::ScriptBuf;
 use bitcoin::consensus::Encodable;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
@@ -1012,23 +1013,28 @@ fn entry_spends_live_outpoint(
     })
 }
 
-fn entry_spends_mempool_output_to_address(
+/// Whether `entry` spends an output of another mempool transaction that pays
+/// `target_spk`.
+///
+/// Matching is on the script itself rather than on a rendered address string:
+/// this runs for every transaction in the mempool on every address page, and
+/// deriving an address per candidate output meant a bech32 encode and a
+/// `String` allocation each time — tens of thousands of them per page against a
+/// mempool this size. A script and an address are one-to-one for a given
+/// network, so comparing the scripts answers the same question.
+fn entry_spends_mempool_output_to_spk(
     entry: &MempoolTransactionStruct,
-    address: &str,
-    network: Network,
+    target_spk: &ScriptBuf,
     state: &InMemoryMempool,
 ) -> bool {
     entry.spent_outpoints.iter().any(|prev| {
         let Some(parent) = state.txs.get(&prev.txid).and_then(|parent| parent.tx.as_ref()) else {
             return false;
         };
-        let Some(output) = parent.output.get(prev.vout as usize) else {
-            return false;
-        };
-        Address::from_script(output.script_pubkey.as_script(), network)
-            .ok()
-            .map(|addr| addr.to_string() == address)
-            .unwrap_or(false)
+        parent
+            .output
+            .get(prev.vout as usize)
+            .is_some_and(|output| output.script_pubkey == *target_spk)
     })
 }
 
@@ -3211,6 +3217,10 @@ pub fn pending_action_entries_for_address(
     let Ok(state) = mempool_state().read() else {
         return Vec::new();
     };
+    let target_spk = Address::from_str(addr)
+        .ok()
+        .and_then(|address| address.require_network(network).ok())
+        .map(|address| address.script_pubkey());
     let mut out: Vec<MempoolEntry> = state
         .txs
         .values()
@@ -3227,7 +3237,9 @@ pub fn pending_action_entries_for_address(
                     live_alkane_outpoints,
                     live_rune_outpoints,
                 )
-                || entry_spends_mempool_output_to_address(entry, addr, network, &state)
+                || target_spk
+                    .as_ref()
+                    .is_some_and(|spk| entry_spends_mempool_output_to_spk(entry, spk, &state))
         })
         .filter_map(mempool_entry_from_state)
         .collect();
@@ -3300,6 +3312,12 @@ fn pending_page_from_state(
         return (Vec::new(), 0);
     }
 
+    // Derived once for the whole scan rather than per candidate output.
+    let target_spk = Address::from_str(addr)
+        .ok()
+        .and_then(|address| address.require_network(network).ok())
+        .map(|address| address.script_pubkey());
+
     let mut matches: Vec<(u64, Txid)> = Vec::new();
     for (txid, entry) in state.txs.iter() {
         // Entries without a transaction body cannot be rendered, so they are
@@ -3315,7 +3333,9 @@ fn pending_page_from_state(
         }
         let matched = entry.addresses.iter().any(|address| address == addr)
             || candidate_txids.contains(txid)
-            || entry_spends_mempool_output_to_address(entry, addr, network, state);
+            || target_spk
+                .as_ref()
+                .is_some_and(|spk| entry_spends_mempool_output_to_spk(entry, spk, state));
         if matched {
             matches.push((entry.first_seen, *txid));
         }

@@ -1473,9 +1473,30 @@ pub(crate) fn alkane_meta(
     meta
 }
 
+/// Above this much JSON, the viewer emits plain text instead of highlighting.
+///
+/// Highlighting wraps every token in its own span, which costs roughly four
+/// bytes of markup per byte of JSON. One AMM transaction with an 819 KB trace
+/// turned into 3.2 MB of markup — a third of an 11 MB address page, and ~290 ms
+/// of rendering — for a block that starts collapsed and is usually never
+/// opened. Past this size the content is served as-is: complete and readable,
+/// just not coloured.
+const JSON_VIEWER_HIGHLIGHT_MAX_BYTES: usize = 128 * 1024;
+
 pub fn json_viewer(value: Option<&Value>, raw: &str) -> Markup {
     match value {
         Some(v) => {
+            // Sizing the compact form first avoids building the per-token
+            // markup only to discover it is too big to be worth it. Callers
+            // pass all sorts of things as `raw` — for protostones it is the
+            // OP_RETURN text, not this JSON — so the plain rendering comes
+            // from the value itself.
+            let compact = serde_json::to_string(v).unwrap_or_default();
+            if compact.len() > JSON_VIEWER_HIGHLIGHT_MAX_BYTES {
+                let plain = serde_json::to_string_pretty(v).unwrap_or(compact);
+                return html! { pre class="json-raw" { (plain) } };
+            }
+
             let mut buf = String::new();
             render_json_value(v, 0, &mut buf);
             html! {
