@@ -597,10 +597,20 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
     let mempool_url = mempool_tx_url(state.network, &txid);
 
     let mempool_entry = pending_by_txid(&txid);
+    // In client mode the mempool lives on the data instance, so an unconfirmed
+    // transaction has to be asked for over RPC — otherwise the page renders
+    // without the estimated trace the projected-block view shows for the very
+    // same transaction.
+    let remote_mempool_tx = if tx_height.is_none() && mempool_entry.is_none() {
+        crate::config::explorer_remote().and_then(|remote| fetch_mempool_tx_remote(&remote, &txid))
+    } else {
+        None
+    };
     let selected_mempool_index = if tx_height.is_none() {
         mempool_entry
             .as_ref()
             .and_then(|entry| entry.position.as_ref().map(|pos| pos.block))
+            .or_else(|| remote_mempool_tx.as_ref().and_then(|remote| remote.mempool_block))
     } else {
         None
     };
@@ -615,6 +625,9 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
             mempool_entry
                 .as_ref()
                 .map(|entry| entry.defer_alkane_trace_status)
+                .or_else(|| {
+                    remote_mempool_tx.as_ref().map(|remote| remote.defer_alkane_trace_status)
+                })
                 .unwrap_or(false)
         })
         .unwrap_or(false);
@@ -724,16 +737,23 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
             }
         })
     } else {
-        mempool_entry.as_ref().and_then(|m| m.traces.clone()).or_else(|| {
-            match fetch_traces_for_tx_noheight(&txid, &tx) {
+        mempool_entry
+            .as_ref()
+            .and_then(|m| m.traces.clone())
+            .or_else(|| {
+                remote_mempool_tx
+                    .as_ref()
+                    .map(|remote| remote.traces.clone())
+                    .filter(|traces| !traces.is_empty())
+            })
+            .or_else(|| match fetch_traces_for_tx_noheight(&txid, &tx) {
                 Ok(v) if !v.is_empty() => Some(v),
                 Ok(_) => None,
                 Err(e) => {
                     eprintln!("[tx_page] failed to fetch traces (noheight) for {txid}: {e}");
                     None
                 }
-            }
-        })
+            })
     };
     let traces_ref: Option<&[EspoTrace]> = traces_for_tx.as_ref().map(|v| v.as_slice());
     let tx_pill = if tx_height.is_none() {
@@ -842,7 +862,16 @@ fn fetch_traces_for_tx_remote(
             Err(e) if e.to_string().contains("height_not_indexed") => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-    let traces = result.get("traces").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    Ok(traces_from_remote_json(txid, result.get("traces")))
+}
+
+/// Rebuilds this transaction's traces from a remote `traces` array — the shape
+/// `get_block_traces` and `get_mempool_tx` both return. Only the sandshrew-like
+/// events survive the hop, which is what the call summary is built from; the
+/// protobuf form and storage changes stay empty, as they do for confirmed
+/// transactions rendered from a remote.
+fn traces_from_remote_json(txid: &Txid, traces: Option<&serde_json::Value>) -> Vec<EspoTrace> {
+    let traces = traces.and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let tx_hex = txid.to_string();
     let mut out: Vec<EspoTrace> = Vec::new();
     for trace in traces {
@@ -872,7 +901,41 @@ fn fetch_traces_for_tx_remote(
             },
         });
     }
-    Ok(out)
+    out
+}
+
+/// What a data instance can tell a client-mode explorer about an unconfirmed
+/// transaction. The client runs no mempool of its own, so without this an
+/// unconfirmed page renders its inputs and outputs — those come from the
+/// address index — but no estimated trace, and therefore no call summary.
+struct RemoteMempoolTx {
+    traces: Vec<EspoTrace>,
+    mempool_block: Option<usize>,
+    defer_alkane_trace_status: bool,
+}
+
+fn fetch_mempool_tx_remote(
+    remote: &crate::runtime::remote_espo::RemoteEspoClient,
+    txid: &Txid,
+) -> Option<RemoteMempoolTx> {
+    let result = remote
+        .call("essentials.get_mempool_tx", serde_json::json!({ "txid": txid.to_string() }))
+        .map_err(|e| eprintln!("[tx_page] remote mempool lookup failed for {txid}: {e}"))
+        .ok()?;
+    if !result.get("found").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    Some(RemoteMempoolTx {
+        traces: traces_from_remote_json(txid, result.get("traces")),
+        mempool_block: result
+            .get("mempool_block")
+            .and_then(serde_json::Value::as_u64)
+            .map(|block| block as usize),
+        defer_alkane_trace_status: result
+            .get("defer_alkane_trace_status")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 fn fetch_traces_for_tx(

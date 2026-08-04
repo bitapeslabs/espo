@@ -586,6 +586,26 @@ fn docs_modules() -> Vec<ModuleDoc> {
             intro: "Core Alkane, address, outpoint, trace, holder, and mempool reads.",
             methods: vec![
                 rpc_doc(
+                    "essentials.get_mempool_tx",
+                    "Returns one pending transaction's projected traces by txid, along with its projected mempool block and trace-status flags. Answers found false when the transaction is not in the mempool. The traces carry the same outpoint/events shape as get_block_traces, so one reconstruction covers pending and confirmed transactions alike; a remote explorer uses this to render an unconfirmed transaction's estimated trace and call summary, which it cannot project itself.",
+                    json!({ "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90" }),
+                    json!({
+                        "ok": true,
+                        "found": true,
+                        "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90",
+                        "first_seen": 1785100016u64,
+                        "mempool_block": 0,
+                        "mempool_position_vsize": 141,
+                        "defer_alkane_trace_status": false,
+                        "has_alkane_action": true,
+                        "has_rune_action": false,
+                        "traces": [{
+                            "outpoint": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90:3",
+                            "events": [{ "event": "invoke", "data": { "type": "call", "context": { "myself": { "block": "0x2", "tx": "0x0" }, "inputs": ["0x4d", "0x0"] } } }]
+                        }]
+                    }),
+                ),
+                rpc_doc(
                     "essentials.get_mempool_traces",
                     "Returns paged Alkane traces from the in-memory projected mempool index, optionally filtered by address and minimum sats/vbyte paid via fee_paid. Results are ordered by projected mempool block with the next block first, then by fee paid within that block.",
                     json!({ "page": 1, "limit": 10, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "fee_paid": 2.16 }),

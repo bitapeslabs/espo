@@ -3404,6 +3404,63 @@ impl EssentialsProvider {
         Ok(GetMempoolEntryResult { entry: get_tx_from_mempool(&params.txid) })
     }
 
+    /// One pending transaction's projected traces, by txid.
+    ///
+    /// A remote explorer keeps no mempool of its own, so without this it can
+    /// render an unconfirmed transaction's inputs and outputs — those come from
+    /// the address index — but none of its estimated trace or the call summary
+    /// built from it. The shape matches `get_block_traces`, so the same
+    /// reconstruction serves confirmed and pending transactions alike.
+    pub fn rpc_get_mempool_tx(
+        &self,
+        params: RpcGetMempoolTxParams,
+    ) -> Result<RpcGetMempoolTxResult> {
+        let Some(raw) = params.txid.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(RpcGetMempoolTxResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_txid",
+                    "hint": "expected {\"txid\": \"<txid>\"}"
+                }),
+            });
+        };
+        let Ok(txid) = Txid::from_str(raw) else {
+            return Ok(RpcGetMempoolTxResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_txid"}),
+            });
+        };
+
+        let Some(entry) = get_tx_from_mempool(&txid) else {
+            return Ok(RpcGetMempoolTxResult { value: json!({"ok": true, "found": false}) });
+        };
+
+        let traces = entry
+            .traces
+            .as_ref()
+            .map(|traces| {
+                traces
+                    .iter()
+                    .map(|trace| mempool_trace_to_json(&txid, trace))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        Ok(RpcGetMempoolTxResult {
+            value: json!({
+                "ok": true,
+                "found": true,
+                "txid": txid.to_string(),
+                "first_seen": entry.first_seen,
+                "mempool_block": entry.position.as_ref().map(|position| position.block),
+                "mempool_position_vsize": entry.position.as_ref().map(|position| position.vsize),
+                "defer_alkane_trace_status": entry.defer_alkane_trace_status,
+                "has_alkane_action": entry.has_alkane_action,
+                "has_rune_action": entry.has_rune_action,
+                "traces": traces,
+            }),
+        })
+    }
+
     pub fn get_mempool_pending_for_address(
         &self,
         params: GetMempoolPendingForAddressParams,
@@ -7351,6 +7408,14 @@ pub struct RpcGetOutpointBalancesResult {
     pub value: Value,
 }
 
+pub struct RpcGetMempoolTxParams {
+    pub txid: Option<String>,
+}
+
+pub struct RpcGetMempoolTxResult {
+    pub value: Value,
+}
+
 /// No parameters: the protocol has exactly one runtime balance sheet.
 pub struct RpcGetRuntimeBalancesMetashrewParams {}
 
@@ -9151,10 +9216,19 @@ fn mem_block_tx_to_json(entry: &MempoolBlockTx) -> Value {
 }
 
 fn mempool_trace_to_json(txid: &Txid, trace: &EspoTrace) -> Value {
-    let events_val = prettyify_protobuf_trace_json(&trace.protobuf_trace)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or(Value::Null);
+    // A mempool trace is projected rather than read back from metashrew, so it
+    // carries its events in the sandshrew-like form and leaves the protobuf one
+    // empty. Reading only the protobuf form returned `"events": []` for every
+    // pending transaction — the estimated trace, and the call summary built
+    // from it, simply were not in the response.
+    let events_val = if trace.sandshrew_trace.events.is_empty() {
+        prettyify_protobuf_trace_json(&trace.protobuf_trace)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .unwrap_or(Value::Null)
+    } else {
+        serde_json::to_value(&trace.sandshrew_trace.events).unwrap_or(Value::Null)
+    };
     json!({
         "outpoint": format!("{}:{}", txid, trace.outpoint.vout),
         "events": events_val,
