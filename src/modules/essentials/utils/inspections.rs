@@ -17,9 +17,19 @@ use std::future::Future;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::block_in_place;
 
-const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
-const KV_KEY_BEACON: &[u8] = b"/beacon";
+pub const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
+pub const KV_KEY_BEACON: &[u8] = b"/beacon";
+/// alkanes-std-upgradeable's own ABI — kept as the fixture of what the
+/// canonical proxy looks like; detection itself is `is_upgradeable_proxy`.
+#[cfg(test)]
 const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
+/// The proxy constructor's opcode: alkanes-runtime's
+/// `observe_proxy_initialization` convention (0x7fff), far above any
+/// implementation's own range so that every other opcode falls through to
+/// the delegatecall.
+const PROXY_INITIALIZE_OPCODE: u128 = 32767;
+/// alkanes-std-upgradeable's pass-through method.
+const PROXY_FORWARD_OPCODE: u128 = 36863;
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct StoredInspectionMethod {
@@ -150,13 +160,29 @@ pub fn load_inspection(
     Ok(rec.and_then(|r| r.inspection))
 }
 
-fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
+/// Is this contract an upgradeable (delegatecall) proxy?
+///
+/// Recognized by SHAPE, not by one template's exact ABI: a method at the
+/// proxy-constructor opcode 32767, whatever it is called (`initialize`,
+/// `proxy_initialize`, …), plus the evidence that the code behind it can be
+/// swapped or is only passed through — an `upgrade` method (any opcode), or
+/// alkanes-std-upgradeable's `forward` at 36863. That covers
+/// alkanes-std-upgradeable, the beacon proxies and third-party proxies
+/// written against the same runtime convention (pizza.fun's cheese-proxy:
+/// `proxy_initialize`@32767 + `upgrade`@32766, no `forward`).
+///
+/// This only says "look for a pointer": the target still has to be readable
+/// from `/implementation` or `/beacon` (`get_proxy_implementation`), so a
+/// contract that merely resembles a proxy resolves to nothing and is shown
+/// as itself.
+pub fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
     let Some(meta) = inspection.metadata.as_ref() else { return false };
-    UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
-        meta.methods
-            .iter()
-            .any(|method| method.name.eq_ignore_ascii_case(name) && method.opcode == *opcode)
-    })
+    let has_constructor = meta.methods.iter().any(|m| m.opcode == PROXY_INITIALIZE_OPCODE);
+    let swappable = meta.methods.iter().any(|m| {
+        m.name.eq_ignore_ascii_case("upgrade")
+            || (m.opcode == PROXY_FORWARD_OPCODE && m.name.eq_ignore_ascii_case("forward"))
+    });
+    has_constructor && swappable
 }
 
 fn kv_row_key(alkane: &SchemaAlkaneId, storage_key: &[u8]) -> Vec<u8> {
@@ -174,13 +200,29 @@ fn kv_row_key(alkane: &SchemaAlkaneId, storage_key: &[u8]) -> Vec<u8> {
     key
 }
 
-fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
-    if raw.len() < 32 {
+/// The alkane id held in a proxy's `/implementation` (or `/beacon`) slot.
+///
+/// Two encodings are in the wild:
+/// - 32 bytes — alkanes-support's `AlkaneId` as bytes (u128 block LE, u128 tx
+///   LE), what alkanes-std-upgradeable writes;
+/// - 12 bytes — a borsh `{ block: u32, tx: u64 }`, what contracts built on
+///   borsh schemas write (pizza.fun's cheese-proxy).
+///
+/// Anything else is not a pointer. A zero id is not a pointer either.
+pub fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
+    let id = if raw.len() == 12 {
+        SchemaAlkaneId {
+            block: u32::from_le_bytes(raw[0..4].try_into().ok()?),
+            tx: u64::from_le_bytes(raw[4..12].try_into().ok()?),
+        }
+    } else if raw.len() >= 32 {
+        let block = u128::from_le_bytes(raw[0..16].try_into().ok()?);
+        let tx = u128::from_le_bytes(raw[16..32].try_into().ok()?);
+        SchemaAlkaneId { block: u32::try_from(block).ok()?, tx: u64::try_from(tx).ok()? }
+    } else {
         return None;
-    }
-    let block = u128::from_le_bytes(raw[0..16].try_into().ok()?);
-    let tx = u128::from_le_bytes(raw[16..32].try_into().ok()?);
-    Some(SchemaAlkaneId { block: u32::try_from(block).ok()?, tx: u64::try_from(tx).ok()? })
+    };
+    (id.block != 0 || id.tx != 0).then_some(id)
 }
 
 /// The implementation (or beacon) pointer stored by an upgradeable proxy.
@@ -217,7 +259,8 @@ fn proxy_target_from_db(
             .ok()
             .and_then(|response| response.value)
             .and_then(|raw| {
-                if raw.len() >= 32 {
+                // stored rows carry a 32-byte prefix (the writing txid) before the value
+                if raw.len() >= 32 + 12 {
                     decode_kv_implementation(&raw[32..])
                 } else {
                     decode_kv_implementation(&raw)
@@ -579,6 +622,84 @@ mod tests {
         );
 
         assert_eq!(resolve_contract_wasm_source(&proxy, &provider), Some(factory));
+    }
+
+    #[test]
+    fn resolves_a_borsh_pointer_proxy_without_the_std_forward_method() {
+        // pizza.fun's cheese-proxy: `proxy_initialize`@32767 + `upgrade`@32766 (no
+        // `forward`), and `/implementation` holds a 12-byte borsh { u32, u64 }.
+        let dir = tempfile::tempdir_in(".").expect("tempdir");
+        let provider = EssentialsProvider::new(Arc::new(
+            Mdb::open(dir.path(), b"inspection_borsh_proxy_test:").expect("open mdb"),
+        ));
+        let proxy = SchemaAlkaneId { block: 4, tx: 396 };
+        let implementation = SchemaAlkaneId { block: 4, tx: 393 };
+        let method = |name: &str, opcode: u128| StoredInspectionMethod {
+            name: name.to_string(),
+            opcode,
+            params: Vec::new(),
+            returns: String::new(),
+        };
+        let proxy_methods = vec![
+            method("proxy_initialize", 32767),
+            method("upgrade", 32766),
+            method("get_implementation", 32765),
+            method("get_data_id", 32764),
+        ];
+        let mut implementation_value = vec![0; 32];
+        implementation_value.extend_from_slice(&implementation.block.to_le_bytes());
+        implementation_value.extend_from_slice(&implementation.tx.to_le_bytes());
+        write_inspection_records(
+            &provider,
+            &[
+                inspection_record(proxy, proxy_methods, None),
+                inspection_record(implementation, vec![method("stake", 1)], None),
+            ],
+            vec![(kv_row_key(&proxy, KV_KEY_IMPLEMENTATION), implementation_value)],
+        );
+
+        assert_eq!(resolve_proxy_target_recursive(&proxy, &provider), Some(implementation));
+    }
+
+    #[test]
+    fn proxy_shape_needs_the_constructor_and_a_way_to_swap_the_code() {
+        let with = |methods: Vec<(&str, u128)>| {
+            let mut record = inspection_record(
+                SchemaAlkaneId { block: 2, tx: 1 },
+                methods
+                    .into_iter()
+                    .map(|(name, opcode)| StoredInspectionMethod {
+                        name: name.to_string(),
+                        opcode,
+                        params: Vec::new(),
+                        returns: String::new(),
+                    })
+                    .collect(),
+                None,
+            );
+            record.inspection.take().expect("inspection")
+        };
+        assert!(is_upgradeable_proxy(&with(vec![("initialize", 32767), ("forward", 36863)])));
+        assert!(is_upgradeable_proxy(&with(vec![("proxy_initialize", 32767), ("upgrade", 32766)])));
+        // an ordinary contract with an `upgrade` of its own is not a proxy…
+        assert!(!is_upgradeable_proxy(&with(vec![("initialize", 0), ("upgrade", 7)])));
+        // …and neither is one that only happens to use the high opcode
+        assert!(!is_upgradeable_proxy(&with(vec![("initialize", 32767), ("stake", 1)])));
+    }
+
+    #[test]
+    fn decodes_both_pointer_encodings() {
+        let id = SchemaAlkaneId { block: 4, tx: 393 };
+        let mut wide = Vec::new();
+        wide.extend_from_slice(&(id.block as u128).to_le_bytes());
+        wide.extend_from_slice(&(id.tx as u128).to_le_bytes());
+        assert_eq!(decode_kv_implementation(&wide), Some(id));
+        let mut borsh = Vec::new();
+        borsh.extend_from_slice(&id.block.to_le_bytes());
+        borsh.extend_from_slice(&id.tx.to_le_bytes());
+        assert_eq!(decode_kv_implementation(&borsh), Some(id));
+        assert_eq!(decode_kv_implementation(&[0u8; 12]), None, "a zero id is no pointer");
+        assert_eq!(decode_kv_implementation(&[1u8; 20]), None, "neither encoding");
     }
 
     #[test]
