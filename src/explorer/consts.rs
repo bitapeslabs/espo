@@ -17,8 +17,10 @@ const MAINNET_ICON_OVERRIDES: &[(&str, &str)] = &[
     ("2:77269", "https://i.ibb.co/RTZw3zyh/tortilla-Lp-2.png"),
     ("2:77623", "https://i.ibb.co/nN1LKyZb/fire.png"),
     ("32:0", FRBTC_ICON_URL),
+    ("4:8888", "https://i.ibb.co/DD229cX0/slice-logo.png"),
 ];
-const MAINNET_CONTRACT_NAME_OVERRIDES: &[(&str, &str)] = &[("4:65522", "Oyl AMM")];
+const MAINNET_CONTRACT_NAME_OVERRIDES: &[(&str, &str)] =
+    &[("4:65522", "Oyl AMM"), ("4:8888", "SLICE")];
 const MAINNET_FACTORY_ICON_BLACKLIST: &[&str] =
     &["4:3804", "4:103", "4:102", "4:3803", "4:3805", "4:3806", "4:3807", "4:3800", "4:3802"];
 
