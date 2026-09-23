@@ -2792,9 +2792,15 @@ async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()
         .ok()
         .and_then(|state| state.status.clear_protection_until);
     let clear_active = clear_until.map(|until| until > now).unwrap_or(false);
+    // the window ran out and the canonical set is STILL smaller: the drop is
+    // real (the node's mempool shrank, or the cap above trimmed ours), not a
+    // partial answer to wait out — accept it, or the store stays "stale" for
+    // good (mainnet sat ten days at 465k txs against a node holding 82k,
+    // every refresh re-arming the window; nothing new was ever projected)
+    let protection_expired = clear_until.map(|until| until <= now).unwrap_or(false);
     let sharp_drop = current_count > 20_000
         && canonical.len().saturating_mul(100) <= current_count.saturating_mul(80);
-    let skip_removal = sharp_drop || (clear_active && canonical.len() < current_count);
+    let skip_removal = !protection_expired && (sharp_drop || (clear_active && canonical.len() < current_count));
     let mut protected_refresh = false;
     if skip_removal {
         protected_refresh = true;
@@ -2823,6 +2829,13 @@ async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()
                 status.clear_protection_until = None;
             }
         });
+        if protection_expired {
+            eprintln!(
+                "[mempool] clear protection expired with canonical getrawmempool still at {}/{} txs: accepting the drop",
+                canonical.len(),
+                current_count
+            );
+        }
         let removed = remove_missing_memory_entries(&canonical);
         if removed > 0 {
             eprintln!("[mempool] removed {} txs absent from canonical getrawmempool", removed);
@@ -3182,6 +3195,34 @@ pub fn get_tx_from_mempool(txid: &Txid) -> Option<MempoolEntry> {
     let state = mempool_state().read().ok()?;
     let entry = state.txs.get(txid)?;
     mempool_entry_from_state(entry)
+}
+
+/// A mempool transaction the caller asks for by txid, FETCHED FROM THE NODE
+/// when this store does not hold it hydrated yet: a wallet that just
+/// broadcast a swap asks for it right away, while the store learns of new
+/// arrivals only at the next canonical refresh (`raw_poll_secs`, a full
+/// verbose `getrawmempool` — tens of seconds on a large mempool) and
+/// hydrates them behind everything already queued. `getmempoolentry` says
+/// whether the node holds it unconfirmed (a mined or unknown txid is not
+/// fetched); the raw transaction is decoded, entered like a ZMQ arrival
+/// (protostones, readiness, a trace enqueued) and read back.
+pub fn fetch_mempool_tx_on_demand(txid: &Txid) -> Option<MempoolEntry> {
+    let hydrated = mempool_state()
+        .read()
+        .ok()
+        .and_then(|state| state.txs.get(txid).map(|entry| entry.tx.is_some()))
+        .unwrap_or(false);
+    if hydrated {
+        return get_tx_from_mempool(txid);
+    }
+    let rpc = get_bitcoind_rpc_client();
+    let verbose: VerboseMempoolEntry = rpc.call("getmempoolentry", &[json!(txid.to_string())]).ok()?;
+    let raw_hex = rpc.get_raw_transaction_hex(txid, None).ok()?;
+    let raw = hex::decode(raw_hex.trim()).ok()?;
+    let tx = deserialize::<Transaction>(&raw).ok()?;
+    let entry = build_memory_entry(*txid, tx, Some(&verbose), get_network());
+    upsert_memory_entry(entry);
+    get_tx_from_mempool(txid)
 }
 
 pub fn pending_by_txid(txid: &Txid) -> Option<MempoolEntry> {

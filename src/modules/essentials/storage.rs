@@ -37,8 +37,9 @@ use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    MempoolBlockTx, MempoolEntry, get_mempool_index_transactions_ordered_by_block_and_fee,
-    get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
+    MempoolBlockTx, MempoolEntry, fetch_mempool_tx_on_demand,
+    get_mempool_index_transactions_ordered_by_block_and_fee, get_seen_txids_page,
+    get_tx_from_mempool, pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::{AddressHistoryEntry, AddressUtxo, ElectrumLikeBackend};
 pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
@@ -3430,7 +3431,8 @@ impl EssentialsProvider {
             });
         };
 
-        let Some(entry) = get_tx_from_mempool(&txid) else {
+        // not in the store yet (or metadata only): fetched from the node on the spot
+        let Some(entry) = fetch_mempool_tx_on_demand(&txid) else {
             return Ok(RpcGetMempoolTxResult { value: json!({"ok": true, "found": false}) });
         };
 
