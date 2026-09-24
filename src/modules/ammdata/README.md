@@ -68,7 +68,6 @@ ammdata/amm_tvl_total/v1/<height BE u64>      -> SchemaTvlPointV1  (running AMM 
 ammdata/token_tvl_total/v1/<token>/<height BE u64>
                                               -> SchemaTvlPointV1  (running token total)
 ammdata/pool_tvl_anchor/v1/<pool>             -> SchemaTvlPointV1  (pool's last contribution)
-ammdata/backfill/tvl_line/v1                  -> u128 LE           (backfill completion marker)
 ```
 
 A per-token line counts the full anchored value of each pool the token appears
@@ -85,24 +84,13 @@ store, the same shape `total_volume_amm` uses, so a reorg that drops a block
 falls back to the last surviving total on its own. All writes go out in the
 normal `index_finalize` batch.
 
-#### Backfill
+#### No backfill
 
-`backfill_tvl::maybe_backfill_tvl_lines` gives the lines their history **without
-re-running traces**. Everything it needs is already indexed:
+The lines are **forward-only**. They begin at the block the index was first
+written at and accrue from there; there are no points before that, and nothing
+regenerates them. That is deliberate - see the indexer rules in the repo's
+CLAUDE.md. A backfill would have to run inside `index_block`, which stalls the
+indexer until it completes, and one per index upgrade would be unmaintainable.
 
-* essentials keeps a per-height log of which alkanes' balances moved and by how
-  much - the same feed the live indexer replays to track reserves;
-* ammdata keeps btc/usd per height, the canonical-pool candles that give a token
-  its price in sats, and the per-token USD candles.
-
-So it is a single forward walk over the height range carrying the same running
-totals the live path maintains. It runs once, guarded by the marker key above,
-from inside `index_block` before the block's own work, and writes the marker only
-on completion - an interrupted run starts over. Set `tvl_line_backfill: false` in
-the ammdata module config to skip it and leave the lines forward-only.
-
-One known gap: the backfill recovers `unanchored_sats` from the per-token USD
-candle series, which only exists for tokens that were ever priced. A pool whose
-tokens have no USD candle history contributes nothing to the backfilled
-`unanchored_sats`, where the live path would have valued it from token metrics.
-`canonical_sats` and `derived_sats` are unaffected.
+Nothing here reads or rewrites an existing keyspace: the series lives entirely in
+the new keys above, so deploying it cannot affect an index already on disk.

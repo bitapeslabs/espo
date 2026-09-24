@@ -132,7 +132,6 @@ pub struct AmmDataTable<'a> {
     pub AMM_TVL_TOTAL: KvPointer<'a>,
     pub TOKEN_TVL_TOTAL: KvPointer<'a>,
     pub POOL_TVL_ANCHOR: KvPointer<'a>,
-    pub TVL_LINE_BACKFILL: KvPointer<'a>,
     pub TOKEN_ACTIVITY: ListPointer<'a>,
     pub TOKEN_ACTIVITY_AMOUNT: ListPointer<'a>,
     pub TOKEN_SWAPS: ListPointer<'a>,
@@ -198,7 +197,6 @@ impl<'a> AmmDataTable<'a> {
             AMM_TVL_TOTAL: root.keyword("/amm_tvl_total/v1/"),
             TOKEN_TVL_TOTAL: root.keyword("/token_tvl_total/v1/"),
             POOL_TVL_ANCHOR: root.keyword("/pool_tvl_anchor/v1/"),
-            TVL_LINE_BACKFILL: root.keyword("/backfill/tvl_line/v1"),
             TOKEN_ACTIVITY: root.list_keyword("/token_activity/v1/"),
             TOKEN_ACTIVITY_AMOUNT: root.list_keyword("/token_activity_amount/v1/"),
             TOKEN_SWAPS: root.list_keyword("/token_swaps/v1/"),
@@ -1319,10 +1317,6 @@ impl<'a> AmmDataTable<'a> {
         k.extend_from_slice(&pool.block.to_be_bytes());
         k.extend_from_slice(&pool.tx.to_be_bytes());
         k
-    }
-
-    pub fn tvl_line_backfill_key(&self) -> Vec<u8> {
-        self.TVL_LINE_BACKFILL.key().to_vec()
     }
 
     pub fn token_activity_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {

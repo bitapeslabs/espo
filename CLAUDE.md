@@ -10,6 +10,20 @@
 - When asked to push, push to the branch the user names; if none is named, ask
   or use the current branch — never create branches unprompted.
 
+## Indexer changes
+
+- **New index work starts at the current tip and only moves forward.** An index
+  upgrade must leave every existing keyspace readable and untouched, and must not
+  need historical data to be regenerated to be correct. A new series simply has
+  no points before the block it was deployed at — that is fine and expected.
+- **Never write a backfill, a migration, or anything that rewrites or invalidates
+  an already-indexed keyspace without asking first.** Backfills stall the indexer
+  (they run inside `index_block`, so no blocks advance until they finish), they
+  are slow on a real database, and one per index upgrade would leave this repo
+  unmaintainable. If a change seems to need one, stop and ask before writing it.
+- The same goes for anything that forces a reindex, changes the meaning of an
+  existing key, or deletes/rewrites history. Ask, do not assume.
+
 ## Build / test
 
 - Build: `cargo build --release --features binary`

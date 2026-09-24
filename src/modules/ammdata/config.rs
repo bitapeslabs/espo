@@ -26,9 +26,6 @@ pub struct DerivedLiquidityConfig {
 pub struct AmmDataConfig {
     pub espo_pricer_host: String,
     pub use_historical_backfill: bool,
-    /// One-time replay that gives the aggregated TVL lines their history. Only ever
-    /// runs once; set false to keep the lines forward-only.
-    pub tvl_line_backfill: bool,
     pub pre_ammdata_btc_usd_price: u128,
     pub search_index_enabled: bool,
     pub search_prefix_min_len: u8,
@@ -40,7 +37,7 @@ pub struct AmmDataConfig {
 
 impl AmmDataConfig {
     pub fn spec() -> &'static str {
-        "{ \"espo_pricer_host\": \"http://127.0.0.1:6901\", \"use_historical_backfill\": <bool=true>, \"tvl_line_backfill\": <bool=true>, \"pre_ammdata_btc_usd_price\": <86500 or \"86500.12\">, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
+        "{ \"espo_pricer_host\": \"http://127.0.0.1:6901\", \"use_historical_backfill\": <bool=true>, \"pre_ammdata_btc_usd_price\": <86500 or \"86500.12\">, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
@@ -56,8 +53,6 @@ impl AmmDataConfig {
         let espo_pricer_host = normalize_espo_pricer_host(espo_pricer_host_raw)?;
         let use_historical_backfill =
             obj.get("use_historical_backfill").and_then(|v| v.as_bool()).unwrap_or(true);
-        let tvl_line_backfill =
-            obj.get("tvl_line_backfill").and_then(|v| v.as_bool()).unwrap_or(true);
         let pre_ammdata_btc_usd_price = obj
             .get("pre_ammdata_btc_usd_price")
             .map(parse_scaled_price_value)
@@ -155,7 +150,6 @@ impl AmmDataConfig {
         Ok(Self {
             espo_pricer_host,
             use_historical_backfill,
-            tvl_line_backfill,
             pre_ammdata_btc_usd_price,
             search_index_enabled,
             search_prefix_min_len,
