@@ -39,6 +39,9 @@ pub struct FinalizeStats {
     pub pool_lp_supply: usize,
     pub pool_details_snapshot: usize,
     pub tvl_versioned: usize,
+    pub tvl_line: usize,
+    pub tvl_total: usize,
+    pub pool_tvl_anchor: usize,
     pub token_activity: usize,
     pub token_activity_amount: usize,
     pub token_swaps: usize,
@@ -224,6 +227,9 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     let pls_cnt = state.pool_lp_supply_writes.len();
     let pds_cnt = state.pool_details_snapshot_writes.len();
     let tvl_cnt = state.tvl_versioned_writes.len();
+    let tvll_cnt = state.tvl_line_writes.len();
+    let tvlt_cnt = state.tvl_total_writes.len();
+    let pta_cnt = state.pool_tvl_anchor_writes.len();
     let ta_cnt = state.token_activity_writes.len();
     let taa_cnt = state.token_activity_amount_writes.len();
     let ts_cnt = state.token_swaps_writes.len();
@@ -266,6 +272,9 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         || !state.pool_lp_supply_writes.is_empty()
         || !state.pool_details_snapshot_writes.is_empty()
         || !state.tvl_versioned_writes.is_empty()
+        || !state.tvl_line_writes.is_empty()
+        || !state.tvl_total_writes.is_empty()
+        || !state.pool_tvl_anchor_writes.is_empty()
         || !state.token_activity_writes.is_empty()
         || !state.token_activity_amount_writes.is_empty()
         || !state.token_swaps_writes.is_empty()
@@ -312,6 +321,9 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     puts.extend(std::mem::take(&mut state.pool_lp_supply_writes));
     puts.extend(std::mem::take(&mut state.pool_details_snapshot_writes));
     puts.extend(std::mem::take(&mut state.tvl_versioned_writes));
+    puts.extend(std::mem::take(&mut state.tvl_line_writes));
+    puts.extend(std::mem::take(&mut state.tvl_total_writes));
+    puts.extend(std::mem::take(&mut state.pool_tvl_anchor_writes));
     puts.extend(std::mem::take(&mut state.token_activity_writes));
     puts.extend(std::mem::take(&mut state.token_activity_amount_writes));
     puts.extend(std::mem::take(&mut state.token_swaps_writes));
@@ -369,6 +381,9 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         pool_lp_supply: pls_cnt,
         pool_details_snapshot: pds_cnt,
         tvl_versioned: tvl_cnt,
+        tvl_line: tvll_cnt,
+        tvl_total: tvlt_cnt,
+        pool_tvl_anchor: pta_cnt,
         token_activity: ta_cnt,
         token_activity_amount: taa_cnt,
         token_swaps: ts_cnt,

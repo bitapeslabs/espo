@@ -1108,6 +1108,33 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     }),
                 ),
                 rpc_doc(
+                    "ammdata.get_tvl_candles",
+                    "Returns the TVL line for the whole AMM, or for one token when token is set. Each pool contributes the side of it that can be priced without guessing, doubled, because a constant-product pool holds equal value on both sides: a pool with a canonical quote (frBTC, or BUSD before height 946500) lands in canonical_sats, one whose other side has a canonical-rooted price lands in derived_sats, and anything left is priced off both USD token feeds into unanchored_sats. sats is the reported level and excludes unanchored_sats unless include_unanchored is true. The series is stored in sats and priced into usd at read time against the BTC/USD line of the same bucket, so usd moves with both liquidity and the BTC price while sats isolates liquidity alone; usd and btc_usd are null for buckets the BTC/USD line does not cover. Supported timeframes are 10m, 1h, 4h, 1d, 1w, and 1M, default 1d. Points are newest first and buckets with no change are forward-filled, because TVL is a level rather than a flow. A per-token line counts each of its pools' full anchored value, so token lines do not sum to the AMM line.",
+                    json!({ "token": "2:68479", "timeframe": "1d", "limit": 2, "page": 1 }),
+                    json!({
+                        "ok": true,
+                        "scope": "2:68479",
+                        "timeframe": "1d",
+                        "page": 1,
+                        "limit": 2,
+                        "total": 180,
+                        "has_more": true,
+                        "include_unanchored": false,
+                        "sats_scale": "100000000",
+                        "price_scale": "10000000000000000",
+                        "price_decimals": 16,
+                        "points": [{
+                            "ts": 1779235200,
+                            "sats": "240000000",
+                            "canonical_sats": "200000000",
+                            "derived_sats": "40000000",
+                            "unanchored_sats": "0",
+                            "usd": "1560000000000000000000000",
+                            "btc_usd": "650000000000000000000"
+                        }]
+                    }),
+                ),
+                rpc_doc(
                     "ammdata.get_alkanes_quote",
                     "Returns current and 24-hour USD quotes for BTC and requested Alkanes. frBTC (32:0) is pegged directly to Espo's indexed BTC/USD history, so its prices and changes match BTC exactly. Other Alkane quotes prefer the configured merged <token>-derived_<quote>-usd chart, fall back to the direct <token>-usd chart, and return zero prices when neither chart exists. Current prices use the latest 10-minute close and comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
                     json!({ "assets": ["btc", "2:0", "2:68479"] }),

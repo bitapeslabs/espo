@@ -4,7 +4,7 @@ use crate::modules::ammdata::storage::{
     RpcGetBtcUsdCandlesParams, RpcGetBtcUsdPriceParams, RpcGetCandlesParams,
     RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetPoolsParams,
     RpcGetPortfolioStatsParams, RpcGetTokenActivityParams, RpcGetTokenTotalVolumeParams,
-    RpcGetTokenVolumeParams, RpcGetTotalVolumeAmmParams, RpcPingParams,
+    RpcGetTokenVolumeParams, RpcGetTotalVolumeAmmParams, RpcGetTvlCandlesParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -88,6 +88,51 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         }
                     };
                     view.rpc_get_btc_usd_candles(params)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                }
+            })
+            .await;
+    });
+
+    let reg_tvl_candles = reg.clone();
+    let mdb_ptr_tvl_candles = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_tvl_candles
+            .register("get_tvl_candles", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_ptr_tvl_candles);
+                async move {
+                    let params = RpcGetTvlCandlesParams {
+                        token: payload
+                            .get("token")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        timeframe: payload
+                            .get("timeframe")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        limit: payload.get("limit").and_then(|value| value.as_u64()),
+                        size: payload.get("size").and_then(|value| value.as_u64()),
+                        page: payload.get("page").and_then(|value| value.as_u64()),
+                        now: payload.get("now").and_then(|value| value.as_u64()),
+                        include_unanchored: payload
+                            .get("include_unanchored")
+                            .and_then(|value| value.as_bool()),
+                    };
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|value| value.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": error.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_tvl_candles(params)
                         .map(|response| response.value)
                         .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
                 }

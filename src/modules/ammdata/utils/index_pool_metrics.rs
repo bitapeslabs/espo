@@ -271,6 +271,23 @@ pub fn derive_pool_metrics(
         let pool_tvl_usd = token0_tvl_usd.saturating_add(token1_tvl_usd);
         let pool_tvl_sats = token0_tvl_sats.saturating_add(token1_tvl_sats);
 
+        // Contribution to the aggregated TVL lines: the priceable side, doubled.
+        // Kept separate from pool_tvl_* above, which prices both sides independently.
+        let anchor_point = crate::modules::ammdata::utils::index_tvl::pool_anchor_point(
+            defs,
+            canonical_quote_units,
+            &crate::modules::ammdata::utils::index_tvl::PoolAnchorInput {
+                base_tvl_sats: token0_tvl_sats,
+                quote_tvl_sats: token1_tvl_sats,
+                base_price_sats: token0_price_sats,
+                quote_price_sats: token1_price_sats,
+                base_tvl_usd: token0_tvl_usd,
+                quote_tvl_usd: token1_tvl_usd,
+            },
+            state.btc_usd_price,
+        );
+        state.pool_tvl_anchor_current.insert(*pool, anchor_point);
+
         let prev_pool_metrics = provider
             .get_pool_metrics_v2(GetPoolMetricsV2Params {
                 blockhash: blockhash.clone(),

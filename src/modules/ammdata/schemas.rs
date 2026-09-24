@@ -17,6 +17,35 @@ pub struct SchemaFullCandleV1 {
     pub quote_candle: SchemaCandleV1,
 }
 
+/// A single point on a TVL line, held in canonical sats so the USD line can be
+/// re-derived at read time from the btc/usd line instead of being frozen at write time.
+///
+/// The three buckets record how confident we are in the valuation:
+/// * `canonical_sats` - pools with a canonical quote side (frBTC/BUSD), valued as
+///   `canonical_side * 2`. Exact for a balanced pool, no price feed involved.
+/// * `derived_sats` - pools with no canonical side but where one side has a
+///   canonical-rooted price, valued as `that_side * 2`.
+/// * `unanchored_sats` - neither side reachable from a canonical quote; both sides
+///   priced off the token feed and summed. Reported separately so a chart can drop it.
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Copy, Default)]
+pub struct SchemaTvlPointV1 {
+    pub canonical_sats: u128,
+    pub derived_sats: u128,
+    pub unanchored_sats: u128,
+}
+
+impl SchemaTvlPointV1 {
+    pub fn total_sats(&self) -> u128 {
+        self.canonical_sats
+            .saturating_add(self.derived_sats)
+            .saturating_add(self.unanchored_sats)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.canonical_sats == 0 && self.derived_sats == 0 && self.unanchored_sats == 0
+    }
+}
+
 #[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Copy)]
 pub struct SchemaCanonicalPoolEntry {
     pub pool_id: SchemaAlkaneId,

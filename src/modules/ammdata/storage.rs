@@ -1,13 +1,14 @@
 use super::schemas::{
     ActivityKind, SchemaActivityV1, SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaMarketDefs,
     SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2,
-    SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
+    SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, SchemaTvlPointV1, Timeframe,
 };
 use crate::config::{get_electrum_like, get_espo_indexed_height, get_network};
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
-    CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID, MAINNET_FIRE_USD_CHART_START_TS,
-    PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block, canonical_quotes_at_height,
+    AMOUNT_SCALE, CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID,
+    MAINNET_FIRE_USD_CHART_START_TS, PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block,
+    canonical_quotes_at_height,
 };
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
@@ -125,6 +126,13 @@ pub struct AmmDataTable<'a> {
     pub POOL_LP_SUPPLY: KvPointer<'a>,
     pub POOL_DETAILS_SNAPSHOT: KvPointer<'a>,
     pub TVL_VERSIONED: KvPointer<'a>,
+    // Aggregated TVL lines (canonical sats) + the running totals that feed them.
+    pub AMM_TVL_LINE: ListPointer<'a>,
+    pub TOKEN_TVL_LINE: ListPointer<'a>,
+    pub AMM_TVL_TOTAL: KvPointer<'a>,
+    pub TOKEN_TVL_TOTAL: KvPointer<'a>,
+    pub POOL_TVL_ANCHOR: KvPointer<'a>,
+    pub TVL_LINE_BACKFILL: KvPointer<'a>,
     pub TOKEN_ACTIVITY: ListPointer<'a>,
     pub TOKEN_ACTIVITY_AMOUNT: ListPointer<'a>,
     pub TOKEN_SWAPS: ListPointer<'a>,
@@ -185,6 +193,12 @@ impl<'a> AmmDataTable<'a> {
             POOL_LP_SUPPLY: root.keyword("/pool_lp_supply/latest/"),
             POOL_DETAILS_SNAPSHOT: root.keyword("/pool_details/v2/"),
             TVL_VERSIONED: root.keyword("/tvlVersioned/"),
+            AMM_TVL_LINE: root.list_keyword("atl1:"),
+            TOKEN_TVL_LINE: root.list_keyword("ttl1:"),
+            AMM_TVL_TOTAL: root.keyword("/amm_tvl_total/v1/"),
+            TOKEN_TVL_TOTAL: root.keyword("/token_tvl_total/v1/"),
+            POOL_TVL_ANCHOR: root.keyword("/pool_tvl_anchor/v1/"),
+            TVL_LINE_BACKFILL: root.keyword("/backfill/tvl_line/v1"),
             TOKEN_ACTIVITY: root.list_keyword("/token_activity/v1/"),
             TOKEN_ACTIVITY_AMOUNT: root.list_keyword("/token_activity_amount/v1/"),
             TOKEN_SWAPS: root.list_keyword("/token_swaps/v1/"),
@@ -1219,6 +1233,98 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
+    pub fn amm_tvl_line_ns_prefix(&self, tf: Timeframe) -> Vec<u8> {
+        let suffix = format!("{}:", tf.code());
+        self.AMM_TVL_LINE.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn amm_tvl_line_key(&self, tf: Timeframe, bucket_ts: u64) -> Vec<u8> {
+        let mut k = self.amm_tvl_line_ns_prefix(tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    pub fn token_tvl_line_ns_prefix(&self, token: &SchemaAlkaneId, tf: Timeframe) -> Vec<u8> {
+        let blk_hex = format!("{:x}", token.block);
+        let tx_hex = format!("{:x}", token.tx);
+        let suffix = format!("{}:{}:{}:", blk_hex, tx_hex, tf.code());
+        self.TOKEN_TVL_LINE.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn token_tvl_line_key(
+        &self,
+        token: &SchemaAlkaneId,
+        tf: Timeframe,
+        bucket_ts: u64,
+    ) -> Vec<u8> {
+        let mut k = self.token_tvl_line_ns_prefix(token, tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    pub fn amm_tvl_total_prefix(&self) -> Vec<u8> {
+        self.AMM_TVL_TOTAL.key().to_vec()
+    }
+
+    pub fn amm_tvl_total_key(&self, height: u64) -> Vec<u8> {
+        let mut k = self.amm_tvl_total_prefix();
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    pub fn parse_amm_tvl_total_key(&self, key: &[u8]) -> Option<u64> {
+        let prefix = self.amm_tvl_total_prefix();
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 8 {
+            return None;
+        }
+        let mut height = [0u8; 8];
+        height.copy_from_slice(rest);
+        Some(u64::from_be_bytes(height))
+    }
+
+    pub fn token_tvl_total_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.TOKEN_TVL_TOTAL.key().to_vec();
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k.push(b'/');
+        k
+    }
+
+    pub fn token_tvl_total_key(&self, token: &SchemaAlkaneId, height: u64) -> Vec<u8> {
+        let mut k = self.token_tvl_total_prefix(token);
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    pub fn parse_token_tvl_total_key(&self, token: &SchemaAlkaneId, key: &[u8]) -> Option<u64> {
+        let prefix = self.token_tvl_total_prefix(token);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 8 {
+            return None;
+        }
+        let mut height = [0u8; 8];
+        height.copy_from_slice(rest);
+        Some(u64::from_be_bytes(height))
+    }
+
+    pub fn pool_tvl_anchor_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.POOL_TVL_ANCHOR.key().to_vec();
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn tvl_line_backfill_key(&self) -> Vec<u8> {
+        self.TVL_LINE_BACKFILL.key().to_vec()
+    }
+
     pub fn token_activity_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
         let mut k = self.TOKEN_ACTIVITY.key().to_vec();
         k.extend_from_slice(&token.block.to_be_bytes());
@@ -1958,6 +2064,71 @@ impl AmmDataProvider {
             }
         }
         Ok(None)
+    }
+
+    /// Newest global TVL total written at or before `height`.
+    ///
+    /// The running total is keyed by height and read back through the versioned
+    /// store, so a reorg that drops the block that wrote a point automatically
+    /// falls back to the last surviving one - the same shape `total_volume_amm`
+    /// already relies on.
+    pub fn get_amm_tvl_total_at_or_before_height(
+        &self,
+        height: u32,
+    ) -> Result<Option<(u64, SchemaTvlPointV1)>> {
+        let table = self.table();
+        let rel_prefix = table.amm_tvl_total_prefix();
+        let end_exclusive = table.amm_tvl_total_key(u64::from(height).saturating_add(1));
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            Some(&end_exclusive),
+            self.view_blockhash,
+            0,
+            16,
+            true,
+        )?;
+        for (k, v) in entries {
+            let Some(point_height) = table.parse_amm_tvl_total_key(&k) else { continue };
+            if let Ok(value) = decode_tvl_point_v1(&v) {
+                return Ok(Some((point_height, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Newest per-token TVL total written at or before `height`.
+    pub fn get_token_tvl_total_at_or_before_height(
+        &self,
+        token: &SchemaAlkaneId,
+        height: u32,
+    ) -> Result<Option<(u64, SchemaTvlPointV1)>> {
+        let table = self.table();
+        let rel_prefix = table.token_tvl_total_prefix(token);
+        let end_exclusive = table.token_tvl_total_key(token, u64::from(height).saturating_add(1));
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            Some(&end_exclusive),
+            self.view_blockhash,
+            0,
+            16,
+            true,
+        )?;
+        for (k, v) in entries {
+            let Some(point_height) = table.parse_token_tvl_total_key(token, &k) else { continue };
+            if let Ok(value) = decode_tvl_point_v1(&v) {
+                return Ok(Some((point_height, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The contribution a pool last made to the running totals, so the next block
+    /// can apply a delta instead of re-summing every pool.
+    pub fn get_pool_tvl_anchor(&self, pool: &SchemaAlkaneId) -> Result<Option<SchemaTvlPointV1>> {
+        let table = self.table();
+        let key = table.pool_tvl_anchor_key(pool);
+        let raw = self.get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?.value;
+        Ok(raw.and_then(|bytes| decode_tvl_point_v1(&bytes).ok()))
     }
 
     pub fn get_latest_total_volume_amm(
@@ -4141,6 +4312,66 @@ impl AmmDataProvider {
         Ok(RpcGetBtcUsdCandlesResult { value })
     }
 
+    /// TVL line, protocol-wide or for one token, as `{ts, sats, usd}` points.
+    ///
+    /// The series is stored in sats; the usd column is produced here by pricing
+    /// each bucket against the btc/usd line of the same bucket.
+    pub fn rpc_get_tvl_candles(
+        &self,
+        params: RpcGetTvlCandlesParams,
+    ) -> Result<RpcGetTvlCandlesResult> {
+        let tf = params.timeframe.as_deref().and_then(parse_timeframe).unwrap_or(Timeframe::D1);
+        let legacy_size = params.size.map(|value| value as usize);
+        let limit = params
+            .limit
+            .map(|value| value as usize)
+            .or(legacy_size)
+            .unwrap_or(120)
+            .clamp(1, 1_000);
+        let page = params.page.map(|value| value as usize).unwrap_or(1).max(1);
+        let now = params.now.unwrap_or_else(now_ts);
+        let include_unanchored = params.include_unanchored.unwrap_or(false);
+
+        let table = self.table();
+        let (ns_prefix, scope) = match params.token.as_deref().map(str::trim) {
+            Some(raw) if !raw.is_empty() => {
+                let Some(token) = parse_id_from_str(raw) else {
+                    return Ok(RpcGetTvlCandlesResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_token",
+                            "hint": "token should be an Alkane id like \"2:0\""
+                        }),
+                    });
+                };
+                (
+                    table.token_tvl_line_ns_prefix(&token, tf),
+                    format!("{}:{}", token.block, token.tx),
+                )
+            }
+            _ => (table.amm_tvl_line_ns_prefix(tf), "amm".to_string()),
+        };
+
+        let slice = match read_tvl_line_v1(self, ns_prefix, tf, now) {
+            Ok(slice) => slice,
+            Err(error) => {
+                return Ok(RpcGetTvlCandlesResult {
+                    value: json!({
+                        "ok": false,
+                        "error": format!("read_failed: {error}")
+                    }),
+                });
+            }
+        };
+        let btc_line = read_btc_usd_line_v1(self, tf, now)
+            .map(|btc| btc_usd_by_bucket(&btc, tf))
+            .unwrap_or_default();
+
+        Ok(RpcGetTvlCandlesResult {
+            value: tvl_candles_json(&slice, &btc_line, tf, limit, page, &scope, include_unanchored),
+        })
+    }
+
     pub fn rpc_get_chart_change_block(
         &self,
         params: RpcGetChartChangeBlockParams,
@@ -5769,6 +6000,23 @@ pub struct RpcGetBtcUsdCandlesResult {
     pub value: Value,
 }
 
+pub struct RpcGetTvlCandlesParams {
+    /// Omit for the protocol-wide line; set to an alkane id for that token's line.
+    pub token: Option<String>,
+    pub timeframe: Option<String>,
+    pub limit: Option<u64>,
+    pub size: Option<u64>,
+    pub page: Option<u64>,
+    pub now: Option<u64>,
+    /// Include the `unanchored` component (pools with no canonical-rooted price)
+    /// in the reported totals. Off by default.
+    pub include_unanchored: Option<bool>,
+}
+
+pub struct RpcGetTvlCandlesResult {
+    pub value: Value,
+}
+
 pub struct RpcGetAlkanesQuoteParams {
     pub assets: Option<Vec<String>>,
     pub now: Option<u64>,
@@ -6027,6 +6275,15 @@ pub fn decode_pool_creation_info(bytes: &[u8]) -> anyhow::Result<SchemaPoolCreat
 }
 
 pub fn encode_pool_creation_info(v: &SchemaPoolCreationInfoV1) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(v)?)
+}
+
+pub fn decode_tvl_point_v1(bytes: &[u8]) -> anyhow::Result<SchemaTvlPointV1> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaTvlPointV1::try_from_slice(bytes)?)
+}
+
+pub fn encode_tvl_point_v1(v: &SchemaTvlPointV1) -> anyhow::Result<Vec<u8>> {
     Ok(borsh::to_vec(v)?)
 }
 
@@ -6794,6 +7051,156 @@ fn read_btc_usd_line_v1(
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }
 
+/// A forward-filled TVL line: newest bucket first, one entry per bucket.
+pub struct TvlSlice {
+    pub points_newest_first: Vec<SchemaTvlPointV1>,
+    pub newest_ts: u64,
+}
+
+/// Read a TVL line and fill the gaps.
+///
+/// TVL is a level, not a flow: a bucket with no write means nothing moved, so the
+/// previous value carries forward - both across interior gaps and from the last
+/// written bucket up to now. Buckets before the first ever write stay zero.
+fn read_tvl_line_v1(
+    provider: &AmmDataProvider,
+    ns_prefix: Vec<u8>,
+    tf: Timeframe,
+    now_ts: u64,
+) -> Result<TvlSlice> {
+    let dur = tf.duration_secs();
+    let mut per_bucket: BTreeMap<u64, SchemaTvlPointV1> = BTreeMap::new();
+    for (k, v) in provider
+        .get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest,
+            prefix: ns_prefix,
+        })?
+        .entries
+    {
+        let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() else { continue };
+        let Ok(ts_str) = std::str::from_utf8(ts_bytes) else { continue };
+        let Ok(ts) = ts_str.parse::<u64>() else { continue };
+        if per_bucket.contains_key(&ts) {
+            continue;
+        }
+        if let Ok(point) = decode_tvl_point_v1(&v) {
+            per_bucket.insert(ts, point);
+        }
+    }
+
+    if per_bucket.is_empty() {
+        return Ok(TvlSlice { points_newest_first: vec![], newest_ts: 0 });
+    }
+
+    let start_bucket = *per_bucket.keys().next().unwrap();
+    let newest_bucket_with_data = *per_bucket.keys().last().unwrap();
+    let newest_bucket_now = (now_ts / dur) * dur;
+
+    let mut forward: BTreeMap<u64, SchemaTvlPointV1> = BTreeMap::new();
+    let mut last = SchemaTvlPointV1::default();
+    let mut bts = start_bucket;
+    while bts <= newest_bucket_with_data {
+        if let Some(point) = per_bucket.get(&bts) {
+            last = *point;
+        }
+        forward.insert(bts, last);
+        bts = match bts.checked_add(dur) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+
+    if newest_bucket_now > newest_bucket_with_data {
+        let mut t = newest_bucket_with_data.saturating_add(dur);
+        while t <= newest_bucket_now {
+            forward.insert(t, last);
+            t = match t.checked_add(dur) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+
+    let newest_ts = *forward.keys().last().unwrap_or(&newest_bucket_with_data);
+    let points_newest_first: Vec<SchemaTvlPointV1> =
+        forward.into_iter().rev().map(|(_ts, point)| point).collect();
+
+    Ok(TvlSlice { points_newest_first, newest_ts })
+}
+
+/// Map bucket ts -> btc/usd close, so a sats line can be priced at read time.
+fn btc_usd_by_bucket(slice: &CandleSlice, tf: Timeframe) -> BTreeMap<u64, u128> {
+    let dur = tf.duration_secs();
+    let mut map = BTreeMap::new();
+    for (index, candle) in slice.candles_newest_first.iter().enumerate() {
+        let ts = slice.newest_ts.saturating_sub((index as u64).saturating_mul(dur));
+        map.insert(ts, candle.close);
+    }
+    map
+}
+
+fn tvl_candles_json(
+    slice: &TvlSlice,
+    btc_line: &BTreeMap<u64, u128>,
+    tf: Timeframe,
+    limit: usize,
+    page: usize,
+    scope: &str,
+    include_unanchored: bool,
+) -> Value {
+    let total = slice.points_newest_first.len();
+    let offset = limit.saturating_mul(page.saturating_sub(1));
+    let end = offset.saturating_add(limit).min(total);
+    let points = if offset >= total {
+        Vec::new()
+    } else {
+        slice.points_newest_first[offset..end]
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let global_index = offset.saturating_add(index);
+                let ts = slice
+                    .newest_ts
+                    .saturating_sub((global_index as u64).saturating_mul(tf.duration_secs()));
+                let sats = if include_unanchored {
+                    point.total_sats()
+                } else {
+                    point.canonical_sats.saturating_add(point.derived_sats)
+                };
+                // Price the sats level with the btc/usd close of the same bucket; a
+                // bucket the btc line does not cover yet reports usd as null.
+                let btc_usd = btc_line.get(&ts).copied();
+                let usd =
+                    btc_usd.map(|price| sats.saturating_mul(price).saturating_div(AMOUNT_SCALE));
+                json!({
+                    "ts": ts,
+                    "sats": sats.to_string(),
+                    "canonical_sats": point.canonical_sats.to_string(),
+                    "derived_sats": point.derived_sats.to_string(),
+                    "unanchored_sats": point.unanchored_sats.to_string(),
+                    "usd": usd.map(|v| v.to_string()),
+                    "btc_usd": btc_usd.map(|v| v.to_string()),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    json!({
+        "ok": true,
+        "scope": scope,
+        "timeframe": tf.code(),
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "has_more": end < total,
+        "include_unanchored": include_unanchored,
+        "sats_scale": AMOUNT_SCALE.to_string(),
+        "price_scale": PRICE_SCALE.to_string(),
+        "price_decimals": 16,
+        "points": points,
+    })
+}
+
 fn btc_usd_candles_json(slice: &CandleSlice, tf: Timeframe, limit: usize, page: usize) -> Value {
     let total = slice.candles_newest_first.len();
     let offset = limit.saturating_mul(page.saturating_sub(1));
@@ -6967,6 +7374,102 @@ fn id_str(id: &SchemaAlkaneId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tvl_test_provider() -> (tempfile::TempDir, AmmDataProvider) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let amm_mdb =
+            std::sync::Arc::new(Mdb::open(dir.path(), b"ammdata_tvl_test:").expect("open mdb"));
+        let essentials = std::sync::Arc::new(EssentialsProvider::new(std::sync::Arc::new(
+            amm_mdb.clone_with_prefix(b"essentials:"),
+        )));
+        (dir, AmmDataProvider::new(amm_mdb, essentials))
+    }
+
+    #[test]
+    fn tvl_line_carries_the_last_level_across_empty_buckets() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let tf = Timeframe::H1;
+        let dur = tf.duration_secs();
+        let base = (1_700_000_000u64 / dur) * dur;
+
+        let first = SchemaTvlPointV1 { canonical_sats: 1_000, ..Default::default() };
+        let later =
+            SchemaTvlPointV1 { canonical_sats: 4_000, derived_sats: 500, unanchored_sats: 0 };
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.amm_tvl_line_key(tf, base), encode_tvl_point_v1(&first).unwrap()),
+                    (
+                        table.amm_tvl_line_key(tf, base + dur * 3),
+                        encode_tvl_point_v1(&later).unwrap(),
+                    ),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write line");
+
+        // Read as of one bucket past the last write.
+        let now = base + dur * 4;
+        let slice =
+            read_tvl_line_v1(&provider, table.amm_tvl_line_ns_prefix(tf), tf, now).expect("read");
+
+        // base..base+4h inclusive is 5 buckets, newest first.
+        assert_eq!(slice.points_newest_first.len(), 5);
+        assert_eq!(slice.newest_ts, now);
+        // Newest two buckets hold the later level (one written, one filled forward).
+        assert_eq!(slice.points_newest_first[0], later);
+        assert_eq!(slice.points_newest_first[1], later);
+        // The two buckets between the writes keep the first level rather than dropping to zero.
+        assert_eq!(slice.points_newest_first[2], first);
+        assert_eq!(slice.points_newest_first[3], first);
+        assert_eq!(slice.points_newest_first[4], first);
+    }
+
+    #[test]
+    fn tvl_json_prices_sats_with_the_btc_line_and_excludes_unanchored_by_default() {
+        let tf = Timeframe::D1;
+        let newest_ts = 1_700_000_000u64;
+        let point = SchemaTvlPointV1 {
+            canonical_sats: AMOUNT_SCALE,
+            derived_sats: AMOUNT_SCALE,
+            unanchored_sats: AMOUNT_SCALE,
+        };
+        let slice = TvlSlice { points_newest_first: vec![point], newest_ts };
+        let btc_usd = 50_000u128.saturating_mul(PRICE_SCALE);
+        let btc_line = BTreeMap::from([(newest_ts, btc_usd)]);
+
+        let value = tvl_candles_json(&slice, &btc_line, tf, 10, 1, "amm", false);
+        let entry = &value["points"][0];
+        // Two BTC of anchored liquidity; the unanchored leg is reported but not counted.
+        assert_eq!(entry["sats"], json!((AMOUNT_SCALE * 2).to_string()));
+        assert_eq!(entry["unanchored_sats"], json!(AMOUNT_SCALE.to_string()));
+        assert_eq!(entry["usd"], json!((100_000u128 * PRICE_SCALE).to_string()));
+
+        let with_unanchored = tvl_candles_json(&slice, &btc_line, tf, 10, 1, "amm", true);
+        assert_eq!(with_unanchored["points"][0]["sats"], json!((AMOUNT_SCALE * 3).to_string()));
+        assert_eq!(
+            with_unanchored["points"][0]["usd"],
+            json!((150_000u128 * PRICE_SCALE).to_string())
+        );
+    }
+
+    #[test]
+    fn tvl_json_reports_null_usd_for_buckets_the_btc_line_misses() {
+        let tf = Timeframe::D1;
+        let slice = TvlSlice {
+            points_newest_first: vec![SchemaTvlPointV1 {
+                canonical_sats: AMOUNT_SCALE,
+                ..Default::default()
+            }],
+            newest_ts: 1_700_000_000,
+        };
+
+        let value = tvl_candles_json(&slice, &BTreeMap::new(), tf, 10, 1, "amm", false);
+        assert_eq!(value["points"][0]["usd"], json!(null));
+        assert_eq!(value["points"][0]["sats"], json!(AMOUNT_SCALE.to_string()));
+    }
 
     #[test]
     fn price_assets_accept_btc_alkanes_and_remove_duplicates() {

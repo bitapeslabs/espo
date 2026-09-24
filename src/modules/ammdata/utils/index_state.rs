@@ -1,6 +1,6 @@
 use crate::modules::ammdata::schemas::{
     SchemaCanonicalPoolEntry, SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
-    SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe,
+    SchemaPoolSnapshot, SchemaTokenMetricsV1, SchemaTvlPointV1, Timeframe,
 };
 use crate::modules::ammdata::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
 use crate::modules::ammdata::utils::candles::CandleCache;
@@ -36,6 +36,12 @@ pub struct IndexState {
     pub pool_lp_supply_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub pool_details_snapshot_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub tvl_versioned_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// This block's anchored TVL contribution per touched pool, consumed by
+    /// `index_tvl` to move the running totals by a delta.
+    pub pool_tvl_anchor_current: HashMap<SchemaAlkaneId, SchemaTvlPointV1>,
+    pub tvl_line_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub tvl_total_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub pool_tvl_anchor_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_activity_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_activity_amount_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_swaps_writes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -114,6 +120,10 @@ impl IndexState {
             pool_lp_supply_writes: Vec::new(),
             pool_details_snapshot_writes: Vec::new(),
             tvl_versioned_writes: Vec::new(),
+            pool_tvl_anchor_current: HashMap::new(),
+            tvl_line_writes: Vec::new(),
+            tvl_total_writes: Vec::new(),
+            pool_tvl_anchor_writes: Vec::new(),
             token_activity_writes: Vec::new(),
             token_activity_amount_writes: Vec::new(),
             token_swaps_writes: Vec::new(),
