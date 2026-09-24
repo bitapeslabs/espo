@@ -132,6 +132,7 @@ pub struct AmmDataTable<'a> {
     pub AMM_TVL_TOTAL: KvPointer<'a>,
     pub TOKEN_TVL_TOTAL: KvPointer<'a>,
     pub POOL_TVL_ANCHOR: KvPointer<'a>,
+    pub TVL_LINE_BACKFILL: KvPointer<'a>,
     pub TOKEN_ACTIVITY: ListPointer<'a>,
     pub TOKEN_ACTIVITY_AMOUNT: ListPointer<'a>,
     pub TOKEN_SWAPS: ListPointer<'a>,
@@ -192,11 +193,12 @@ impl<'a> AmmDataTable<'a> {
             POOL_LP_SUPPLY: root.keyword("/pool_lp_supply/latest/"),
             POOL_DETAILS_SNAPSHOT: root.keyword("/pool_details/v2/"),
             TVL_VERSIONED: root.keyword("/tvlVersioned/"),
-            AMM_TVL_LINE: root.list_keyword("atl1:"),
-            TOKEN_TVL_LINE: root.list_keyword("ttl1:"),
-            AMM_TVL_TOTAL: root.keyword("/amm_tvl_total/v1/"),
-            TOKEN_TVL_TOTAL: root.keyword("/token_tvl_total/v1/"),
-            POOL_TVL_ANCHOR: root.keyword("/pool_tvl_anchor/v1/"),
+            AMM_TVL_LINE: root.list_keyword("atl2:"),
+            TOKEN_TVL_LINE: root.list_keyword("ttl2:"),
+            AMM_TVL_TOTAL: root.keyword("/amm_tvl_total/v2/"),
+            TOKEN_TVL_TOTAL: root.keyword("/token_tvl_total/v2/"),
+            POOL_TVL_ANCHOR: root.keyword("/pool_tvl_anchor/v2/"),
+            TVL_LINE_BACKFILL: root.keyword("/backfill/tvl_line/v2"),
             TOKEN_ACTIVITY: root.list_keyword("/token_activity/v1/"),
             TOKEN_ACTIVITY_AMOUNT: root.list_keyword("/token_activity_amount/v1/"),
             TOKEN_SWAPS: root.list_keyword("/token_swaps/v1/"),
@@ -1310,6 +1312,10 @@ impl<'a> AmmDataTable<'a> {
         let mut height = [0u8; 8];
         height.copy_from_slice(rest);
         Some(u64::from_be_bytes(height))
+    }
+
+    pub fn tvl_line_backfill_key(&self) -> Vec<u8> {
+        self.TVL_LINE_BACKFILL.key().to_vec()
     }
 
     pub fn pool_tvl_anchor_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {

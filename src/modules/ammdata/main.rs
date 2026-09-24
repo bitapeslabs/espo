@@ -732,6 +732,7 @@ impl EspoModule for AmmData {
             search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
         let use_historical_backfill =
             search_cfg.as_ref().map(|c| c.use_historical_backfill).unwrap_or(true);
+        let tvl_line_backfill = search_cfg.as_ref().map(|c| c.tvl_line_backfill).unwrap_or(true);
         let mut search_prefix_min =
             search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
         let mut search_prefix_max =
@@ -746,6 +747,21 @@ impl EspoModule for AmmData {
         }
         if search_prefix_max < search_prefix_min {
             search_prefix_max = search_prefix_min;
+        }
+
+        // Runs once, before this block's own work, so the totals it leaves behind are
+        // what the live delta path reads. Explicitly requested; see CLAUDE.md.
+        if tvl_line_backfill {
+            let timer = debug::start_if(debug);
+            if let Err(e) = crate::modules::ammdata::utils::backfill_tvl::maybe_backfill_tvl_lines(
+                &write_provider,
+                essentials,
+                get_network(),
+                height,
+            ) {
+                eprintln!("[AMMDATA] tvl line backfill failed: {e:?}");
+            }
+            debug::log_elapsed(module, "tvl_line_backfill", timer);
         }
 
         let timer = debug::start_if(debug);

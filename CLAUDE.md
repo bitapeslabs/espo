@@ -23,6 +23,14 @@
   unmaintainable. If a change seems to need one, stop and ask before writing it.
 - The same goes for anything that forces a reindex, changes the meaning of an
   existing key, or deletes/rewrites history. Ask, do not assume.
+- **Never delete keys in prod.** If indexed data turns out to be wrong, bump the
+  namespace (`v1` → `v2`), write the corrected data there, point the readers at
+  it, and leave the old keys in place, stale and orphaned. Writing new keys is
+  safe; deleting is not.
+- When a backfill *is* explicitly requested: it must be idempotent, it must
+  only write to namespaces nothing else reads, it must be guarded by a marker
+  key written only on completion, and its per-height cost must be bounded
+  (range scans with a limit, never whole-namespace reads in a loop).
 
 ## Build / test
 

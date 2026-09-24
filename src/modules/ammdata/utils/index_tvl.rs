@@ -14,7 +14,7 @@
 //! Maintenance is O(pools touched this block): each pool's last contribution is
 //! stored, so a block applies deltas rather than re-summing every pool.
 
-use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit};
+use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE};
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, SchemaTvlPointV1, active_timeframes};
 use crate::modules::ammdata::storage::{AmmDataProvider, encode_tvl_point_v1};
 use crate::modules::ammdata::utils::candles::bucket_start_for;
@@ -23,7 +23,40 @@ use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use std::collections::HashMap;
 
-/// Per-side valuations for one pool, as `derive_pool_metrics` already computes them.
+/// Value one side of a pool in sats.
+///
+/// A canonical side is already denominated in the canonical asset, so it converts
+/// directly. Any other side is priced off a pool candle close, and **candle closes
+/// are scaled by `PRICE_SCALE` (1e16), not `AMOUNT_SCALE`** - `price_quote_per_base`
+/// divides by `PRICE_SCALE`. Dimensionally:
+///
+/// ```text
+/// amount (token units x 1e8) * price (quote per base x 1e16) / 1e16
+///     = quote amount in 1e8 units = sats
+/// ```
+///
+/// Dividing by `AMOUNT_SCALE` here instead would inflate the result by 1e8. The
+/// pre-existing `token*_tvl_sats` in `derive_pool_metrics` does exactly that, which
+/// is why the TVL lines compute their own value rather than reusing those fields.
+pub fn side_tvl_sats(
+    token: &SchemaAlkaneId,
+    amount: u128,
+    price_sats: u128,
+    canonical_quote_units: &HashMap<SchemaAlkaneId, CanonicalQuoteUnit>,
+    btc_usd_price: Option<u128>,
+) -> u128 {
+    if let Some(unit) = canonical_quote_units.get(token).copied() {
+        return crate::modules::ammdata::canonical_quote_amount_tvl_sats(
+            amount,
+            unit,
+            btc_usd_price,
+        )
+        .unwrap_or(0);
+    }
+    amount.saturating_mul(price_sats).saturating_div(PRICE_SCALE)
+}
+
+/// Per-side valuations for one pool. The sats legs must come from `side_tvl_sats`.
 pub struct PoolAnchorInput {
     pub base_tvl_sats: u128,
     pub quote_tvl_sats: u128,
@@ -312,6 +345,32 @@ mod tests {
         assert_eq!(point.derived_sats, 0);
         // $50k at $50k/BTC is exactly one BTC.
         assert_eq!(point.unanchored_sats, AMOUNT_SCALE);
+    }
+
+    #[test]
+    fn side_tvl_sats_divides_candle_prices_by_price_scale() {
+        // 10 tokens of a base asset whose candle close says 0.5 frBTC per token.
+        // Candle closes are PRICE_SCALE-scaled, so the answer must be 5 BTC in sats.
+        let token = SchemaAlkaneId { block: 2, tx: 0 };
+        let amount = 10u128.saturating_mul(AMOUNT_SCALE);
+        let price = PRICE_SCALE / 2;
+        let canonical = HashMap::new();
+
+        let sats = side_tvl_sats(&token, amount, price, &canonical, None);
+        assert_eq!(sats, 5u128.saturating_mul(AMOUNT_SCALE));
+
+        // Dividing by AMOUNT_SCALE instead is the 1e8 inflation this guards against.
+        let inflated = amount.saturating_mul(price) / AMOUNT_SCALE;
+        assert_eq!(inflated, sats.saturating_mul(AMOUNT_SCALE));
+    }
+
+    #[test]
+    fn side_tvl_sats_passes_a_canonical_btc_side_through_unchanged() {
+        let mut canonical = HashMap::new();
+        canonical.insert(FRBTC_ALKANE_ID, CanonicalQuoteUnit::Btc);
+        // A frBTC reserve is already sats; the (nonsense) price must be ignored.
+        let sats = side_tvl_sats(&FRBTC_ALKANE_ID, 123_456, u128::MAX, &canonical, None);
+        assert_eq!(sats, 123_456);
     }
 
     #[test]

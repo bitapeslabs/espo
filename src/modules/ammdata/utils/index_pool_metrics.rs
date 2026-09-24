@@ -273,12 +273,32 @@ pub fn derive_pool_metrics(
 
         // Contribution to the aggregated TVL lines: the priceable side, doubled.
         // Kept separate from pool_tvl_* above, which prices both sides independently.
+        //
+        // The sats legs are recomputed through index_tvl::side_tvl_sats rather than
+        // reusing token0/1_tvl_sats, because those divide a PRICE_SCALE-scaled candle
+        // price by AMOUNT_SCALE and come out 1e8 too large. Fixing that in place would
+        // change pool_tvl_sats and the other already-indexed sats fields, so it is left
+        // alone here and tracked separately.
+        let anchor_base_sats = crate::modules::ammdata::utils::index_tvl::side_tvl_sats(
+            &defs.base_alkane_id,
+            token0_amount,
+            token0_price_sats,
+            canonical_quote_units,
+            state.btc_usd_price,
+        );
+        let anchor_quote_sats = crate::modules::ammdata::utils::index_tvl::side_tvl_sats(
+            &defs.quote_alkane_id,
+            token1_amount,
+            token1_price_sats,
+            canonical_quote_units,
+            state.btc_usd_price,
+        );
         let anchor_point = crate::modules::ammdata::utils::index_tvl::pool_anchor_point(
             defs,
             canonical_quote_units,
             &crate::modules::ammdata::utils::index_tvl::PoolAnchorInput {
-                base_tvl_sats: token0_tvl_sats,
-                quote_tvl_sats: token1_tvl_sats,
+                base_tvl_sats: anchor_base_sats,
+                quote_tvl_sats: anchor_quote_sats,
                 base_price_sats: token0_price_sats,
                 quote_price_sats: token1_price_sats,
                 base_tvl_usd: token0_tvl_usd,
