@@ -701,29 +701,6 @@ impl EspoModule for AmmData {
             }
             Err(e) => eprintln!("[AMMDATA] failed to load /index_height: {e:?}"),
         }
-
-        // Say up front whether the TVL backfill is still owed. It only runs from
-        // inside index_block, so a restart at the tip sits quietly until the next
-        // block arrives - without this line that looks like it silently did nothing.
-        if let Some(provider) = self.provider.as_ref() {
-            let enabled = AmmDataConfig::load_from_global_config()
-                .map(|c| c.tvl_line_backfill)
-                .unwrap_or(true);
-            match crate::modules::ammdata::utils::backfill_tvl::backfill_done_through(provider) {
-                Ok(Some(h)) => {
-                    eprintln!(
-                        "[AMMDATA] tvl line backfill (v2): already complete through height {h}"
-                    )
-                }
-                Ok(None) if enabled => eprintln!(
-                    "[AMMDATA] tvl line backfill (v2): PENDING - it runs at the next indexed block and pauses indexing until it finishes; set ammdata.tvl_line_backfill=false to skip"
-                ),
-                Ok(None) => {
-                    eprintln!("[AMMDATA] tvl line backfill (v2): not run, disabled by config")
-                }
-                Err(e) => eprintln!("[AMMDATA] tvl line backfill (v2): marker read failed: {e:?}"),
-            }
-        }
     }
 
     fn get_genesis_block(&self, network: Network) -> u32 {
@@ -755,7 +732,6 @@ impl EspoModule for AmmData {
             search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
         let use_historical_backfill =
             search_cfg.as_ref().map(|c| c.use_historical_backfill).unwrap_or(true);
-        let tvl_line_backfill = search_cfg.as_ref().map(|c| c.tvl_line_backfill).unwrap_or(true);
         let mut search_prefix_min =
             search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
         let mut search_prefix_max =
@@ -770,21 +746,6 @@ impl EspoModule for AmmData {
         }
         if search_prefix_max < search_prefix_min {
             search_prefix_max = search_prefix_min;
-        }
-
-        // Runs once, before this block's own work, so the totals it leaves behind are
-        // what the live delta path reads. Explicitly requested; see CLAUDE.md.
-        if tvl_line_backfill {
-            let timer = debug::start_if(debug);
-            if let Err(e) = crate::modules::ammdata::utils::backfill_tvl::maybe_backfill_tvl_lines(
-                &write_provider,
-                essentials,
-                get_network(),
-                height,
-            ) {
-                eprintln!("[AMMDATA] tvl line backfill failed: {e:?}");
-            }
-            debug::log_elapsed(module, "tvl_line_backfill", timer);
         }
 
         let timer = debug::start_if(debug);

@@ -1,5 +1,4 @@
 pub mod activity;
-pub mod backfill_tvl;
 pub mod candles;
 pub mod index_activity;
 pub mod index_factories;

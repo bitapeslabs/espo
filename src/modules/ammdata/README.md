@@ -68,7 +68,6 @@ ammdata/amm_tvl_total/v2/<height BE u64>      -> SchemaTvlPointV1  (running AMM 
 ammdata/token_tvl_total/v2/<token>/<height BE u64>
                                               -> SchemaTvlPointV1  (running token total)
 ammdata/pool_tvl_anchor/v2/<pool>             -> SchemaTvlPointV1  (pool's last contribution)
-ammdata/backfill/tvl_line/v2                  -> u128 LE           (backfill completion marker)
 ```
 
 **The `v1` namespaces (`atl1:`, `ttl1:`, `/amm_tvl_total/v1/`, `/token_tvl_total/v1/`,
@@ -92,34 +91,25 @@ store, the same shape `total_volume_amm` uses, so a reorg that drops a block
 falls back to the last surviving total on its own. All writes go out in the
 normal `index_finalize` batch.
 
-#### Backfill
+#### History and the one-time backfill
 
-`backfill_tvl::maybe_backfill_tvl_lines` gives the lines their history **without
-re-running traces**. Everything it needs is already indexed:
+The lines are **forward-only** in this codebase: the live path alone populates
+them from the block the index is deployed at, and nothing here regenerates
+history. That is the repo rule (see "Indexer changes" in CLAUDE.md); a backfill
+runs inside `index_block`, stalls the indexer until it finishes, and one per
+index upgrade would be unmaintainable.
 
-* essentials keeps a per-height log of which alkanes' balances moved and by how
-  much - the same feed the live indexer replays to track reserves;
-* ammdata keeps btc/usd per height, the canonical-pool candles that give a token
-  its price in sats, and the per-token USD candles.
+The v2 series on prod does have history, from a one-time backfill that was
+explicitly requested and run once on 2026-09-25. It replayed the essentials
+per-height balance log from the ammdata genesis (no traces re-run), took 22
+seconds for 63,824 heights, and was validated against live reserves: the
+backfilled `canonical_sats` matched `2 x sum(frBTC reserves)` from the reserves
+snapshot to within 0.000%. The code was removed afterwards. Two things it left
+behind, both harmless and both left alone: the `v1` keyspaces above, and the
+marker key `ammdata/backfill/tvl_line/v2` (u128 LE, the height it completed
+through). Nothing reads either.
 
-So it is a single forward walk over the height range carrying the same running
-totals the live path maintains, valuing each side through the same
-`index_tvl::side_tvl_sats` helper so the two cannot disagree on scale. Price
-lookups are bounded range scans (newest candle at or before the bucket), not
-whole-namespace reads; the first version read every candle a token ever had, per
-10-minute bucket, and took 40 minutes on prod.
-
-It runs once, guarded by the marker key above, from inside `index_block` before
-the block's own work, and writes the marker only on completion - an interrupted
-run starts over. **While it runs the indexer does not advance.** Set
-`tvl_line_backfill: false` in the ammdata module config to skip it.
-
-This backfill exists because it was explicitly asked for. The repo rule in
-CLAUDE.md is that index upgrades move forward from the tip and a backfill needs
-permission first.
-
-One known gap: the backfill recovers `unanchored_sats` from the per-token USD
-candle series, which only exists for tokens that were ever priced. A pool whose
-tokens have no USD candle history contributes nothing to the backfilled
-`unanchored_sats`, where the live path would have valued it from token metrics.
-`canonical_sats` and `derived_sats` are unaffected.
+One known gap in that backfilled history: `unanchored_sats` before the deploy
+block was recovered from the per-token USD candle series, which only exists for
+tokens that were ever priced, so pools whose tokens have no USD candle history
+contributed nothing to it. `canonical_sats` and `derived_sats` are unaffected.
