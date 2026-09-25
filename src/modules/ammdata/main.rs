@@ -701,6 +701,29 @@ impl EspoModule for AmmData {
             }
             Err(e) => eprintln!("[AMMDATA] failed to load /index_height: {e:?}"),
         }
+
+        // Say up front whether the TVL backfill is still owed. It only runs from
+        // inside index_block, so a restart at the tip sits quietly until the next
+        // block arrives - without this line that looks like it silently did nothing.
+        if let Some(provider) = self.provider.as_ref() {
+            let enabled = AmmDataConfig::load_from_global_config()
+                .map(|c| c.tvl_line_backfill)
+                .unwrap_or(true);
+            match crate::modules::ammdata::utils::backfill_tvl::backfill_done_through(provider) {
+                Ok(Some(h)) => {
+                    eprintln!(
+                        "[AMMDATA] tvl line backfill (v2): already complete through height {h}"
+                    )
+                }
+                Ok(None) if enabled => eprintln!(
+                    "[AMMDATA] tvl line backfill (v2): PENDING - it runs at the next indexed block and pauses indexing until it finishes; set ammdata.tvl_line_backfill=false to skip"
+                ),
+                Ok(None) => {
+                    eprintln!("[AMMDATA] tvl line backfill (v2): not run, disabled by config")
+                }
+                Err(e) => eprintln!("[AMMDATA] tvl line backfill (v2): marker read failed: {e:?}"),
+            }
+        }
     }
 
     fn get_genesis_block(&self, network: Network) -> u32 {

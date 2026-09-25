@@ -30,7 +30,11 @@ use crate::modules::ammdata::utils::index_snapshot::{
 use crate::modules::ammdata::utils::index_tvl::{
     PoolAnchorInput, pool_anchor_point, side_tvl_sats as anchor_side_tvl_sats,
 };
-use crate::modules::essentials::storage::EssentialsProvider;
+use crate::modules::essentials::storage::{
+    AlkaneBalanceTxEntry, EssentialsProvider,
+    GetListEntriesDescParams as EssentialsGetListEntriesDescParams, decode_pointer_idx_u64,
+    load_tx_pointer_blob_v3_by_id,
+};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
@@ -44,7 +48,23 @@ const BLOCK_TIME_BATCH: usize = 1_000;
 /// How often to log progress, in heights.
 const LOG_EVERY_HEIGHTS: u32 = 5_000;
 
+/// Height the backfill last completed through, or `None` if it has never finished.
+pub fn backfill_done_through(provider: &AmmDataProvider) -> Result<Option<u32>> {
+    let key = provider.table().tvl_line_backfill_key();
+    let raw = provider
+        .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+        .value;
+    Ok(raw
+        .and_then(|bytes| decode_u128_value(&bytes).ok())
+        .map(|h| h as u32)
+        .filter(|h| *h > 0))
+}
+
 /// Returns true when a backfill ran.
+///
+/// Called from `index_block`, so it only fires when a block actually arrives. A
+/// restart at the tip does not trigger it until the next block does; `set_mdb`
+/// logs that at startup so nobody waits on a log line that cannot appear yet.
 pub fn maybe_backfill_tvl_lines(
     provider: &AmmDataProvider,
     essentials: &EssentialsProvider,
@@ -53,13 +73,7 @@ pub fn maybe_backfill_tvl_lines(
 ) -> Result<bool> {
     let table = provider.table();
     let marker_key = table.tvl_line_backfill_key();
-    let done_through = provider
-        .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: marker_key.clone() })?
-        .value
-        .and_then(|bytes| decode_u128_value(&bytes).ok())
-        .unwrap_or(0) as u32;
-
-    if done_through > 0 {
+    if backfill_done_through(provider)?.is_some() {
         return Ok(false);
     }
 
@@ -218,7 +232,7 @@ impl<'a> BackfillWalker<'a> {
     /// the new totals onto this height's buckets.
     fn step(&mut self, height: u32) -> Result<()> {
         let balance_txs =
-            crate::modules::ammdata::load_balance_txs_by_height(self.essentials, height)?;
+            load_pool_balance_txs_by_height(self.essentials, height, &self.pools_map)?;
         if balance_txs.is_empty() {
             return Ok(());
         }
@@ -495,6 +509,56 @@ impl<'a> BackfillWalker<'a> {
         self.flush()?;
         Ok(self.stats)
     }
+}
+
+/// The by-height balance log, restricted to pool owners.
+///
+/// Same shape as `load_balance_txs_by_height`, but the owner is part of the log
+/// key, so non-pool owners are dropped *before* their pointer blob is loaded. At a
+/// busy height most balance changes belong to wallets, not pools, and each blob is
+/// a point read - skipping them is most of the remaining per-height cost.
+fn load_pool_balance_txs_by_height(
+    essentials: &EssentialsProvider,
+    height: u32,
+    pools: &HashMap<SchemaAlkaneId, SchemaMarketDefs>,
+) -> Result<HashMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>> {
+    let table = essentials.table();
+    let prefix = table.alkane_balance_txs_by_height_log_prefix(height);
+    let entries = essentials
+        .get_list_entries_desc(EssentialsGetListEntriesDescParams {
+            blockhash: StateAt::Latest,
+            prefix,
+        })?
+        .entries;
+
+    let mut with_idx: HashMap<SchemaAlkaneId, Vec<(u32, AlkaneBalanceTxEntry)>> = HashMap::new();
+    for (key, value) in entries {
+        let Some((tx_idx, owner)) = table.parse_alkane_balance_txs_by_height_log_key(height, &key)
+        else {
+            continue;
+        };
+        if !pools.contains_key(&owner) {
+            continue;
+        }
+        let Ok(entry_id) = decode_pointer_idx_u64(&value) else { continue };
+        let Some(blob) = load_tx_pointer_blob_v3_by_id(essentials, entry_id) else { continue };
+        with_idx.entry(owner).or_default().push((
+            tx_idx,
+            AlkaneBalanceTxEntry {
+                txid: blob.txid,
+                height: blob.height,
+                outflow: blob.outflows.get(&owner).cloned().unwrap_or_default(),
+            },
+        ));
+    }
+
+    let mut out: HashMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>> = HashMap::new();
+    for (owner, mut list) in with_idx {
+        // Deltas must apply in intra-block tx order, as the live path does.
+        list.sort_by_key(|(tx_idx, _)| *tx_idx);
+        out.insert(owner, list.into_iter().map(|(_, e)| e).collect());
+    }
+    Ok(out)
 }
 
 /// Replace a pool's old contribution to a total with its new one.

@@ -7386,6 +7386,50 @@ mod tests {
     }
 
     #[test]
+    fn tvl_totals_read_the_newest_point_at_or_before_a_height() {
+        // This is the join between the backfill and the live path: the live path at
+        // height H reads the total at-or-before H-1 and applies a delta to it. If
+        // this returned the wrong point the running total would silently restart.
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let token = SchemaAlkaneId { block: 2, tx: 68479 };
+
+        let at_100 = SchemaTvlPointV1 { canonical_sats: 100, ..Default::default() };
+        let at_200 = SchemaTvlPointV1 { canonical_sats: 200, ..Default::default() };
+        let tok_150 = SchemaTvlPointV1 { derived_sats: 150, ..Default::default() };
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.amm_tvl_total_key(100), encode_tvl_point_v1(&at_100).unwrap()),
+                    (table.amm_tvl_total_key(200), encode_tvl_point_v1(&at_200).unwrap()),
+                    (
+                        table.token_tvl_total_key(&token, 150),
+                        encode_tvl_point_v1(&tok_150).unwrap(),
+                    ),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write totals");
+
+        // Exactly at a written height, between heights, past the newest, before the first.
+        let at = |h: u32| provider.get_amm_tvl_total_at_or_before_height(h).unwrap();
+        assert_eq!(at(100).map(|(h, p)| (h, p.canonical_sats)), Some((100, 100)));
+        assert_eq!(at(199).map(|(h, p)| (h, p.canonical_sats)), Some((100, 100)));
+        assert_eq!(at(200).map(|(h, p)| (h, p.canonical_sats)), Some((200, 200)));
+        assert_eq!(at(5_000).map(|(h, p)| (h, p.canonical_sats)), Some((200, 200)));
+        assert_eq!(at(99), None);
+
+        let tok = |h: u32| provider.get_token_tvl_total_at_or_before_height(&token, h).unwrap();
+        assert_eq!(tok(149), None);
+        assert_eq!(tok(150).map(|(h, p)| (h, p.derived_sats)), Some((150, 150)));
+        assert_eq!(tok(999).map(|(h, p)| (h, p.derived_sats)), Some((150, 150)));
+        // A different token sees nothing.
+        let other = SchemaAlkaneId { block: 2, tx: 1 };
+        assert_eq!(provider.get_token_tvl_total_at_or_before_height(&other, 999).unwrap(), None);
+    }
+
+    #[test]
     fn tvl_line_carries_the_last_level_across_empty_buckets() {
         let (_dir, provider) = tvl_test_provider();
         let table = provider.table();
