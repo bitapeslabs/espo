@@ -332,6 +332,8 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
     }
 
     let mut events = subscribe_mempool_events();
+    // a lag resyncs the client ONCE per burst, and at most every few seconds
+    let mut last_resync: Option<TokioInstant> = None;
     let heartbeat_period = Duration::from_secs(25);
     let mut heartbeat = interval_at(TokioInstant::now() + heartbeat_period, heartbeat_period);
     loop {
@@ -339,6 +341,14 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
             event = events.recv() => {
                 match event {
                     Ok(payload) => {
+                        // nothing of this socket's could match: skip the parse (a mempool
+                        // refresh publishes one event per address of every transaction;
+                        // parsing each one on every socket is what let sockets lag)
+                        if (subscriptions.addresses.is_empty() && payload.contains("\"type\":\"address-tx\""))
+                            || (subscriptions.txids.is_empty() && payload.contains("\"type\":\"tx\""))
+                        {
+                            continue;
+                        }
                         let parsed_payload = serde_json::from_str::<Value>(&payload).ok();
                         if let Some(filtered) = parsed_payload
                             .as_ref()
@@ -392,6 +402,17 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Drain what is already queued, then resync ONCE — and not again
+                        // for a few seconds. A burst (a mempool refresh publishing an event
+                        // per address of thousands of transactions) lagged a socket once per
+                        // message, and a resync per lag — the snapshot plus every address's
+                        // status — was the storm: 250 messages a second, all the same
+                        // sequence, to a client that had asked for one address.
+                        while let Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) = events.try_recv() {}
+                        if last_resync.is_some_and(|at| at.elapsed() < Duration::from_secs(5)) {
+                            continue;
+                        }
+                        last_resync = Some(TokioInstant::now());
                         let mut disconnected = false;
                         if subscriptions.blocks {
                             let payload = json!({

@@ -607,7 +607,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_mempool_traces",
-                    "Returns paged Alkane traces from the in-memory projected mempool index, optionally filtered by address and minimum sats/vbyte paid via fee_paid. Results are ordered by projected mempool block with the next block first, then by fee paid within that block.",
+                    "Returns paged Alkane traces from the in-memory projected mempool index, optionally filtered by address, by minimum sats/vbyte paid via fee_paid, and by targets: a list of alkane ids (\"2:68479\") that keeps only the transactions whose projected traces invoke one of them (a pool, the AMM factory) — the pending swaps of a token in one small page, whatever else fills the mempool. Results are ordered by projected mempool block with the next block first, then by fee paid within that block.",
                     json!({ "page": 1, "limit": 10, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "fee_paid": 2.16 }),
                     json!({
                         "ok": true,

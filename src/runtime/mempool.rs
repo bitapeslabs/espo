@@ -365,7 +365,9 @@ pub fn subscribe_mempool_events() -> broadcast::Receiver<String> {
 
 fn mempool_event_sender() -> &'static broadcast::Sender<String> {
     MEMPOOL_EVENTS.get_or_init(|| {
-        let (sender, _) = broadcast::channel(128);
+        // a mempool refresh publishes an event per address of every transaction it
+        // touches: thousands in a burst — a channel of 128 lagged every socket
+        let (sender, _) = broadcast::channel(8192);
         sender
     })
 }

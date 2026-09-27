@@ -63,6 +63,18 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty()),
                             fee_paid: payload.get("fee_paid").and_then(|v| v.as_f64()),
+                            targets: payload
+                                .get("targets")
+                                .and_then(|v| v.as_array())
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty())
+                                        .collect::<Vec<_>>()
+                                })
+                                .filter(|v| !v.is_empty()),
                         };
                         view.rpc_get_mempool_traces(params)
                             .map(|resp| resp.value)

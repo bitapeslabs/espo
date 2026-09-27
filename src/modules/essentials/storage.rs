@@ -3479,6 +3479,11 @@ impl EssentialsProvider {
         let limit = params.limit.unwrap_or(100).max(1) as usize;
         let address = params.address.as_deref().and_then(normalize_address);
         let min_fee_paid = params.fee_paid.filter(|value| value.is_finite() && *value >= 0.0);
+        let targets = params
+            .targets
+            .as_ref()
+            .map(|list| list.iter().filter_map(|s| parse_alkane_from_str(s)).collect::<HashSet<SchemaAlkaneId>>())
+            .filter(|set| !set.is_empty());
 
         let filtered = get_mempool_index_transactions_ordered_by_block_and_fee()
             .into_iter()
@@ -3489,6 +3494,7 @@ impl EssentialsProvider {
                     .map_or(true, |addr| entry.addresses.iter().any(|candidate| candidate == addr))
             })
             .filter(|entry| min_fee_paid.map_or(true, |fee_paid| entry.fee_rate >= fee_paid))
+            .filter(|entry| targets.as_ref().map_or(true, |set| mempool_entry_invokes(entry, set)))
             .collect::<Vec<_>>();
         let total_traces = filtered
             .iter()
@@ -7133,6 +7139,12 @@ pub struct RpcGetMempoolTracesParams {
     pub limit: Option<u64>,
     pub address: Option<String>,
     pub fee_paid: Option<f64>,
+    /// Alkane ids ("2:68479", "0x2:0x10b59"): keep only the transactions whose
+    /// projected traces INVOKE one of them (a pool, the AMM factory, a token).
+    /// A client after the pending swaps of a token reads them in one small page
+    /// instead of paging through a mint storm (74,000 transactions, 4,000 of
+    /// them traced, the swaps sitting behind 3,700 mints).
+    pub targets: Option<Vec<String>>,
 }
 
 pub struct RpcGetMempoolTracesResult {
@@ -9181,6 +9193,38 @@ fn tx_summary_from_parts(
         outflows.push(AlkaneBalanceTxEntry { txid, height, outflow: outflow_map });
     }
     AlkaneTxSummary { txid, traces, outflows, height }
+}
+
+/// Whether any projected trace of the entry runs a frame AS one of `targets`
+/// (the `myself` of an invoke: the pool a swap calls, the factory a path swap
+/// goes through, a token being minted) — the `targets` filter of
+/// `get_mempool_traces`.
+fn mempool_entry_invokes(entry: &MempoolBlockTx, targets: &HashSet<SchemaAlkaneId>) -> bool {
+    let parse = |s: &str| -> Option<u128> {
+        let t = s.trim();
+        if let Some(x) = t.strip_prefix("0x") {
+            u128::from_str_radix(x, 16).ok()
+        } else {
+            t.parse::<u128>().ok()
+        }
+    };
+    entry.traces.as_ref().is_some_and(|traces| {
+        traces.iter().any(|trace| {
+            trace.sandshrew_trace.events.iter().any(|event| match event {
+                EspoSandshrewLikeTraceEvent::Invoke(data) => {
+                    let myself = &data.context.myself;
+                    match (parse(&myself.block), parse(&myself.tx)) {
+                        (Some(block), Some(tx)) => match (u32::try_from(block), u64::try_from(tx)) {
+                            (Ok(block), Ok(tx)) => targets.contains(&SchemaAlkaneId { block, tx }),
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+                }
+                _ => false,
+            })
+        })
+    })
 }
 
 fn mem_block_tx_to_json(entry: &MempoolBlockTx) -> Value {
