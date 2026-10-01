@@ -149,14 +149,22 @@ moves, and essentials already records exactly when that happens.
 | Holder | Trigger heights from | Balance at a trigger from |
 | --- | --- | --- |
 | alkane | its `balance_by_height` list for the token | the `balance_by_height` row |
-| address | its `AlkaneTxs` ledger (every tx that touched its alkane balances) | one point read of `address_balance` against that block's root (the store is versioned per block) |
+| address | its outpoint list: every outpoint carrying the token, at its creation block and (if spent) its spend block | the outpoint's own amount - `+` at creation, `-` at spend. No per-height balance reads; outpoints carrying other tokens are one small decode and nothing more |
 
 The heights are unioned, each holder's balance is carried forward across them
-(one cursor per holder), supply is read at each trigger height, and the heights
-are mapped to block times in one batch. A request is a few small list reads
-plus one point read per trigger height - not a walk over the chart's history.
-An address with more than 50,000 alkane txs is refused rather than truncated,
-since that is not a treasury and a partial ledger would make the chart lie.
+(one cursor per holder), and a height only becomes a step if the total actually
+moved - supply is read and the block time looked up per step, not per holder
+event. A request is a few small list reads plus one supply read per real change,
+not a walk over the chart's history. An address with more than 50,000 outpoints
+is refused rather than truncated, since that is not a treasury and a partial
+history would make the chart lie.
+
+Why outpoints and not the address's tx ledger: the first version used the
+`AlkaneTxs` ledger and a pinned balance read per height. For TORTILLA's burn
+address, which receives burns of two dozen other tokens, that meant 1,291 steps
+and a 2.7 s request, each step loading a trace-carrying tx blob for a height
+where TORTILLA had not moved. The outpoint form only touches outpoints that
+carry the token, and needs no historical reads at all.
 
 Applying it: a candle takes the last step at or before the end of its bucket.
 Buckets before the first step get ratio 1 (nothing was locked yet). Volume is

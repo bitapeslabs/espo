@@ -20,32 +20,37 @@
 //!
 //! * an alkane holder has a per-height balance history for the token
 //!   (`balance_by_height`), with the list of heights it changed at;
-//! * an address holder has a ledger of every tx that touched its alkane balances
-//!   (`AlkaneTxs`), and the store is versioned per block, so its balance at any
-//!   of those heights is one point read against that block's root.
+//! * an address holder's balance in a token is the sum of its unspent outpoints
+//!   carrying that token, and essentials keeps the address's outpoint list. Each
+//!   outpoint record is small (no traces) and names its block, so the token's
+//!   balance history is: +amount at the outpoint's creation height, -amount at
+//!   its spend height. No per-height balance reads, and outpoints that do not
+//!   carry the token cost one small decode and nothing else - which matters for
+//!   a burn address that receives dozens of other tokens.
 //!
-//! So a request costs a few small list reads plus one point read per trigger
-//! height - not a walk over the candles' history. Supply is read at those same
-//! trigger heights only; between triggers the ratio is held, so supply growth
-//! without a holder movement does not move it. That is a deliberate trade for
-//! cheapness and is noted in the docs.
+//! Holders' histories are then merged and collapsed to the heights where the
+//! total actually changed, and supply is read only at those. Between steps the
+//! ratio is held, so supply growth without a holder movement does not move it.
+//! That is a deliberate trade for cheapness and is noted in the docs.
 
 use crate::modules::ammdata::consts::NonCirculatingHolders;
 use crate::modules::ammdata::schemas::SchemaCandleV1;
 use crate::modules::essentials::storage::{
     AddressIndexListKind, EssentialsProvider, GetCirculatingSupplyParams, GetMultiValuesParams,
     GetRawValueParams, decode_u128_value, get_address_index_list_len, get_address_index_list_range,
-    load_tx_pointer_blob_v3_by_id,
+    load_outpoint_pointer_blob_v3_by_id, load_tx_summary_v2, resolve_outpoint_spent_by_id_v2,
 };
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use alloy_primitives::U256;
 use anyhow::{Result, anyhow};
-use std::collections::{BTreeMap, BTreeSet};
+use bitcoin::hashes::Hash;
+use bitcoin::{BlockHash, Txid};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Refuse rather than silently truncate: an address with this many alkane txs is
-/// not a treasury or a locker, and a partial ledger would make the chart lie.
-const MAX_ADDRESS_LEDGER_ENTRIES: u64 = 50_000;
+/// Refuse rather than silently truncate: an address with this many outpoints is
+/// not a treasury or a locker, and a partial history would make the chart lie.
+const MAX_ADDRESS_OUTPOINTS: u64 = 50_000;
 /// Block summaries are fetched in batches of this many heights.
 const BLOCK_TIME_BATCH: usize = 1_000;
 
@@ -104,6 +109,7 @@ pub fn circulating_steps(
     let mut cursors: Vec<usize> = vec![0; series.len()];
     let mut held: Vec<u128> = vec![0; series.len()];
     let mut out: Vec<CirculatingStep> = Vec::with_capacity(heights.len());
+    let mut last_total: Option<u128> = None;
     for h in heights {
         for (i, s) in series.iter().enumerate() {
             while cursors[i] < s.len() && s[cursors[i]].0 <= h {
@@ -112,6 +118,12 @@ pub fn circulating_steps(
             }
         }
         let non_circulating = held.iter().fold(0u128, |acc, v| acc.saturating_add(*v));
+        // Only a height where the total actually moved is a step; everything
+        // downstream (supply read, block time, ratio) is per step.
+        if last_total == Some(non_circulating) {
+            continue;
+        }
+        last_total = Some(non_circulating);
         let supply = supply_at_height(essentials, &token, h)?;
         let Some(ts) = block_times.get(&h).copied() else { continue };
         out.push(CirculatingStep { height: h, ts, non_circulating, supply });
@@ -198,9 +210,12 @@ fn alkane_holder_series(
         .collect())
 }
 
-/// `(height, balance)` for an address holder. Heights come from the address's
-/// alkane tx ledger; each balance is a point read of the address's balance row
-/// against that block's root.
+/// `(height, balance)` for an address holder, from its outpoints.
+///
+/// An outpoint carrying the token adds its amount at the block it was created in
+/// and subtracts it at the block it was spent in. Outpoints that do not carry the
+/// token are one small decode and nothing more. Spend heights need the spending
+/// tx's summary, which is heavier, but lockers and burn addresses rarely spend.
 fn address_holder_series(
     essentials: &EssentialsProvider,
     address: &str,
@@ -209,47 +224,88 @@ fn address_holder_series(
     let total = get_address_index_list_len(
         essentials,
         StateAt::Latest,
-        AddressIndexListKind::AlkaneTxs,
+        AddressIndexListKind::OutpointIdx,
         address,
     )?;
     if total == 0 {
         return Ok(Vec::new());
     }
-    if total > MAX_ADDRESS_LEDGER_ENTRIES {
+    if total > MAX_ADDRESS_OUTPOINTS {
         return Err(anyhow!(
-            "non_circulating address {address} has {total} alkane txs, over the {MAX_ADDRESS_LEDGER_ENTRIES} cap"
+            "non_circulating address {address} has {total} outpoints, over the {MAX_ADDRESS_OUTPOINTS} cap"
         ));
     }
     let ids = get_address_index_list_range(
         essentials,
         StateAt::Latest,
-        AddressIndexListKind::AlkaneTxs,
+        AddressIndexListKind::OutpointIdx,
         address,
         0,
         total,
     )?;
 
-    let mut heights: BTreeSet<u32> = BTreeSet::new();
+    // Block hash -> height is a tree lookup, not an essentials one.
+    let tree = crate::runtime::tree_db::get_global_tree_db().ok_or_else(|| {
+        anyhow!("cmcap needs the versioned tree to map outpoint blocks to heights")
+    })?;
+    let mut height_by_blockhash: HashMap<[u8; 32], Option<u32>> = HashMap::new();
+    let mut deltas: Vec<(u32, i128)> = Vec::new();
     for id in ids {
-        if let Some(blob) = load_tx_pointer_blob_v3_by_id(essentials, id) {
-            heights.insert(blob.height);
+        let Some(blob) = load_outpoint_pointer_blob_v3_by_id(essentials, id) else { continue };
+        let amount: u128 = blob
+            .balances
+            .iter()
+            .filter(|b| b.alkane == *token)
+            .fold(0u128, |acc, b| acc.saturating_add(b.amount));
+        if amount == 0 {
+            continue;
+        }
+        let created = match height_by_blockhash.get(&blob.blockhash) {
+            Some(h) => *h,
+            None => {
+                let h = tree.height_for_blockhash(&BlockHash::from_byte_array(blob.blockhash))?;
+                height_by_blockhash.insert(blob.blockhash, h);
+                h
+            }
+        };
+        let Some(created) = created else { continue };
+        deltas.push((created, clamp_i128(amount)));
+
+        if let Some(spent_txid) = resolve_outpoint_spent_by_id_v2(essentials, StateAt::Latest, id)?
+        {
+            if let Some(summary) =
+                load_tx_summary_v2(essentials, &Txid::from_byte_array(spent_txid))
+            {
+                deltas.push((summary.height, -clamp_i128(amount)));
+            }
         }
     }
+    Ok(series_from_deltas(deltas))
+}
 
-    let table = essentials.table();
-    let key = table.address_balance_key(address, token);
-    let mut out = Vec::with_capacity(heights.len());
-    for h in heights {
-        let Some(hash) = essentials.blockhash_for_height(h)? else { continue };
-        let at = essentials.with_view_blockhash(Some(hash));
-        let balance = at
-            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })?
-            .value
-            .and_then(|b| decode_u128_value(&b).ok())
-            .unwrap_or(0);
-        out.push((h, balance));
+fn clamp_i128(v: u128) -> i128 {
+    v.min(i128::MAX as u128) as i128
+}
+
+/// Fold signed per-height deltas into a `(height, balance)` series, one entry per
+/// height the balance changed at.
+fn series_from_deltas(mut deltas: Vec<(u32, i128)>) -> Vec<(u32, u128)> {
+    deltas.sort_by_key(|(h, _)| *h);
+    let mut out: Vec<(u32, u128)> = Vec::new();
+    let mut balance: i128 = 0;
+    let mut i = 0;
+    while i < deltas.len() {
+        let h = deltas[i].0;
+        while i < deltas.len() && deltas[i].0 == h {
+            balance = balance.saturating_add(deltas[i].1);
+            i += 1;
+        }
+        let b = balance.max(0) as u128;
+        if out.last().map(|(_, prev)| *prev) != Some(b) {
+            out.push((h, b));
+        }
     }
-    Ok(out)
+    out
 }
 
 fn supply_at_height(
@@ -309,6 +365,21 @@ mod tests {
         let out = scale_candle(c, &step(0, 500, 100));
         assert_eq!(out.close, 0);
         assert_eq!(step(0, 500, 100).ratio_f64(), 0.0);
+    }
+
+    #[test]
+    fn deltas_fold_into_a_balance_series_with_one_entry_per_change() {
+        // Outpoints created at 100 and 105; the first spent at 110 while another of
+        // equal size lands at 110, so 110 is a no-op; nothing at 120.
+        let series =
+            series_from_deltas(vec![(105, 50), (100, 100), (110, -100), (110, 100), (120, 0)]);
+        assert_eq!(series, vec![(100, 100), (105, 150)]);
+    }
+
+    #[test]
+    fn deltas_never_drive_a_balance_negative() {
+        let series = series_from_deltas(vec![(10, 5), (20, -9)]);
+        assert_eq!(series, vec![(10, 5), (20, 0)]);
     }
 
     #[test]
