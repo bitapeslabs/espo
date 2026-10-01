@@ -1079,9 +1079,23 @@ fn docs_modules() -> Vec<ModuleDoc> {
             methods: vec![
                 rpc_doc(
                     "ammdata.get_candles",
-                    "Returns OHLCV candles for a pool or token pair over a supported timeframe.",
-                    json!({ "pool": "2:53014", "timeframe": "1h", "limit": 10, "page": 1, "side": "base" }),
-                    json!({ "ok": true, "candles": [{ "ts": 1710000000, "open": "1", "high": "2", "low": "1", "close": "2", "volume": "100" }] }),
+                    "Returns OHLCV candles for a pool or token pair over a supported timeframe. pool accepts a pool id, or a token id with a chart suffix: -usd and -sats (price), -mcusd and -mcsats (price times the supply essentials tracks, which counts every minted token and so is closer to FDV), -cmcap (circulating market cap), and the -derived_<quote> forms of each. A derived chart merges the token's canonical (frBTC) pricing with its price through the quote's pool; a pair listed in the module's mainnet derived-quote forks (MAINNET_DERIVED_QUOTE_FORKS in ammdata/consts.rs) stops taking the quote's price moves from the fork height on and follows the token's direct USD pricing from there, with its earlier history untouched. Today that is TORTILLA (2:68479) against DIESEL (2:0) from height 969393. -cmcap scales the stored mcusd candles by (supply - non_circulating) / supply, where non_circulating is the sum of balances held by the addresses and alkanes listed for that token in the module's mainnet constants (MAINNET_NON_CIRCULATING in ammdata/consts.rs): lockers, treasuries, team-seeded LP pools, burn addresses. Nothing is indexed for it: the ratio only changes when a listed holder's balance changes, and those heights come from indexes essentials already keeps (an alkane holder's per-height balance history; an address holder's alkane tx ledger plus one point read of its balance at each of those blocks), so a request costs a few small reads rather than a walk of the chart's history. Supply is read at those same heights only, so supply growth with no holder movement does not move the ratio until the next one. Each -cmcap candle carries circulating_ratio, and the response carries a cmcap object saying whether the token has an entry; with none, the candles equal -mcusd and the ratio is 1. Volume is never scaled.",
+                    json!({ "pool": "2:68479-cmcap", "timeframe": "1d", "limit": 2, "page": 1 }),
+                    json!({
+                        "ok": true,
+                        "pool": "2:68479-cmcap",
+                        "timeframe": "1d",
+                        "cmcap": { "configured": true, "holders": 3, "steps": 12 },
+                        "candles": [{
+                            "ts": 1790208000,
+                            "open": "1230000000000000000000000",
+                            "high": "1260000000000000000000000",
+                            "low": "1210000000000000000000000",
+                            "close": "1250000000000000000000000",
+                            "volume": "100",
+                            "circulating_ratio": 0.6125
+                        }]
+                    }),
                 ),
                 rpc_doc(
                     "ammdata.get_btc_usd_candles",

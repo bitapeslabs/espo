@@ -113,3 +113,87 @@ One known gap in that backfilled history: `unanchored_sats` before the deploy
 block was recovered from the per-token USD candle series, which only exists for
 tokens that were ever priced, so pools whose tokens have no USD candle history
 contributed nothing to it. `canonical_sats` and `derived_sats` are unaffected.
+
+### cmcap (circulating market cap)
+
+`get_candles` with `pool: "<token>-cmcap"` (or `<token>-derived_<quote>-cmcap`).
+
+The stored mcap candles (`tmc1:` / `tdmc1:`) are price x the supply essentials
+tracks, which counts every minted token - tokens in a vesting contract, a
+treasury or a burn sink included. For many tokens that is FDV. cmcap is that
+series scaled at request time:
+
+```
+cmcap = mcap x (supply - non_circulating) / supply
+```
+
+`non_circulating` is the sum of balances held by the holders listed for the
+token in `MAINNET_NON_CIRCULATING` (`consts.rs`). It is a network fact - which
+contracts are lockers, which address is the treasury - so it lives in consts
+next to `canonical_quotes`, not in config. LP pools are not listed: pooled
+liquidity is circulating. Mainnet today:
+
+| token | non-circulating alkanes | non-circulating addresses |
+| --- | --- | --- |
+| DIESEL `2:0` | - | `bc1phqvgwn7...g8umr8` |
+| TORTILLA `2:68479` | `2:68478` (deployer) | `1A1zP1eP5Q...DivfNa` (burn) |
+| SLICE `4:8888` | `4:53`, `4:54`, `4:55`, `4:56` (lockers) | `bc1pz860hk...mzyjer` (treasury) |
+
+Other networks have no entries, so `-cmcap` equals `-mcusd` there.
+
+#### Why it needs no index
+
+The ratio is a step function: it only moves when a listed holder's balance
+moves, and essentials already records exactly when that happens.
+
+| Holder | Trigger heights from | Balance at a trigger from |
+| --- | --- | --- |
+| alkane | its `balance_by_height` list for the token | the `balance_by_height` row |
+| address | its `AlkaneTxs` ledger (every tx that touched its alkane balances) | one point read of `address_balance` against that block's root (the store is versioned per block) |
+
+The heights are unioned, each holder's balance is carried forward across them
+(one cursor per holder), supply is read at each trigger height, and the heights
+are mapped to block times in one batch. A request is a few small list reads
+plus one point read per trigger height - not a walk over the chart's history.
+An address with more than 50,000 alkane txs is refused rather than truncated,
+since that is not a treasury and a partial ledger would make the chart lie.
+
+Applying it: a candle takes the last step at or before the end of its bucket.
+Buckets before the first step get ratio 1 (nothing was locked yet). Volume is
+never scaled - it is trade volume. Each candle carries `circulating_ratio`; the
+response carries `cmcap: { configured, holders, steps }`. With no entry for the
+token the candles equal `-mcusd` and the ratio is 1.
+
+#### Known approximation
+
+Supply is only read at trigger heights, so a token that mints continuously
+(DIESEL) without any listed holder moving keeps the ratio from its last trigger
+while supply grows. The mcap candle itself does reflect the new supply, so the
+error is confined to the ratio. If that matters for a token, the fix is to add
+the supply-change heights as triggers too - still no index, just more point
+reads - or to divide out supply per bucket from the stored price candle.
+
+### Derived-chart forks
+
+`MAINNET_DERIVED_QUOTE_FORKS` (`consts.rs`) lists (token, derived quote, height)
+triples. From the height on, the token's `-derived_<quote>-usd` chart no longer
+registers the quote's pool as its derived pool, so the quote's price moves stop
+being written into new candles and the chart follows the token's direct USD
+pricing - the same values `-usd` would give. History before the height is left
+exactly as it was indexed; the fork changes what gets written from then on, so
+it needs no reindex.
+
+Mechanically it is one exclusion when the derived-pool map is built in
+`derive_token_data`. Everything downstream - bucket triggers, the per-bucket
+merge, higher-timeframe canonicalization, derived mcap, derived metrics - keys
+off that map, and all of it already has a "no derived pool for this pair"
+branch that mirrors the direct USD series. The first post-fork candle's open is
+still anchored to the last derived close (`apply_open`), so the series is
+continuous even though its level steps to the frBTC-only price.
+
+| token | quote | height |
+| --- | --- | --- |
+| TORTILLA `2:68479` | DIESEL `2:0` | 969393 |
+
+This sits beside the older `BUSD_CANONICAL_QUOTE_FORK_HEIGHT` (946500), which
+removed BUSD as a canonical quote the same way.

@@ -1,5 +1,7 @@
 use crate::modules::ammdata::config::{DerivedMergeStrategy, DerivedQuoteConfig};
-use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE};
+use crate::modules::ammdata::consts::{
+    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, derived_quote_detached_at_height,
+};
 use crate::modules::ammdata::price_feeds::{
     EspoPricerPriceFeed, PriceFeed, get_historical_btc_usd_price,
 };
@@ -785,11 +787,29 @@ pub fn derive_token_data(
                     }
                 };
 
+            // A pair past its detach height gets no derived pool: the quote's price
+            // moves stop triggering or feeding its candles, and the `info.is_none()`
+            // path below writes the token's direct USD candle instead.
+            let network = crate::config::get_network();
             for (pool, defs) in state.pools_map.iter() {
-                if derived_quote_set.contains(&defs.quote_alkane_id) {
+                if derived_quote_set.contains(&defs.quote_alkane_id)
+                    && !derived_quote_detached_at_height(
+                        network,
+                        &defs.base_alkane_id,
+                        &defs.quote_alkane_id,
+                        height,
+                    )
+                {
                     maybe_insert_pool(defs.base_alkane_id, defs.quote_alkane_id, *pool, true);
                 }
-                if derived_quote_set.contains(&defs.base_alkane_id) {
+                if derived_quote_set.contains(&defs.base_alkane_id)
+                    && !derived_quote_detached_at_height(
+                        network,
+                        &defs.quote_alkane_id,
+                        &defs.base_alkane_id,
+                        height,
+                    )
+                {
                     maybe_insert_pool(defs.quote_alkane_id, defs.base_alkane_id, *pool, false);
                 }
             }

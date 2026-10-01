@@ -37,7 +37,7 @@ pub struct AmmDataConfig {
 
 impl AmmDataConfig {
     pub fn spec() -> &'static str {
-        "{ \"espo_pricer_host\": \"http://127.0.0.1:6901\", \"use_historical_backfill\": <bool=true>, \"pre_ammdata_btc_usd_price\": <86500 or \"86500.12\">, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
+        "{ \"espo_pricer_host\": \"http://127.0.0.1:6901\", \"use_historical_backfill\": <bool=true>, \"pre_ammdata_btc_usd_price\": <86500 or \"86500.12\">, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ]] }"
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {

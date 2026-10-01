@@ -8,7 +8,7 @@ use crate::modules::ammdata::config::{AmmDataConfig, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
     AMOUNT_SCALE, CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID,
     MAINNET_FIRE_USD_CHART_START_TS, PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block,
-    canonical_quotes_at_height,
+    canonical_quotes_at_height, non_circulating_holders,
 };
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
@@ -16,6 +16,9 @@ use crate::modules::ammdata::utils::activity::{
     decode_activity_v1, read_activity_for_pool, read_activity_for_pool_sorted,
 };
 use crate::modules::ammdata::utils::candles::{CandleSlice, PriceSide, read_candles_v1};
+use crate::modules::ammdata::utils::cmcap::{
+    CirculatingStep, circulating_steps, scale_candle, step_for_bucket,
+};
 use crate::modules::ammdata::utils::live_reserves::fetch_all_pools;
 use crate::modules::ammdata::utils::pathfinder::{
     DEFAULT_FEE_BPS, plan_best_mev_swap, plan_exact_in_default_fee, plan_exact_out_default_fee,
@@ -3999,8 +4002,27 @@ impl AmmDataProvider {
         let mut is_mcusd = false;
         let mut is_sats = false;
         let mut is_mcsats = false;
+        let mut is_cmcap = false;
 
-        let pool = if let Some(stripped) = pool_raw.strip_suffix("-mcsats") {
+        let pool = if let Some(stripped) = pool_raw.strip_suffix("-cmcap") {
+            match parse_token_or_derived(stripped) {
+                Ok((p, q)) => {
+                    derived_quote = q;
+                    is_mcusd = true;
+                    is_cmcap = true;
+                    p
+                }
+                Err(_) => {
+                    return Ok(RpcGetCandlesResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_pool",
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
+                        }),
+                    });
+                }
+            }
+        } else if let Some(stripped) = pool_raw.strip_suffix("-mcsats") {
             match parse_token_or_derived(stripped) {
                 Ok((p, q)) => {
                     derived_quote = q;
@@ -4013,7 +4035,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -4031,7 +4053,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -4048,7 +4070,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -4065,7 +4087,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -4078,7 +4100,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -4099,6 +4121,27 @@ impl AmmDataProvider {
             }
         } else {
             read_candles_v1(self, pool, tf, /*unused*/ limit, now, side)
+        };
+
+        // cmcap: the ratio's step function for this token, built from indexes
+        // essentials already keeps. None unless the -cmcap suffix was asked for.
+        let cmcap: Option<(Vec<CirculatingStep>, bool, usize)> = if is_cmcap {
+            match non_circulating_holders(get_network(), &pool) {
+                Some(entry) => {
+                    let holders = entry.addresses.len() + entry.alkanes.len();
+                    match circulating_steps(self.essentials(), pool, entry) {
+                        Ok(steps) => Some((steps, true, holders)),
+                        Err(e) => {
+                            return Ok(RpcGetCandlesResult {
+                                value: json!({ "ok": false, "error": format!("cmcap_failed: {e}") }),
+                            });
+                        }
+                    }
+                }
+                None => Some((Vec::new(), false, 0)),
+            }
+        } else {
+            None
         };
 
         match slice {
@@ -4218,20 +4261,35 @@ impl AmmDataProvider {
                                 candle.low = candle.open;
                             }
                         }
-                        json!({
+                        let circulating_ratio = cmcap.as_ref().map(|(steps, _, _)| {
+                            match step_for_bucket(steps, ts, dur) {
+                                Some(step) => {
+                                    candle = scale_candle(candle, step);
+                                    step.ratio_f64()
+                                }
+                                None => 1.0,
+                            }
+                        });
+                        let mut row = json!({
                             "ts":     ts,
                             "open":   candle.open.to_string(),
                             "high":   candle.high.to_string(),
                             "low":    candle.low.to_string(),
                             "close":  candle.close.to_string(),
                             "volume": candle.volume.to_string(),
-                        })
+                        });
+                        if let Some(ratio) = circulating_ratio {
+                            row["circulating_ratio"] = json!(ratio);
+                        }
+                        row
                     })
                     .collect();
 
                 let pool_label = if is_usd || is_mcusd {
                     if let Some(q) = derived_quote {
-                        let suffix = if is_mcsats {
+                        let suffix = if is_cmcap {
+                            "cmcap"
+                        } else if is_mcsats {
                             "mcsats"
                         } else if is_sats {
                             "sats"
@@ -4241,6 +4299,8 @@ impl AmmDataProvider {
                             "usd"
                         };
                         format!("{}-derived_{}-{}", id_str(&pool), id_str(&q), suffix)
+                    } else if is_cmcap {
+                        format!("{}-cmcap", id_str(&pool))
                     } else if is_mcsats {
                         format!("{}-mcsats", id_str(&pool))
                     } else if is_sats {
@@ -4254,8 +4314,7 @@ impl AmmDataProvider {
                     id_str(&pool)
                 };
 
-                Ok(RpcGetCandlesResult {
-                    value: json!({
+                let mut value = json!({
                         "ok": true,
                         "pool": pool_label,
                         "timeframe": tf.code(),
@@ -4272,8 +4331,15 @@ impl AmmDataProvider {
                         "total": total,
                         "has_more": end < total,
                         "candles": arr
-                    }),
-                })
+                });
+                if let Some((steps, configured, holders)) = cmcap.as_ref() {
+                    value["cmcap"] = json!({
+                        "configured": configured,
+                        "holders": holders,
+                        "steps": steps.len(),
+                    });
+                }
+                Ok(RpcGetCandlesResult { value })
             }
             Err(e) => Ok(RpcGetCandlesResult {
                 value: json!({ "ok": false, "error": format!("read_failed: {e}") }),

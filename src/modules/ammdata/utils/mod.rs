@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod candles;
+pub mod cmcap;
 pub mod index_activity;
 pub mod index_factories;
 pub mod index_finalize;
