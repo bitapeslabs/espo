@@ -1,0 +1,141 @@
+{
+  "readonly_metashrew_db_dir": "/data/.metashrew/v905",
+  "electrum_rpc_url": null,
+  "metashrew_rpc_url": "http://127.0.0.1:7145",
+  "electrs_esplora_url": "http://127.0.0.1:4332",
+  "bitcoind_rpc_url": "http://127.0.0.1:8332",
+  "bitcoind_rpc_user": "<bitcoind-rpc-user>",
+  "bitcoind_rpc_pass": "<bitcoind-rpc-pass>",
+  "bitcoind_blocks_dir": "~/.bitcoin/blocks",
+  "reset_mempool_on_startup": false,
+  "db_path": "./prodb",
+  "db_cache": true,
+  "alkabi_verify_trials": 128,
+  "enable_aof": true,
+  "sdb_poll_ms": 5000,
+  "indexer_block_delay_ms": 0,
+  "port": 5780,
+  "explorer_host": "0.0.0.0:5081",
+  "google_analytics_tag": null,
+  "sync_banner": {
+    "enabled": true,
+    "message": "Espo has been restarted in 'view only' mode while we coordinate with the subfrost team to bring indexers back up. ",
+    "message_zh": "Espo 已以“仅查看”模式重新启动，我们正在与 Subfrost 团队协调，尽快恢复索引器的正常运行。",
+    "url": "https://t.me/espoupdates",
+    "link_text": "Follow updates",
+    "link_text_zh": "查看更新"
+  },
+  "misc": {
+    "show_terminal_ad": false
+  },
+  "mempool": {
+    "enabled": true,
+    "populate_with_views": false,
+    "raw_poll_secs": 60,
+    "template_poll_secs": 10,
+    "trace_workers": 1,
+    "hydration_workers": 24,
+    "clear_protection_secs": 180,
+    "max_txs": 100000,
+    "template_blocks": 8,
+    "block_weight_units": 4000000,
+    "zmq_rawtx_url": "tcp://127.0.0.1:28332",
+    "zmq_sequence_url": "tcp://127.0.0.1:28333",
+    "websocket_enabled": true,
+    "websocket_path": "/api/events/ws"
+  },
+  "explorer_pizza_tv_endpoint": "https://stv.pizza.fun",
+  "explorer_amm_prefix": "https://www.oyl.io/swap",
+  "network": "mainnet",
+  "debug": true,
+  "debug_ignore_ms": 1,
+  "debug_backup": {
+    "blocks": [
+      879995,
+      880100,
+      900000,
+      903500,
+      908368,
+      933000,
+      943499,
+      950000,
+      951030,
+      956320
+    ],
+    "dir": "./db-bkp"
+  },
+  "metashrew_db_label": null,
+  "strict_mode": {
+    "check_utxos": false,
+    "check_alkane_balances": true,
+    "check_trace_mismatches": false
+  },
+  "block_source_mode": "rpc",
+  "address_index_chunk_size": 512,
+  "trace_read_workers": 12,
+  "simulate_reorg": false,
+  "explorer_networks": {
+    "mainnet": "https://staging.espo.sh",
+    "regtest": "https://espo.subfrost.io/regtest"
+  },
+  "modules": {
+    "oylapi": {
+      "host": "0.0.0.0",
+      "port": 9712,
+      "alkane_icon_cdn": "https://asset.oyl.gg/alkanes/mainnet"
+    },
+    "subfrost": {},
+    "runes": {
+      "enable": true,
+      "load_live_outpoints": true
+    },
+    "ammdata": {
+      "espo_pricer_host": "http://127.0.0.1:6901",
+      "pre_ammdata_btc_usd_price": 86500,
+      "derived_liquidity": [
+        {
+          "alkane": "2:0",
+          "strategy": "neutral-vwap"
+        },
+        {
+          "alkane": "2:68479",
+          "strategy": "neutral-vwap",
+          "height": 969931
+        }
+      ],
+      "search_index_enabled": true,
+      "search_prefix_min": 2,
+      "search_prefix_max": 6,
+      "search_fallback_scan_cap": 5000,
+      "search_limit_cap": 20,
+      "derive_sources": [
+        {
+          "alkane": "4:8888",
+          "target": "2:68479",
+          "start_offset": 968034,
+          "drop_forks": [
+            {
+              "alkane": "32:0",
+              "height": 969931
+            }
+          ]
+        }
+      ]
+    },
+    "memgraph": {
+      "enable": true,
+      "uri": "bolt://127.0.0.1:7690",
+      "username": "<memgraph-user>",
+      "password": "<memgraph-password>",
+      "connect_timeout_secs": 5,
+      "request_timeout_secs": 30
+    },
+    "pizzafun": {
+      "factory_id": "4:797",
+      "initialization_key": "/initialized",
+      "snapshot_page_limit": 10000,
+      "snapshot_page_limit_max": 10000,
+      "snapshot_http_base_path": "/pizza-<random-path-token>"
+    }
+  }
+}

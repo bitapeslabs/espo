@@ -205,3 +205,113 @@ continuous even though its level steps to the frBTC-only price.
 
 This sits beside the older `BUSD_CANONICAL_QUOTE_FORK_HEIGHT` (946500), which
 removed BUSD as a canonical quote the same way.
+
+### Forkable derived liquidity, `-full`, and `derive_sources`
+
+```json
+"derived_liquidity": [
+  { "alkane": "2:0",     "strategy": "neutral-vwap" },
+  { "alkane": "2:68479", "strategy": "neutral-vwap", "height": 969925 }
+],
+"derive_sources": [
+  { "alkane": "2:77", "target": "2:68479" },
+  { "alkane": "2:68479", "target": "2:0",
+    "drop_forks": [ { "alkane": "2:0", "height": 970000 } ],
+    "start_offset": 960000 }
+]
+```
+
+The first `derived_liquidity` entry is the **default** derived quote.
+
+#### `height` on a derived quote
+
+Without a height an entry acts as derived liquidity from the ammdata genesis, as
+before. With one, the alkane is invisible to indexing until that block
+(`AmmDataConfig::derived_index_plan(height)` hands `derive_token_data` only the
+quotes in force), and from it on it is a derived quote like any other.
+
+It is also a **fork**. A token's chart against the new quote does not start
+empty: the first time the pair is about to get a candle, the token's usd and
+mcusd history against the default quote is copied into the pair's namespace, on
+every timeframe (`AmmDataProvider::fork_token_derived_history`). For the default
+quote's own token, which has no chart against itself, its direct usd/mcusd
+charts are what gets carried over.
+
+This is the one place the module copies history, and it does so because it was
+asked for explicitly. It is held to the rules for that in CLAUDE.md:
+
+* **once per pair**, behind `token_derived_fork/v1/<token>/<quote>`, written in
+  the same batch as the copy;
+* **new keys only** - a destination that already holds candles is left exactly
+  as it is and just marked, and nothing is ever deleted or moved (the default
+  quote's series stays and keeps being indexed);
+* **lazy** - per token, on its first trade after the height, not a walk over
+  every token at the fork block;
+* **in-block** - the write lands in the block being indexed, so the rest of that
+  block (previous close, anchors, higher-timeframe aggregation, metrics) reads it
+  back, and a reorg removes the copy and the marker together.
+
+Cost to expect: one read of the token's default-quote series per timeframe and
+the same number of puts, on that token's first post-fork trade. A token with a
+DIESEL pool has a candle in most 10m buckets, so that can be tens of thousands
+of keys in the block where it first trades; a block where several such tokens
+trade for the first time will be noticeably slower than usual, once.
+
+#### `-full`
+
+`<alkane>-full` (usd) and `<alkane>-full-<kind>` for `usd`, `sats`, `mcusd`,
+`mcsats`, `cmcap`. It is rewritten before parsing, so it is served by exactly the
+code that serves the chart it proxies to:
+
+| situation | `<alkane>-full` serves |
+| --- | --- |
+| alkane has a `derive_sources` target that is in force, and the pair has forked (or the target has no height) | `<alkane>-derived_<target>-usd` |
+| no entry, target not in force yet, or the pair has not forked yet | `<alkane>-derived_<default>-usd` |
+| the alkane *is* the quote it would proxy to, or no derived quote is in force | `<alkane>-usd` |
+
+"Has not forked yet" matters for illiquid tokens: a pair only gets candles under
+a forked quote on the token's first trade after the height, so until then
+`-full` stays on the default quote rather than going blank at the fork height.
+The response keeps `pool` as requested and adds `resolved_pool`.
+`get_alkanes_quote` orders its derived quotes the same way, so a quote agrees
+with the `-full` chart.
+
+A `target` that is not in `derived_liquidity` at all is a config error; one that
+is listed but not in force yet is just "not yet". `target` may be omitted on an
+entry that exists only for `drop_forks` or `start_offset`. `derived_sources` is
+accepted as a spelling of `derive_sources`.
+
+#### `drop_forks`
+
+`{ alkane, height }` on a source entry: from that height, trading on the
+source's pool against that alkane is ignored by the source's derived charts,
+indefinitely. The chart id does not change. What it does depends on the alkane:
+
+| dropped alkane is | effect |
+| --- | --- |
+| a derived quote (e.g. `2:0`) | the pool is not registered as the pair's derived pool; the chart follows the canonical leg alone. The config form of `MAINNET_DERIVED_QUOTE_FORKS` - see "Derived-chart forks" above. Both apply |
+| a canonical quote (e.g. `32:0`) | the canonical leg (the source's direct USD candle) is left out of its derived charts, which follow the derived pool alone |
+
+The canonical leg is one merged series across all of a token's canonical pools,
+so it is only dropped when **every** canonical quote in force is dropped for the
+token (`DerivedIndexPlan::canonical_leg_dropped`). In `derive_token_data` that
+means the token's own USD candle neither triggers a derived bucket nor feeds the
+merge, and the higher-timeframe copy from the direct series is skipped for it.
+The token's direct `-usd` / `-mcusd` charts and its token metrics are untouched:
+they are the canonical leg.
+
+#### `start_offset`
+
+A height before which none of the alkane's charts return candles - usd, mcusd,
+derived, `-full`, `-cmcap`, sats, and its TVL line - as if the earlier trading
+had not happened. Read-side only: nothing is deleted, and removing the setting
+brings the history back.
+
+It is applied at 10-minute precision (`apply_start_offset_ts`). Buckets that end
+before the offset are dropped. On a higher timeframe the one bucket straddling
+it is **rebuilt** from the series' own 10m candles from the offset on, because
+simply keeping it would leave a launch wick inside that day's or week's open and
+high, and simply dropping it would hide up to a month of real data on the 1M
+chart. A `start_offset` the index has not reached yet hides the whole chart:
+every candle so far happened before it. Charts requested by raw pool id are not
+affected - the offset is per alkane.

@@ -11,7 +11,7 @@ use crate::alkanes::trace::EspoBlock;
 use crate::alkanes::trace::EspoSandshrewLikeTraceInvokeData;
 use crate::config::{debug_enabled, get_network};
 use crate::debug;
-use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy, DerivedQuoteConfig};
+use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy};
 use crate::modules::ammdata::consts::{
     AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block,
     canonical_quotes_at_height,
@@ -736,11 +736,8 @@ impl EspoModule for AmmData {
             search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
         let mut search_prefix_max =
             search_cfg.as_ref().map(|c| c.search_prefix_max_len as usize).unwrap_or(6);
-        let derived_quotes: Vec<DerivedQuoteConfig> = search_cfg
-            .as_ref()
-            .and_then(|c| c.derived_liquidity.as_ref())
-            .map(|c| c.derived_quotes.clone())
-            .unwrap_or_default();
+        let derived_plan =
+            search_cfg.as_ref().map(|c| c.derived_index_plan(height)).unwrap_or_default();
         if search_prefix_min == 0 {
             search_prefix_min = 2;
         }
@@ -831,7 +828,7 @@ impl EspoModule for AmmData {
             provider,
             essentials,
             &canonical_quote_units,
-            &derived_quotes,
+            &derived_plan,
             use_historical_backfill,
             search_index_enabled,
             search_prefix_min,

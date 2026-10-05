@@ -15,7 +15,9 @@ use crate::modules::ammdata::utils::activity::{
     ActivityFilter, ActivityPage, ActivityRow, ActivitySideFilter, ActivitySortKey, SortDir,
     decode_activity_v1, read_activity_for_pool, read_activity_for_pool_sorted,
 };
-use crate::modules::ammdata::utils::candles::{CandleSlice, PriceSide, read_candles_v1};
+use crate::modules::ammdata::utils::candles::{
+    CandleSlice, PriceSide, bucket_start_for, read_candles_v1,
+};
 use crate::modules::ammdata::utils::cmcap::{
     CirculatingStep, circulating_steps, scale_candle, step_for_bucket,
 };
@@ -99,6 +101,8 @@ pub struct AmmDataTable<'a> {
     pub TOKEN_VOLUME_CANDLES: ListPointer<'a>,
     pub TOKEN_VOLUME_TOTAL: KvPointer<'a>,
     pub TOKEN_DERIVED_MCAP_USD_CANDLES: ListPointer<'a>,
+    // One marker per (token, forked quote): its history fork has been done.
+    pub TOKEN_DERIVED_FORK: KvPointer<'a>,
     pub CHART_CHANGE_EVENTS: KvPointer<'a>,
     pub CHART_CHANGE_LATEST: KvPointer<'a>,
     // Activity logs + secondary indexes for sort/paging.
@@ -167,6 +171,7 @@ impl<'a> AmmDataTable<'a> {
             TOKEN_VOLUME_CANDLES: root.list_keyword("tv1:"),
             TOKEN_VOLUME_TOTAL: root.keyword("/token_volume_total/v1/"),
             TOKEN_DERIVED_MCAP_USD_CANDLES: root.list_keyword("tdmc1:"),
+            TOKEN_DERIVED_FORK: root.keyword("/token_derived_fork/v1/"),
             CHART_CHANGE_EVENTS: root.keyword("/chart_change_events/v1/"),
             CHART_CHANGE_LATEST: root.keyword("/chart_change_latest/v1/"),
             ACTIVITY: root.list_keyword("activity:v1:"),
@@ -546,6 +551,20 @@ impl<'a> AmmDataTable<'a> {
     ) -> Vec<u8> {
         let mut k = self.token_mcusd_candle_ns_prefix(token, tf);
         k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    pub fn token_derived_fork_key(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.TOKEN_DERIVED_FORK.key().to_vec();
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k.push(b'/');
+        k.extend_from_slice(&quote.block.to_be_bytes());
+        k.extend_from_slice(&quote.tx.to_be_bytes());
         k
     }
 
@@ -2119,6 +2138,97 @@ impl AmmDataProvider {
         Ok(None)
     }
 
+    pub fn token_derived_fork_done(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+    ) -> Result<bool> {
+        let key = self.table().token_derived_fork_key(token, quote);
+        Ok(self
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+            .value
+            .is_some())
+    }
+
+    /// Give `token`'s derived chart against `dest` the history it had against
+    /// `source`, so a quote that comes into force at a height continues the series
+    /// instead of starting empty. Copies the usd and mcusd candles on every
+    /// timeframe, then writes the pair's marker in the same batch.
+    ///
+    /// For the source token itself there is no `(source, source)` series, so its
+    /// direct usd/mcusd charts are what gets carried over.
+    ///
+    /// Only ever writes new keys: if the destination already holds candles it is
+    /// left exactly as it is and only the marker is written. Returns the number of
+    /// candles copied. Meant to be called from inside `index_block`; the write
+    /// lands in the in-progress block, so the rest of that block reads it back
+    /// and a reorg takes the copy and the marker out together.
+    pub fn fork_token_derived_history(
+        &self,
+        token: &SchemaAlkaneId,
+        source: &SchemaAlkaneId,
+        dest: &SchemaAlkaneId,
+        height: u32,
+    ) -> Result<usize> {
+        let table = self.table();
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        let dest_has_candles = !self
+            .get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
+                blockhash: StateAt::Latest,
+                prefix: table.token_derived_usd_candle_ns_prefix(token, dest, Timeframe::M10),
+                cursor: None,
+                limit: 1,
+            })?
+            .entries
+            .is_empty();
+
+        if !dest_has_candles && source != dest {
+            let self_source = token == source;
+            for tf in crate::modules::ammdata::schemas::active_timeframes() {
+                let usd_prefix = if self_source {
+                    table.token_usd_candle_ns_prefix(token, tf)
+                } else {
+                    table.token_derived_usd_candle_ns_prefix(token, source, tf)
+                };
+                let mc_prefix = if self_source {
+                    table.token_mcusd_candle_ns_prefix(token, tf)
+                } else {
+                    table.token_derived_mcusd_candle_ns_prefix(token, source, tf)
+                };
+                for (prefix, is_mc) in [(usd_prefix, false), (mc_prefix, true)] {
+                    let entries = self
+                        .get_list_entries_desc(GetListEntriesDescParams {
+                            blockhash: StateAt::Latest,
+                            prefix,
+                        })?
+                        .entries;
+                    for (k, v) in entries {
+                        let Some(ts) = trailing_bucket_ts(&k) else { continue };
+                        let dest_key = if is_mc {
+                            table.token_derived_mcusd_candle_key(token, dest, tf, ts)
+                        } else {
+                            table.token_derived_usd_candle_key(token, dest, tf, ts)
+                        };
+                        puts.push((dest_key, v));
+                    }
+                }
+            }
+        }
+
+        let copied = puts.len();
+        puts.push((
+            table.token_derived_fork_key(token, dest),
+            encode_u128_value(u128::from(height))?,
+        ));
+        self.with_view_blockhash(None).set_batch(SetBatchParams {
+            blockhash: StateAt::Latest,
+            puts,
+            deletes: Vec::new(),
+        })?;
+        Ok(copied)
+    }
+
     /// The contribution a pool last made to the running totals, so the next block
     /// can apply a delta instead of re-summing every pool.
     pub fn get_pool_tvl_anchor(&self, pool: &SchemaAlkaneId) -> Result<Option<SchemaTvlPointV1>> {
@@ -3682,15 +3792,23 @@ impl AmmDataProvider {
         now: u64,
     ) -> Result<HashMap<PriceAsset, AssetPriceSnapshot>> {
         let config = AmmDataConfig::load_from_global_config()?;
-        let derived_quotes = config
-            .derived_liquidity
-            .as_ref()
-            .map(|config| config.derived_quotes.as_slice())
-            .unwrap_or_default();
+        // Only quotes in force at the tip, and for each alkane the quote its
+        // `-full` chart proxies to goes first, so a quote agrees with that chart.
+        let tip = get_espo_indexed_height().unwrap_or(0);
+        let active = config.active_derived_quotes(tip);
         let mut snapshots = HashMap::with_capacity(assets.len());
         for asset in assets {
-            snapshots
-                .insert(*asset, self.hourly_asset_price_snapshot(*asset, now, derived_quotes)?);
+            let ordered: Vec<DerivedQuoteConfig> = match asset {
+                PriceAsset::Alkane(token) => {
+                    let target = config.full_target(token, tip);
+                    let mut ordered: Vec<DerivedQuoteConfig> =
+                        active.iter().filter(|q| Some(q.alkane) == target).cloned().collect();
+                    ordered.extend(active.iter().filter(|q| Some(q.alkane) != target).cloned());
+                    ordered
+                }
+                _ => active.clone(),
+            };
+            snapshots.insert(*asset, self.hourly_asset_price_snapshot(*asset, now, &ordered)?);
         }
         Ok(snapshots)
     }
@@ -3981,6 +4099,12 @@ impl AmmDataProvider {
                 });
             }
         };
+
+        // `-full`: the consumer does not track which derived quote an alkane is on.
+        // Rewrite it to the chart it proxies to and parse that like any other id.
+        let requested_pool = pool_raw.to_string();
+        let full_resolved: Option<String> = resolve_full_chart_id(self, pool_raw);
+        let pool_raw: &str = full_resolved.as_deref().unwrap_or(pool_raw);
 
         let parse_token_or_derived =
             |raw: &str| -> Result<(SchemaAlkaneId, Option<SchemaAlkaneId>)> {
@@ -4339,6 +4463,10 @@ impl AmmDataProvider {
                         "steps": steps.len(),
                     });
                 }
+                if full_resolved.is_some() {
+                    value["resolved_pool"] = value["pool"].clone();
+                    value["pool"] = json!(requested_pool);
+                }
                 Ok(RpcGetCandlesResult { value })
             }
             Err(e) => Ok(RpcGetCandlesResult {
@@ -4412,7 +4540,7 @@ impl AmmDataProvider {
             _ => (table.amm_tvl_line_ns_prefix(tf), "amm".to_string()),
         };
 
-        let slice = match read_tvl_line_v1(self, ns_prefix, tf, now) {
+        let mut slice = match read_tvl_line_v1(self, ns_prefix, tf, now) {
             Ok(slice) => slice,
             Err(error) => {
                 return Ok(RpcGetTvlCandlesResult {
@@ -4423,6 +4551,28 @@ impl AmmDataProvider {
                 });
             }
         };
+        // A token's start_offset hides its TVL line before that height as well.
+        let scope_token = params
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .and_then(parse_id_from_str);
+        if let Some(offset_ts) = scope_token.and_then(|t| token_start_offset_ts(self, &t)) {
+            let dur = tf.duration_secs();
+            let newest_ts = slice.newest_ts;
+            let keep = slice
+                .points_newest_first
+                .iter()
+                .enumerate()
+                .take_while(|(i, _)| {
+                    newest_ts.saturating_sub((*i as u64).saturating_mul(dur)).saturating_add(dur)
+                        > offset_ts
+                })
+                .count();
+            slice.points_newest_first.truncate(keep);
+        }
+
         let btc_line = read_btc_usd_line_v1(self, tf, now)
             .map(|btc| btc_usd_by_bucket(&btc, tf))
             .unwrap_or_default();
@@ -6653,7 +6803,13 @@ fn read_token_usd_candles_v1(
         }
     }
 
-    apply_token_chart_start_cutoff(token, &mut per_bucket);
+    apply_token_chart_start_cutoff(
+        provider,
+        token,
+        tf,
+        table.token_usd_candle_ns_prefix(&token, Timeframe::M10),
+        &mut per_bucket,
+    );
 
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
@@ -6754,7 +6910,13 @@ fn read_token_derived_usd_candles_v1(
         }
     }
 
-    apply_token_chart_start_cutoff(token, &mut per_bucket);
+    apply_token_chart_start_cutoff(
+        provider,
+        token,
+        tf,
+        table.token_derived_usd_candle_ns_prefix(&token, &quote, Timeframe::M10),
+        &mut per_bucket,
+    );
 
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
@@ -6855,7 +7017,13 @@ fn read_token_derived_mcusd_candles_v1(
         }
     }
 
-    apply_token_chart_start_cutoff(token, &mut per_bucket);
+    apply_token_chart_start_cutoff(
+        provider,
+        token,
+        tf,
+        table.token_derived_mcusd_candle_ns_prefix(&token, &quote, Timeframe::M10),
+        &mut per_bucket,
+    );
 
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
@@ -6955,7 +7123,13 @@ fn read_token_mcusd_candles_v1(
         }
     }
 
-    apply_token_chart_start_cutoff(token, &mut per_bucket);
+    apply_token_chart_start_cutoff(
+        provider,
+        token,
+        tf,
+        table.token_mcusd_candle_ns_prefix(&token, Timeframe::M10),
+        &mut per_bucket,
+    );
 
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
@@ -7025,12 +7199,166 @@ fn read_token_mcusd_candles_v1(
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }
 
+/// Block time of an alkane's configured `start_offset`, or `None` if it has none.
+/// A height the index has not reached yet hides everything: every candle so far
+/// happened before it.
+fn token_start_offset_ts(provider: &AmmDataProvider, token: &SchemaAlkaneId) -> Option<u64> {
+    let height = AmmDataConfig::load_from_global_config().ok()?.start_offset(token)?;
+    if height > get_espo_indexed_height().unwrap_or(0) {
+        return Some(u64::MAX);
+    }
+    provider
+        .essentials()
+        .get_block_summaries_by_heights(&[height])
+        .ok()?
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(|summary| summary.block_time())
+}
+
+/// Aggregate a series' 10m candles in `[from_ts, to_ts)` into one candle.
+fn aggregate_m10_range(
+    provider: &AmmDataProvider,
+    m10_ns_prefix: &[u8],
+    from_ts: u64,
+    to_ts: u64,
+) -> Option<SchemaCandleV1> {
+    // Keys end in the decimal bucket timestamp; see `newest candle at or before`
+    // for why lexicographic bounds are safe on them.
+    let mut start = m10_ns_prefix.to_vec();
+    start.extend_from_slice(from_ts.to_string().as_bytes());
+    let mut end = m10_ns_prefix.to_vec();
+    end.extend_from_slice(to_ts.to_string().as_bytes());
+    let entries = provider
+        .get_list_entries_desc_range(GetListEntriesDescRangeParams {
+            blockhash: StateAt::Latest,
+            start_inclusive: start,
+            end_exclusive: Some(end),
+            limit: 10_000,
+        })
+        .ok()?
+        .entries;
+    // Newest first: the first candle closes the bucket, the last one opens it.
+    let mut out: Option<SchemaCandleV1> = None;
+    for (_k, v) in entries {
+        let Ok(c) = decode_candle_v1(&v) else { continue };
+        out = Some(match out {
+            None => c,
+            Some(acc) => SchemaCandleV1 {
+                open: c.open,
+                high: acc.high.max(c.high),
+                low: acc.low.min(c.low),
+                close: acc.close,
+                volume: acc.volume.saturating_add(c.volume),
+            },
+        });
+    }
+    out
+}
+
+/// Drop the part of a token chart that falls before its start: the fixed mainnet
+/// FIRE cutoff, and any `derive_sources[].start_offset` from config.
+///
+/// The offset is applied at 10-minute precision. Buckets that end before it go.
+/// On a higher timeframe the one bucket that straddles it is rebuilt from the
+/// series' own 10m candles from the offset on, so trading before the offset does
+/// not survive inside that candle's open, high or low.
 fn apply_token_chart_start_cutoff(
+    provider: &AmmDataProvider,
     token: SchemaAlkaneId,
+    tf: Timeframe,
+    m10_ns_prefix: Vec<u8>,
     per_bucket: &mut BTreeMap<u64, SchemaCandleV1>,
 ) {
     if get_network() == bitcoin::Network::Bitcoin && token == MAINNET_FIRE_ALKANE_ID {
         per_bucket.retain(|ts, _| *ts >= MAINNET_FIRE_USD_CHART_START_TS);
+    }
+
+    let Some(offset_ts) = token_start_offset_ts(provider, &token) else { return };
+    apply_start_offset_ts(provider, tf, &m10_ns_prefix, offset_ts, per_bucket);
+}
+
+/// The offset rule itself, separated from where the offset comes from.
+fn apply_start_offset_ts(
+    provider: &AmmDataProvider,
+    tf: Timeframe,
+    m10_ns_prefix: &[u8],
+    offset_ts: u64,
+    per_bucket: &mut BTreeMap<u64, SchemaCandleV1>,
+) {
+    let cutoff = bucket_start_for(offset_ts, Timeframe::M10);
+    if tf == Timeframe::M10 {
+        per_bucket.retain(|ts, _| *ts >= cutoff);
+        return;
+    }
+    let dur = tf.duration_secs();
+    per_bucket.retain(|ts, _| ts.saturating_add(dur) > cutoff);
+    let straddling = (cutoff / dur) * dur;
+    if straddling < cutoff && per_bucket.contains_key(&straddling) {
+        match aggregate_m10_range(provider, m10_ns_prefix, cutoff, straddling.saturating_add(dur)) {
+            Some(rebuilt) => {
+                per_bucket.insert(straddling, rebuilt);
+            }
+            None => {
+                per_bucket.remove(&straddling);
+            }
+        }
+    }
+}
+
+/// Candle keys end in the bucket timestamp, written as decimal ASCII.
+fn trailing_bucket_ts(key: &[u8]) -> Option<u64> {
+    let ts_bytes = key.rsplit(|&b| b == b':').next()?;
+    std::str::from_utf8(ts_bytes).ok()?.parse::<u64>().ok()
+}
+
+/// Rewrite a `-full` chart id to the chart it proxies to: the alkane's derived
+/// chart against its `derive_sources` target (or the default derived quote), or
+/// its direct chart when the alkane is that quote or no derived quote is in
+/// force. `<alkane>-full` is the usd chart; `<alkane>-full-<kind>` picks another.
+/// Returns `None` when `raw` is not a `-full` id.
+fn resolve_full_chart_id(provider: &AmmDataProvider, raw: &str) -> Option<String> {
+    let (token_part, kind) = if let Some(t) = raw.strip_suffix("-full") {
+        (t, "usd")
+    } else {
+        raw.split_once("-full-")?
+    };
+    if !matches!(kind, "usd" | "sats" | "mcusd" | "mcsats" | "cmcap") {
+        return None;
+    }
+    let token = parse_id_from_str(token_part)?;
+    let tip = get_espo_indexed_height().unwrap_or(0);
+    let config = AmmDataConfig::load_from_global_config().ok();
+    let mut target = config.as_ref().and_then(|c| c.full_target(&token, tip));
+
+    // A quote that came into force at a height only has candles for a token once
+    // that token's history has been forked across, which happens on its first
+    // trade after the height. Until then the pair is still on the default quote,
+    // so an illiquid token's chart does not go blank at the fork height.
+    if let (Some(config), Some(t)) = (config.as_ref(), target) {
+        let plan = config.derived_index_plan(tip);
+        if plan.is_forked_quote(&t)
+            && t != token
+            && !provider.token_derived_fork_done(&token, &t).unwrap_or(false)
+        {
+            target = plan.fork_source.filter(|d| {
+                config.derived_quotes().iter().any(|q| q.alkane == *d && q.active_at(tip))
+            });
+        }
+    }
+    Some(full_chart_id(token_part, &token, target, kind))
+}
+
+fn full_chart_id(
+    token_part: &str,
+    token: &SchemaAlkaneId,
+    target: Option<SchemaAlkaneId>,
+    kind: &str,
+) -> String {
+    match target {
+        Some(q) if q != *token => format!("{token_part}-derived_{}:{}-{kind}", q.block, q.tx),
+        _ => format!("{token_part}-{kind}"),
     }
 }
 
@@ -7443,6 +7771,239 @@ mod tests {
             amm_mdb.clone_with_prefix(b"essentials:"),
         )));
         (dir, AmmDataProvider::new(amm_mdb, essentials))
+    }
+
+    fn candle(v: u128, volume: u128) -> SchemaCandleV1 {
+        SchemaCandleV1 { open: v, high: v, low: v, close: v, volume }
+    }
+
+    fn put_candles(provider: &AmmDataProvider, rows: Vec<(Vec<u8>, SchemaCandleV1)>) {
+        let puts = rows.into_iter().map(|(k, c)| (k, borsh::to_vec(&c).unwrap())).collect();
+        provider
+            .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+            .expect("write candles");
+    }
+
+    fn series(provider: &AmmDataProvider, prefix: Vec<u8>) -> BTreeMap<u64, SchemaCandleV1> {
+        provider
+            .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter_map(|(k, v)| Some((trailing_bucket_ts(&k)?, decode_candle_v1(&v).ok()?)))
+            .collect()
+    }
+
+    #[test]
+    fn forking_copies_a_tokens_history_to_the_new_quote_once() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let token = SchemaAlkaneId { block: 2, tx: 77 };
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let (t1, t2) = (1_700_000_400u64, 1_700_001_000u64);
+        let day = 1_699_920_000u64;
+
+        put_candles(
+            &provider,
+            vec![
+                (
+                    table.token_derived_usd_candle_key(&token, &diesel, Timeframe::M10, t1),
+                    candle(10, 1),
+                ),
+                (
+                    table.token_derived_usd_candle_key(&token, &diesel, Timeframe::M10, t2),
+                    candle(12, 2),
+                ),
+                (
+                    table.token_derived_usd_candle_key(&token, &diesel, Timeframe::D1, day),
+                    candle(11, 3),
+                ),
+                (
+                    table.token_derived_mcusd_candle_key(&token, &diesel, Timeframe::M10, t1),
+                    candle(1_000, 1),
+                ),
+            ],
+        );
+
+        assert!(!provider.token_derived_fork_done(&token, &tort).unwrap());
+        let copied = provider.fork_token_derived_history(&token, &diesel, &tort, 969_925).unwrap();
+        assert_eq!(copied, 4);
+        assert!(provider.token_derived_fork_done(&token, &tort).unwrap());
+
+        // Every timeframe and both series arrive under the new quote, values intact...
+        let usd_m10 = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&token, &tort, Timeframe::M10),
+        );
+        assert_eq!(usd_m10.get(&t1), Some(&candle(10, 1)));
+        assert_eq!(usd_m10.get(&t2), Some(&candle(12, 2)));
+        let usd_d1 = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&token, &tort, Timeframe::D1),
+        );
+        assert_eq!(usd_d1.get(&day), Some(&candle(11, 3)));
+        let mc_m10 = series(
+            &provider,
+            table.token_derived_mcusd_candle_ns_prefix(&token, &tort, Timeframe::M10),
+        );
+        assert_eq!(mc_m10.get(&t1), Some(&candle(1_000, 1)));
+
+        // ...and the source is still there: this is a copy, nothing was moved or deleted.
+        let src = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&token, &diesel, Timeframe::M10),
+        );
+        assert_eq!(src.len(), 2);
+    }
+
+    #[test]
+    fn forking_never_overwrites_a_quote_that_already_has_candles() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let token = SchemaAlkaneId { block: 2, tx: 77 };
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let ts = 1_700_000_400u64;
+
+        put_candles(
+            &provider,
+            vec![
+                (
+                    table.token_derived_usd_candle_key(&token, &diesel, Timeframe::M10, ts),
+                    candle(10, 1),
+                ),
+                // The destination already carries its own value for the same bucket.
+                (
+                    table.token_derived_usd_candle_key(&token, &tort, Timeframe::M10, ts),
+                    candle(99, 9),
+                ),
+            ],
+        );
+
+        let copied = provider.fork_token_derived_history(&token, &diesel, &tort, 5).unwrap();
+        assert_eq!(copied, 0);
+        // Marked done so it is not retried every block, and the existing candle stands.
+        assert!(provider.token_derived_fork_done(&token, &tort).unwrap());
+        let dest = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&token, &tort, Timeframe::M10),
+        );
+        assert_eq!(dest.get(&ts), Some(&candle(99, 9)));
+    }
+
+    #[test]
+    fn forking_the_default_quote_itself_carries_its_direct_chart() {
+        // DIESEL has no DIESEL-derived_DIESEL series; against a new quote its history
+        // is its own direct usd/mcusd chart.
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let ts = 1_700_000_400u64;
+        put_candles(
+            &provider,
+            vec![
+                (table.token_usd_candle_key(&diesel, Timeframe::M10, ts), candle(7, 1)),
+                (table.token_mcusd_candle_key(&diesel, Timeframe::M10, ts), candle(700, 1)),
+            ],
+        );
+
+        let copied = provider.fork_token_derived_history(&diesel, &diesel, &tort, 5).unwrap();
+        assert_eq!(copied, 2);
+        let usd = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&diesel, &tort, Timeframe::M10),
+        );
+        assert_eq!(usd.get(&ts), Some(&candle(7, 1)));
+        let mc = series(
+            &provider,
+            table.token_derived_mcusd_candle_ns_prefix(&diesel, &tort, Timeframe::M10),
+        );
+        assert_eq!(mc.get(&ts), Some(&candle(700, 1)));
+    }
+
+    #[test]
+    fn start_offset_drops_earlier_buckets_and_rebuilds_the_straddling_one() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let token = SchemaAlkaneId { block: 2, tx: 77 };
+        let hour = 3_600u64;
+        let h0 = (1_700_000_000u64 / hour) * hour; // an hour bucket
+        let m10 = table.token_usd_candle_ns_prefix(&token, Timeframe::M10);
+
+        // 10m candles through the hour: a wild wick early, sane prices after.
+        put_candles(
+            &provider,
+            vec![
+                (table.token_usd_candle_key(&token, Timeframe::M10, h0), candle(9_999, 1)),
+                (table.token_usd_candle_key(&token, Timeframe::M10, h0 + 1_200), candle(10, 2)),
+                (table.token_usd_candle_key(&token, Timeframe::M10, h0 + 2_400), candle(14, 3)),
+            ],
+        );
+        // The stored hourly candles: the one before, and this hour with the wick baked in.
+        let mut hourly: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+        hourly.insert(h0 - hour, candle(5, 1));
+        hourly
+            .insert(h0, SchemaCandleV1 { open: 9_999, high: 9_999, low: 10, close: 14, volume: 6 });
+        hourly.insert(h0 + hour, candle(15, 4));
+
+        // Offset lands 20 minutes into the hour.
+        apply_start_offset_ts(&provider, Timeframe::H1, &m10, h0 + 1_200 + 30, &mut hourly);
+
+        // The hour before is gone, the hour after is untouched...
+        assert!(!hourly.contains_key(&(h0 - hour)));
+        assert_eq!(hourly.get(&(h0 + hour)), Some(&candle(15, 4)));
+        // ...and the straddling hour is rebuilt from the 10m candles at or after the
+        // offset: the wick is not in its open or high any more.
+        assert_eq!(
+            hourly.get(&h0),
+            Some(&SchemaCandleV1 { open: 10, high: 14, low: 10, close: 14, volume: 5 })
+        );
+
+        // On the 10m chart it is a plain filter at 10-minute precision.
+        let mut tens: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+        tens.insert(h0, candle(9_999, 1));
+        tens.insert(h0 + 1_200, candle(10, 2));
+        apply_start_offset_ts(&provider, Timeframe::M10, &m10, h0 + 1_200 + 30, &mut tens);
+        assert_eq!(tens.keys().copied().collect::<Vec<_>>(), vec![h0 + 1_200]);
+    }
+
+    #[test]
+    fn start_offset_in_the_future_hides_everything() {
+        let (_dir, provider) = tvl_test_provider();
+        let m10 = provider
+            .table()
+            .token_usd_candle_ns_prefix(&SchemaAlkaneId { block: 2, tx: 77 }, Timeframe::M10);
+        let mut daily: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+        daily.insert(1_699_920_000, candle(1, 1));
+        apply_start_offset_ts(&provider, Timeframe::D1, &m10, u64::MAX, &mut daily);
+        assert!(daily.is_empty());
+    }
+
+    #[test]
+    fn full_chart_ids_resolve_to_the_derived_or_direct_chart() {
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        // A token on a derived quote proxies to that derived chart, for any kind.
+        assert_eq!(full_chart_id("2:68479", &tort, Some(diesel), "usd"), "2:68479-derived_2:0-usd");
+        assert_eq!(
+            full_chart_id("2:68479", &tort, Some(diesel), "cmcap"),
+            "2:68479-derived_2:0-cmcap"
+        );
+        // The quote itself has no chart against itself: its direct chart.
+        assert_eq!(full_chart_id("2:0", &diesel, Some(diesel), "usd"), "2:0-usd");
+        // No derived quote in force: direct.
+        assert_eq!(full_chart_id("2:68479", &tort, None, "mcusd"), "2:68479-mcusd");
+    }
+
+    #[test]
+    fn only_full_ids_are_rewritten() {
+        let (_dir, provider) = tvl_test_provider();
+        assert_eq!(resolve_full_chart_id(&provider, "2:0-usd"), None);
+        assert_eq!(resolve_full_chart_id(&provider, "2:68441"), None);
+        assert_eq!(resolve_full_chart_id(&provider, "2:0-full-nonsense"), None);
+        assert_eq!(resolve_full_chart_id(&provider, "garbage-full"), None);
     }
 
     #[test]

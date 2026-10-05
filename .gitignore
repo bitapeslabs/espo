@@ -18,6 +18,8 @@ Cargo.lock
 
 # Configuration files (keep sample.config.json but ignore config.json)
 config.json
+# ...except the committed examples, which carry placeholders instead of credentials
+!example_configs/config.json
 
 # Logs
 *.log
