@@ -806,6 +806,20 @@ impl EspoModule for AmmData {
         )?;
         debug::log_elapsed(module, "discover_new_pools", timer);
 
+        // Which pools may price tokens in this block. Computed after discovery so
+        // a pool created in this block is judged by its factory straight away.
+        if let Some(factories) =
+            crate::modules::ammdata::consts::pricing_factories_at_height(network, height)
+        {
+            let pool_ids: Vec<SchemaAlkaneId> = state.pools_map.keys().copied().collect();
+            state.pricing_excluded_pools = provider.pools_not_in_factories(
+                &pool_ids,
+                factories,
+                &state.pool_factory_writes,
+                &state.factory_pools_writes,
+            )?;
+        }
+
         let timer = debug::start_if(debug);
         crate::modules::ammdata::utils::index_activity::process_balance_deltas(
             block_ts,

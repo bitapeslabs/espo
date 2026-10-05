@@ -22,6 +22,9 @@ pub struct IndexState {
     pub canonical_trade_buckets: HashMap<SchemaAlkaneId, HashSet<(Timeframe, u64)>>,
     pub in_block_trade_volumes: HashMap<SchemaAlkaneId, (u128, u128)>,
     pub pools_touched: HashSet<SchemaAlkaneId>,
+    /// Pools that may not set a token's price in this block: not created by a
+    /// factory on the pricing allowlist. Empty when the allowlist is not in force.
+    pub pricing_excluded_pools: HashSet<SchemaAlkaneId>,
     pub has_trades: bool,
 
     pub pool_name_index_writes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -107,6 +110,7 @@ impl IndexState {
             canonical_trade_buckets: HashMap::new(),
             in_block_trade_volumes: HashMap::new(),
             pools_touched: HashSet::new(),
+            pricing_excluded_pools: HashSet::new(),
             has_trades: false,
             pool_name_index_writes: Vec::new(),
             factory_pools_writes: Vec::new(),

@@ -62,6 +62,33 @@ pub fn canonical_quotes_at_height(network: Network, height: u32) -> Vec<Canonica
     }
 }
 
+/// AMM factories whose pools may set a token's price on mainnet.
+///
+/// Espo indexes pools from any contract that looks like an AMM factory - several
+/// hundred do - and a factory only guarantees one pool per pair among its own
+/// pools. So anyone can deploy a factory and open a second pool for an existing
+/// pair with a few dollars in it. Pools from factories not listed here are still
+/// indexed, charted and counted; they just cannot move a token's price.
+const MAINNET_PRICING_FACTORIES: &[SchemaAlkaneId] = &[SchemaAlkaneId { block: 4, tx: 65522 }];
+
+/// From this height only `MAINNET_PRICING_FACTORIES` price tokens. Before it every
+/// recognised factory did, and that history is left as it was indexed.
+pub const MAINNET_PRICING_FACTORY_FORK_HEIGHT: u32 = 970_000;
+
+/// The factories allowed to price tokens at `height`, or `None` when any
+/// recognised factory may (other networks, and mainnet before the fork height).
+pub fn pricing_factories_at_height(
+    network: Network,
+    height: u32,
+) -> Option<&'static [SchemaAlkaneId]> {
+    match network {
+        Network::Bitcoin if height >= MAINNET_PRICING_FACTORY_FORK_HEIGHT => {
+            Some(MAINNET_PRICING_FACTORIES)
+        }
+        _ => None,
+    }
+}
+
 /// A (token, derived quote) pair that detaches from its derived pool at a height.
 ///
 /// Before the height the token's `-derived_<quote>-usd` chart merges the token's
@@ -161,6 +188,21 @@ mod tests {
             canonical_quotes_at_height(Network::Bitcoin, BUSD_CANONICAL_QUOTE_FORK_HEIGHT - 1);
         assert!(quotes.iter().any(|q| q.id == BUSD_ALKANE_ID));
         assert!(quotes.iter().any(|q| q.id == FRBTC_ALKANE_ID));
+    }
+
+    #[test]
+    fn only_the_oyl_factory_prices_tokens_from_the_fork_height() {
+        let h = MAINNET_PRICING_FACTORY_FORK_HEIGHT;
+        // Before the height, and on other networks, nothing is restricted.
+        assert!(pricing_factories_at_height(Network::Bitcoin, h - 1).is_none());
+        assert!(pricing_factories_at_height(Network::Regtest, h + 1_000).is_none());
+
+        let allowed = pricing_factories_at_height(Network::Bitcoin, h).expect("in force");
+        assert_eq!(allowed, &[SchemaAlkaneId { block: 4, tx: 65522 }]);
+        // The same contract the module already treats as the AMM.
+        assert_eq!(allowed[0], get_amm_contract(Network::Bitcoin).unwrap());
+        // The factory behind the duplicate dust pools is not on it.
+        assert!(!allowed.contains(&SchemaAlkaneId { block: 4, tx: 235884 }));
     }
 
     #[test]

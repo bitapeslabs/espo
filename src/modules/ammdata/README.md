@@ -315,3 +315,35 @@ high, and simply dropping it would hide up to a month of real data on the 1M
 chart. A `start_offset` the index has not reached yet hides the whole chart:
 every candle so far happened before it. Charts requested by raw pool id are not
 affected - the offset is per alkane.
+
+### Trusted pricing factories
+
+Espo indexes pools from any contract that looks like an AMM factory, and a
+factory only guarantees one pool per pair among its own pools - so a second
+factory can open a duplicate pool for an existing pair. From mainnet block
+`MAINNET_PRICING_FACTORY_FORK_HEIGHT` (970000) only pools created by a factory in
+`MAINNET_PRICING_FACTORIES` (`4:65522`, the Oyl AMM) can set a token's price.
+Other pools are still indexed, charted, and counted in volume and TVL.
+
+`IndexState::pricing_excluded_pools` is filled once per block, after pool
+discovery, by `AmmDataProvider::pools_not_in_factories`, and consulted wherever a
+pool can set a price:
+
+| site | effect on an excluded pool |
+| --- | --- |
+| `process_balance_deltas` | its trade does not add to `canonical_trade_buckets`, so it does not re-price a token |
+| `derive_token_data` | not one of a token's canonical pools; not a pair's derived pool; cannot write the canonical-pool pointer |
+| `derive_pool_metrics` | not a source for a token's sats price (pool TVL) |
+| `get_canonical_pools` | dropped at request time; the token's pool list supplies the trusted pool instead |
+
+A pool belongs to a factory if either `pool_factory` or `factory_pools` says so.
+That is espo's own record, not essentials' `inspection.factory_alkane` (the
+clone template) - by that field most Oyl pools belong to `4:780993`.
+
+The canonical-pool pointer (`canonical_pool/v2/<token>/<quote>`) holds one pool
+per pair and the newest discovered pool overwrote it, so duplicates had already
+taken it for several tokens. It is not rewritten; readers stop trusting it from
+the fork height. History before the height is untouched.
+
+Background, the mainnet incident that prompted it, and what it changes for
+consumers: `docs/2-trusted-pricing-factories.md`.

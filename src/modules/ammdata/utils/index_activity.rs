@@ -223,14 +223,17 @@ pub fn process_balance_deltas(
                     );
                 }
 
-                if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
+                // The pool's own candles, volume and activity above are recorded
+                // either way; only a pool from a trusted factory re-prices a token.
+                let prices_tokens = !state.pricing_excluded_pools.contains(&owner);
+                if prices_tokens && canonical_quote_units.contains_key(&defs.quote_alkane_id) {
                     let entry =
                         state.canonical_trade_buckets.entry(defs.base_alkane_id).or_default();
                     for tf in frames {
                         entry.insert((*tf, bucket_start_for(block_ts, *tf)));
                     }
                 }
-                if canonical_quote_units.contains_key(&defs.base_alkane_id) {
+                if prices_tokens && canonical_quote_units.contains_key(&defs.base_alkane_id) {
                     let entry =
                         state.canonical_trade_buckets.entry(defs.quote_alkane_id).or_default();
                     for tf in frames {

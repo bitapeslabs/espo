@@ -8,7 +8,7 @@ use crate::modules::ammdata::config::{AmmDataConfig, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
     AMOUNT_SCALE, CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID,
     MAINNET_FIRE_USD_CHART_START_TS, PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block,
-    canonical_quotes_at_height, non_circulating_holders,
+    canonical_quotes_at_height, non_circulating_holders, pricing_factories_at_height,
 };
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
@@ -2688,6 +2688,18 @@ impl AmmDataProvider {
             };
             pools.push(SchemaCanonicalPoolEntry { pool_id, quote_id });
         }
+
+        // The stored pointer keeps one pool per (token, quote) and the newest pool
+        // to be discovered overwrote it - including dust duplicates opened through
+        // other factories before the allowlist existed. Once the allowlist is in
+        // force the pointer is only a hint: entries naming an untrusted pool are
+        // dropped, and the token's own pool list supplies the trusted pool the
+        // pointer may have lost. Nothing stored is rewritten.
+        if let Some(factories) = pricing_factories_at_height(get_network(), canonical_height) {
+            pools =
+                self.trusted_canonical_pools(&params.token, &canonical_quote_ids, pools, factories);
+        }
+
         pools.sort_by_key(|e| (e.quote_id.block, e.quote_id.tx, e.pool_id.block, e.pool_id.tx));
         Ok(GetCanonicalPoolsResult { pools })
     }
@@ -3077,6 +3089,117 @@ impl AmmDataProvider {
             }
         }
         Ok(GetAmmFactoriesResult { factories: ids })
+    }
+
+    /// A token's canonical pools, restricted to trusted factories.
+    ///
+    /// `pointer_pools` is what the stored one-per-pair pointer says. Entries naming
+    /// an untrusted pool are dropped, and the token's own pool list supplies any
+    /// trusted pool the pointer lost when a later pool overwrote it.
+    fn trusted_canonical_pools(
+        &self,
+        token: &SchemaAlkaneId,
+        canonical_quote_ids: &HashSet<SchemaAlkaneId>,
+        pointer_pools: Vec<SchemaCanonicalPoolEntry>,
+        factories: &[SchemaAlkaneId],
+    ) -> Vec<SchemaCanonicalPoolEntry> {
+        let mut pools: Vec<SchemaCanonicalPoolEntry> = pointer_pools
+            .into_iter()
+            .filter(|e| self.pool_in_factories(&e.pool_id, factories))
+            .collect();
+        let token_pools = self
+            .get_token_pools(GetTokenPoolsParams { blockhash: StateAt::Latest, token: *token })
+            .map(|res| res.pools)
+            .unwrap_or_default();
+        for pool_id in token_pools {
+            if pools.iter().any(|e| e.pool_id == pool_id) {
+                continue;
+            }
+            let Some(defs) = self
+                .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool: pool_id })
+                .ok()
+                .and_then(|res| res.defs)
+            else {
+                continue;
+            };
+            let quote_id = if defs.base_alkane_id == *token {
+                defs.quote_alkane_id
+            } else if defs.quote_alkane_id == *token {
+                defs.base_alkane_id
+            } else {
+                continue;
+            };
+            if canonical_quote_ids.contains(&quote_id)
+                && self.pool_in_factories(&pool_id, factories)
+            {
+                pools.push(SchemaCanonicalPoolEntry { pool_id, quote_id });
+            }
+        }
+        pools
+    }
+
+    /// The pools in `pools` that were not created by any of `factories`.
+    ///
+    /// A pool's factory is recorded twice when it is discovered - `pool_factory`
+    /// (pool -> factory) and `factory_pools` (factory -> pool) - and a pool counts
+    /// as belonging to a factory if either says so, so an index that only gained
+    /// one of the two later cannot make an old pool look foreign. The two `pending`
+    /// slices are this block's not-yet-written entries for the same indexes, so a
+    /// pool discovered in this block is judged in this block.
+    ///
+    /// Read errors are returned, never swallowed: treating "could not read" as
+    /// "no pool is trusted" would silently stop pricing every token.
+    pub fn pools_not_in_factories(
+        &self,
+        pools: &[SchemaAlkaneId],
+        factories: &[SchemaAlkaneId],
+        pending_pool_factory: &[(Vec<u8>, Vec<u8>)],
+        pending_factory_pools: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<HashSet<SchemaAlkaneId>> {
+        let table = self.table();
+        let mut trusted: HashSet<SchemaAlkaneId> = HashSet::new();
+
+        // factory -> pools
+        for factory in factories {
+            let prefix = table.factory_pools_prefix(factory);
+            let keys = self
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+                    blockhash: StateAt::Latest,
+                    prefix: prefix.clone(),
+                })?
+                .keys;
+            for key in keys.iter().chain(pending_factory_pools.iter().map(|(k, _)| k)) {
+                if let Some(pool) = parse_alkane_id_from_prefixed_key(prefix.as_slice(), key) {
+                    trusted.insert(pool);
+                }
+            }
+        }
+
+        // pool -> factory
+        let keys: Vec<Vec<u8>> = pools.iter().map(|p| table.pool_factory_key(p)).collect();
+        let pending: HashMap<&[u8], &[u8]> =
+            pending_pool_factory.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        let stored = self
+            .get_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: keys.clone(),
+            })?
+            .values;
+        for ((pool, key), value) in pools.iter().zip(keys.iter()).zip(stored) {
+            let raw: Option<&[u8]> = pending.get(key.as_slice()).copied().or(value.as_deref());
+            if raw.and_then(decode_alkane_id_be).is_some_and(|f| factories.contains(&f)) {
+                trusted.insert(*pool);
+            }
+        }
+
+        Ok(pools.iter().filter(|p| !trusted.contains(p)).copied().collect())
+    }
+
+    /// Whether one pool was created by any of `factories`, for request-time use.
+    pub fn pool_in_factories(&self, pool: &SchemaAlkaneId, factories: &[SchemaAlkaneId]) -> bool {
+        self.pools_not_in_factories(&[*pool], factories, &[], &[])
+            .map(|excluded| excluded.is_empty())
+            .unwrap_or(false)
     }
 
     pub fn get_factory_pools(
@@ -8191,6 +8314,138 @@ mod tests {
         assert_eq!(legs[0]["pool"], json!("2:77087"));
         assert_eq!(legs[1]["pool"], json!("2:77269"));
         assert_eq!(legs[2]["pool"], json!("2:70020"));
+    }
+
+    const OYL: SchemaAlkaneId = SchemaAlkaneId { block: 4, tx: 65522 };
+    const OTHER_FACTORY: SchemaAlkaneId = SchemaAlkaneId { block: 4, tx: 235884 };
+
+    fn factory_bytes(f: &SchemaAlkaneId) -> Vec<u8> {
+        let mut b = Vec::with_capacity(12);
+        b.extend_from_slice(&f.block.to_be_bytes());
+        b.extend_from_slice(&f.tx.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn a_pool_is_trusted_if_either_factory_record_says_so() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let pool = |tx: u64| SchemaAlkaneId { block: 2, tx };
+        let (both, only_pool_factory, only_factory_pools) = (pool(1), pool(2), pool(3));
+        let (foreign, unrecorded) = (pool(4), pool(5));
+        let (pending_oyl, pending_foreign) = (pool(6), pool(7));
+
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.pool_factory_key(&both), factory_bytes(&OYL)),
+                    (table.factory_pools_key(&OYL, &both), Vec::new()),
+                    // Indexes that gained one record but not the other must not make
+                    // a real pool look foreign.
+                    (table.pool_factory_key(&only_pool_factory), factory_bytes(&OYL)),
+                    (table.factory_pools_key(&OYL, &only_factory_pools), Vec::new()),
+                    (table.pool_factory_key(&foreign), factory_bytes(&OTHER_FACTORY)),
+                    (table.factory_pools_key(&OTHER_FACTORY, &foreign), Vec::new()),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write records");
+
+        // Pools discovered in the block being indexed: records still pending.
+        let pending_pool_factory = vec![
+            (table.pool_factory_key(&pending_oyl), factory_bytes(&OYL)),
+            (table.pool_factory_key(&pending_foreign), factory_bytes(&OTHER_FACTORY)),
+        ];
+        let pending_factory_pools = vec![
+            (table.factory_pools_key(&OYL, &pending_oyl), Vec::new()),
+            (table.factory_pools_key(&OTHER_FACTORY, &pending_foreign), Vec::new()),
+        ];
+
+        let all = [
+            both,
+            only_pool_factory,
+            only_factory_pools,
+            foreign,
+            unrecorded,
+            pending_oyl,
+            pending_foreign,
+        ];
+        let excluded = provider
+            .pools_not_in_factories(&all, &[OYL], &pending_pool_factory, &pending_factory_pools)
+            .expect("read");
+
+        let expected: HashSet<SchemaAlkaneId> =
+            [foreign, unrecorded, pending_foreign].into_iter().collect();
+        assert_eq!(excluded, expected);
+
+        assert!(provider.pool_in_factories(&both, &[OYL]));
+        assert!(provider.pool_in_factories(&only_factory_pools, &[OYL]));
+        assert!(!provider.pool_in_factories(&foreign, &[OYL]));
+        assert!(!provider.pool_in_factories(&unrecorded, &[OYL]));
+        // Trusting the other factory instead flips it.
+        assert!(provider.pool_in_factories(&foreign, &[OTHER_FACTORY]));
+    }
+
+    #[test]
+    fn a_duplicate_pool_that_took_the_pointer_does_not_price_the_token() {
+        // Mainnet SLICE: the real SLICE/frBTC pool 2:96947 was the canonical pool
+        // until a second factory opened 2:102392 for the same pair, which overwrote
+        // the one-per-pair pointer. Live prices must still come from the real pool.
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let slice = SchemaAlkaneId { block: 4, tx: 8888 };
+        let frbtc = SchemaAlkaneId { block: 32, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let real = SchemaAlkaneId { block: 2, tx: 96947 };
+        let duplicate = SchemaAlkaneId { block: 2, tx: 102392 };
+        let tort_pool = SchemaAlkaneId { block: 2, tx: 97475 };
+
+        let defs = |pool, base, quote| {
+            (
+                table.pools_key(&pool),
+                borsh::to_vec(&SchemaMarketDefs {
+                    base_alkane_id: base,
+                    quote_alkane_id: quote,
+                    pool_alkane_id: pool,
+                })
+                .unwrap(),
+            )
+        };
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    defs(real, slice, frbtc),
+                    defs(duplicate, slice, frbtc),
+                    defs(tort_pool, tort, slice),
+                    (table.token_pools_key(&slice, &real), Vec::new()),
+                    (table.token_pools_key(&slice, &duplicate), Vec::new()),
+                    (table.token_pools_key(&slice, &tort_pool), Vec::new()),
+                    (table.pool_factory_key(&real), factory_bytes(&OYL)),
+                    (table.pool_factory_key(&tort_pool), factory_bytes(&OYL)),
+                    (table.pool_factory_key(&duplicate), factory_bytes(&OTHER_FACTORY)),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write");
+
+        let canonical: HashSet<SchemaAlkaneId> = [frbtc].into_iter().collect();
+        // What the stored pointer says today: the duplicate.
+        let pointer = vec![SchemaCanonicalPoolEntry { pool_id: duplicate, quote_id: frbtc }];
+
+        let pools = provider.trusted_canonical_pools(&slice, &canonical, pointer, &[OYL]);
+
+        // The duplicate is gone, the real pool is back, and the TORT pool is not a
+        // canonical pool at all (TORT is not a canonical quote).
+        assert_eq!(pools, vec![SchemaCanonicalPoolEntry { pool_id: real, quote_id: frbtc }]);
+
+        // A pointer that already names the trusted pool is kept, not duplicated.
+        let good = vec![SchemaCanonicalPoolEntry { pool_id: real, quote_id: frbtc }];
+        assert_eq!(
+            provider.trusted_canonical_pools(&slice, &canonical, good.clone(), &[OYL]),
+            good
+        );
     }
 
     #[test]

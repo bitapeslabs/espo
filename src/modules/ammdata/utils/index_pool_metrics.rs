@@ -101,6 +101,9 @@ pub fn derive_pool_metrics(
         Vec<crate::modules::ammdata::schemas::SchemaCanonicalPoolEntry>,
     > = HashMap::new();
     for (pool, defs) in state.pools_map.iter() {
+        if state.pricing_excluded_pools.contains(pool) {
+            continue;
+        }
         if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
             canonical_pools_by_token.entry(defs.base_alkane_id).or_default().push(
                 crate::modules::ammdata::schemas::SchemaCanonicalPoolEntry {

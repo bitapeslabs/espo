@@ -505,6 +505,11 @@ pub fn derive_token_data(
     let mut canonical_pools_by_token: HashMap<SchemaAlkaneId, Vec<SchemaCanonicalPoolEntry>> =
         HashMap::new();
     for (pool, defs) in state.pools_map.iter() {
+        // A pool from a factory off the pricing allowlist is charted but never
+        // contributes to a token's own price.
+        if state.pricing_excluded_pools.contains(pool) {
+            continue;
+        }
         if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
             canonical_pools_by_token
                 .entry(defs.base_alkane_id)
@@ -578,6 +583,11 @@ pub fn derive_token_data(
 
     for (token, new_entries) in state.canonical_pool_updates.iter() {
         for entry in new_entries {
+            // The pointer holds one pool per (token, quote) and the newest writer
+            // wins, so an untrusted duplicate must not be allowed to take it.
+            if state.pricing_excluded_pools.contains(&entry.pool_id) {
+                continue;
+            }
             state.canonical_pool_writes.push((
                 table.canonical_pool_quote_key(token, &entry.quote_id),
                 encode_alkane_id_be(&entry.pool_id).to_vec(),
@@ -809,6 +819,12 @@ pub fn derive_token_data(
                     || plan.pair_dropped(token, quote, height)
             };
             for (pool, defs) in state.pools_map.iter() {
+                // Same rule for the derived leg: a duplicate pool against the
+                // derived quote, with the token on the preferred side, would
+                // otherwise be picked over the real one.
+                if state.pricing_excluded_pools.contains(pool) {
+                    continue;
+                }
                 if derived_quote_set.contains(&defs.quote_alkane_id)
                     && !pair_detached(&defs.base_alkane_id, &defs.quote_alkane_id)
                 {
