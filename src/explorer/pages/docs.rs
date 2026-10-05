@@ -1324,30 +1324,60 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "ammdata.get_token_activity",
-                    "Returns AMM and token-market activity for a token.",
-                    json!({ "token": "2:0", "page": 1, "limit": 10, "kind": "trade", "sort_by": "timestamp" }),
-                    json!({
-                        "ok": true,
-                        "page": 1,
-                        "limit": 10,
-                        "has_more": true,
-                        "activity_type": "all",
-                        "kind": null,
-                        "activity": [{
-                            "kind": "swap",
-                            "index_kind": "swap",
-                            "pool": "DIESEL / CH4",
-                            "pool_id": "2:53014",
-                            "txid": "02146673f5ba09a67042626a21727466a3ac4c68bdce49e12fd9f734133489d3",
-                            "timestamp": 1779888869,
-                            "direction": "sell",
-                            "amount": "11486258",
-                            "base": "2:0",
-                            "quote": "2:16",
-                            "base_delta": "-11486258",
-                            "quote_delta": "1061552883247"
-                        }]
-                    }),
+                    "Returns AMM activity for a token: one row per pool event whose pool contains that token, newest first by default. activity_type is all, trades or events; kind narrows to one event kind; sort is timestamp or amount and dir is asc or desc. base_delta and quote_delta are the pool's own changes (positive is what the pool took in), side and amount describe the event from the queried token's point of view, and base and quote name the pool's two assets, which differ row to row. A swap routed through several pools is recorded as one row per pool, sharing only a txid, and a token's feed holds just the rows for pools that contain it. So on its own this endpoint shows a multi-hop buy as its last leg alone, priced in the intermediate asset rather than in what the buyer actually paid, and shows an arbitrage cycle that merely passes through the token as an unrelated buy and sell of the same amount. Pass include_route true to have every trade row carry route, the whole swap reassembled across pools: legs in the order the swap flowed through them (a cycle has no real start, so it is shown beginning and ending on the token the trader came out ahead in), each with pool, base, quote, token_in, amount_in, token_out and amount_out; hops, the number of legs; via, the tokens that were only passed through; net, what the trader ended up with per token over the whole transaction (negative is paid, positive is received, tokens that net to zero omitted); token_in and amount_in when exactly one token was net paid, and token_out and amount_out when exactly one was net received, each null otherwise; and pass_through, true when the queried token was only a hop and nobody ended up holding it. To count real trades of a token, skip rows whose route has pass_through true, and take the size of a trade from the route's amount_in and amount_out rather than from the row. A single-hop trade has a route of one leg, so the shape is the same for every trade. route is null where it cannot be determined, and rows that are not trades do not carry it. It is off by default because it costs one extra lookup per block in the page.",
+                    json!({ "token": "2:68479", "activity_type": "all", "limit": 1, "page": 1, "sort": "timestamp", "dir": "desc", "include_route": true }),
+                    {
+                        // Built in pieces: one json! this deep exceeds the macro
+                        // recursion limit.
+                        let legs = json!([
+                            { "pool": "2:77087", "base": "2:0", "quote": "32:0", "token_in": "2:0", "amount_in": "48334811", "token_out": "32:0", "amount_out": "21470" },
+                            { "pool": "2:77269", "base": "2:68479", "quote": "32:0", "token_in": "32:0", "amount_in": "21470", "token_out": "2:68479", "amount_out": "168075379605" },
+                            { "pool": "2:70020", "base": "2:0", "quote": "2:68479", "token_in": "2:68479", "amount_in": "168075379605", "token_out": "2:0", "amount_out": "49772500" }
+                        ]);
+                        let route = json!({
+                            "hops": 3,
+                            "legs": legs,
+                            "via": ["2:68479", "32:0"],
+                            "net": { "2:0": "1437689" },
+                            "token_in": null,
+                            "amount_in": null,
+                            "token_out": "2:0",
+                            "amount_out": "1437689",
+                            "pass_through": true
+                        });
+                        let row = json!({
+                            "timestamp": 1791170078,
+                            "txid": "bb0a04dffe30788c0fa6ed59fb86a8ec0fbcb5b4e70ee64f2279babf2ac704f1",
+                            "kind": "trade_buy",
+                            "index_kind": "trade_buy",
+                            "direction": "quote_in",
+                            "side": "buy",
+                            "amount": 1680.75379605,
+                            "base_delta": "-168075379605",
+                            "quote_delta": "21470",
+                            "pool": "2:77269",
+                            "pool_id": "2:77269",
+                            "base": "2:68479",
+                            "quote": "32:0",
+                            "token": "2:68479",
+                            "seq": 0,
+                            "route": route
+                        });
+                        json!({
+                            "ok": true,
+                            "include_route": true,
+                            "token": "2:68479",
+                            "activity_type": "all",
+                            "kind": null,
+                            "sort": "timestamp",
+                            "dir": "desc",
+                            "page": 1,
+                            "limit": 1,
+                            "total": 8269,
+                            "has_more": true,
+                            "activity": [row]
+                        })
+                    },
                 ),
                 rpc_doc(
                     "ammdata.get_pools",

@@ -27,6 +27,7 @@ use crate::modules::ammdata::utils::pathfinder::{
     plan_implicit_default_fee, plan_swap_exact_tokens_for_tokens,
     plan_swap_exact_tokens_for_tokens_implicit, plan_swap_tokens_for_exact_tokens,
 };
+use crate::modules::ammdata::utils::route::{RouteLeg, build_route, route_json};
 use crate::modules::ammdata::utils::token_volume::read_token_volume_v1;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetCreationRecordsByIdParams,
@@ -3585,6 +3586,78 @@ impl AmmDataProvider {
         read_amm_history(self, prefix, params.offset, params.limit, params.kind)
     }
 
+    /// Every swap leg recorded at one block timestamp, grouped by transaction.
+    ///
+    /// A swap's legs are separate per-pool activity rows that share a txid and a
+    /// timestamp. `amm_history_all` already lists every AMM event by timestamp, so
+    /// one short scan of that timestamp plus one batched read of the (small)
+    /// activity entries finds them all - no transaction blobs, no traces.
+    pub fn trade_legs_at_ts(
+        &self,
+        ts: u64,
+        defs_cache: &mut HashMap<SchemaAlkaneId, Option<SchemaMarketDefs>>,
+    ) -> Result<HashMap<[u8; 32], Vec<RouteLeg>>> {
+        let table = self.table();
+        let mut prefix = table.amm_history_all_prefix();
+        prefix.extend_from_slice(&ts.to_be_bytes());
+        let entries = self
+            .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })?
+            .entries;
+
+        // Key tail: ts(8) seq(4) kind(1) pool.block(4) pool.tx(8).
+        let mut lookups: Vec<ActivityEntryLookup> = Vec::new();
+        for (key, _value) in entries {
+            if key.len() < 25 {
+                continue;
+            }
+            let tail = &key[key.len() - 25..];
+            let key_ts = u64::from_be_bytes(tail[0..8].try_into().expect("8 bytes"));
+            if key_ts != ts {
+                continue;
+            }
+            let seq = u32::from_be_bytes(tail[8..12].try_into().expect("4 bytes"));
+            let is_trade = matches!(
+                activity_kind_from_code(tail[12]),
+                Some(ActivityKind::TradeBuy | ActivityKind::TradeSell)
+            );
+            let Some(pool) = decode_alkane_id_be(&tail[13..25]) else { continue };
+            if is_trade {
+                lookups.push(ActivityEntryLookup { pool, ts, seq });
+            }
+        }
+        if lookups.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let keys: Vec<(SchemaAlkaneId, u32)> = lookups.iter().map(|l| (l.pool, l.seq)).collect();
+        let stored = self
+            .get_activity_entries(GetActivityEntriesParams {
+                blockhash: StateAt::Latest,
+                entries: lookups,
+            })?
+            .entries;
+
+        let mut by_tx: HashMap<[u8; 32], Vec<RouteLeg>> = HashMap::new();
+        for ((pool, seq), entry) in keys.into_iter().zip(stored) {
+            let Some(entry) = entry else { continue };
+            let defs = *defs_cache.entry(pool).or_insert_with(|| {
+                self.get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool })
+                    .ok()
+                    .and_then(|res| res.defs)
+            });
+            let Some(defs) = defs else { continue };
+            by_tx.entry(entry.txid).or_default().push(RouteLeg {
+                pool,
+                base: defs.base_alkane_id,
+                quote: defs.quote_alkane_id,
+                base_delta: entry.base_delta,
+                quote_delta: entry.quote_delta,
+                seq,
+            });
+        }
+        Ok(by_tx)
+    }
+
     pub fn get_amm_history_all_page(
         &self,
         params: GetAmmHistoryAllPageParams,
@@ -4864,6 +4937,12 @@ impl AmmDataProvider {
             blockhash: StateAt::Latest,
             entries: lookups,
         })?;
+        // Routes are opt-in: finding a trade's other legs is one extra scan per
+        // block in the page, cached so trades in the same block share it.
+        let include_route = params.include_route.unwrap_or(false);
+        let mut legs_by_ts: HashMap<u64, HashMap<[u8; 32], Vec<RouteLeg>>> = HashMap::new();
+        let mut route_defs_cache: HashMap<SchemaAlkaneId, Option<SchemaMarketDefs>> =
+            HashMap::new();
         let mut activity = Vec::with_capacity(page_result.entries.len());
         for (entry, stored) in page_result.entries.iter().zip(stored_entries.entries.into_iter()) {
             let Some(stored) = stored else { continue };
@@ -4889,12 +4968,34 @@ impl AmmDataProvider {
                     obj.insert("quote".to_string(), json!(id_str(&defs.quote_alkane_id)));
                 }
             }
+            if include_route
+                && matches!(stored.kind, ActivityKind::TradeBuy | ActivityKind::TradeSell)
+            {
+                if !legs_by_ts.contains_key(&entry.ts) {
+                    let legs =
+                        self.trade_legs_at_ts(entry.ts, &mut route_defs_cache).unwrap_or_default();
+                    legs_by_ts.insert(entry.ts, legs);
+                }
+                // If this row's own leg is not among what the scan found, the block
+                // predates the all-AMM index and the route is unknown - say so with
+                // null rather than passing a lone leg off as a one-hop route.
+                let route = legs_by_ts
+                    .get(&entry.ts)
+                    .and_then(|by_tx| by_tx.get(&stored.txid))
+                    .filter(|legs| legs.iter().any(|l| l.pool == entry.pool && l.seq == entry.seq))
+                    .map(|legs| route_json(&build_route(legs.clone()), &token))
+                    .unwrap_or(Value::Null);
+                if let Value::Object(ref mut obj) = row {
+                    obj.insert("route".to_string(), route);
+                }
+            }
             activity.push(row);
         }
 
         Ok(RpcGetTokenActivityResult {
             value: json!({
                 "ok": true,
+                "include_route": include_route,
                 "token": id_str(&token),
                 "activity_type": match activity_type {
                     ActivityFilter::All => "all",
@@ -6307,6 +6408,8 @@ pub struct RpcGetTokenActivityParams {
     pub kind: Option<String>,
     pub sort: Option<String>,
     pub dir: Option<String>,
+    /// Attach each trade's full route across pools. Off by default.
+    pub include_route: Option<bool>,
 }
 
 pub struct RpcGetTokenActivityResult {
@@ -8004,6 +8107,90 @@ mod tests {
         assert_eq!(resolve_full_chart_id(&provider, "2:68441"), None);
         assert_eq!(resolve_full_chart_id(&provider, "2:0-full-nonsense"), None);
         assert_eq!(resolve_full_chart_id(&provider, "garbage-full"), None);
+    }
+
+    #[test]
+    fn trade_legs_at_a_timestamp_are_found_and_grouped_by_transaction() {
+        // The shape of mainnet tx bb0a04df..: one transaction through three pools,
+        // sharing a block with an unrelated swap, a liquidity add, and (at another
+        // timestamp) a swap that must not be picked up.
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let frbtc = SchemaAlkaneId { block: 32, tx: 0 };
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let pool_tort_frbtc = SchemaAlkaneId { block: 2, tx: 77269 };
+        let pool_diesel_tort = SchemaAlkaneId { block: 2, tx: 70020 };
+        let pool_diesel_frbtc = SchemaAlkaneId { block: 2, tx: 77087 };
+        let ts = 1_791_170_078u64;
+        let (tx_a, tx_b, tx_c) = ([0xaa; 32], [0xbb; 32], [0xcc; 32]);
+
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (pool, base, quote) in [
+            (pool_tort_frbtc, tort, frbtc),
+            (pool_diesel_tort, diesel, tort),
+            (pool_diesel_frbtc, diesel, frbtc),
+        ] {
+            let defs = SchemaMarketDefs {
+                base_alkane_id: base,
+                quote_alkane_id: quote,
+                pool_alkane_id: pool,
+            };
+            puts.push((table.pools_key(&pool), borsh::to_vec(&defs).unwrap()));
+        }
+        let mut event = |pool: SchemaAlkaneId,
+                         at: u64,
+                         seq: u32,
+                         kind: ActivityKind,
+                         txid: [u8; 32],
+                         base_delta: i128,
+                         quote_delta: i128| {
+            let activity = SchemaActivityV1 {
+                timestamp: at,
+                txid,
+                kind,
+                direction: None,
+                base_delta,
+                quote_delta,
+                address_spk: Vec::new(),
+                success: true,
+            };
+            puts.push((table.activity_key(&pool, at, seq), borsh::to_vec(&activity).unwrap()));
+            puts.push((table.amm_history_all_key(at, seq, kind, &pool), Vec::new()));
+        };
+        // tx A: frBTC -> TORT -> DIESEL -> frBTC.
+        event(pool_tort_frbtc, ts, 0, ActivityKind::TradeBuy, tx_a, -168_075_379_605, 21_470);
+        event(pool_diesel_tort, ts, 0, ActivityKind::TradeBuy, tx_a, -49_772_500, 168_075_379_605);
+        event(pool_diesel_frbtc, ts, 0, ActivityKind::TradeSell, tx_a, 48_334_811, -21_470);
+        // tx B: an unrelated single swap in the same block.
+        event(pool_tort_frbtc, ts, 1, ActivityKind::TradeSell, tx_b, 500, -3);
+        // tx C: a liquidity add in the same block - not a swap leg.
+        event(pool_diesel_frbtc, ts, 1, ActivityKind::LiquidityAdd, tx_c, 10, 10);
+        // A swap one second later - a different block.
+        event(pool_tort_frbtc, ts + 1, 0, ActivityKind::TradeBuy, tx_a, -1, 1);
+        provider
+            .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+            .expect("write events");
+
+        let mut cache = HashMap::new();
+        let by_tx = provider.trade_legs_at_ts(ts, &mut cache).expect("scan");
+
+        assert_eq!(by_tx.len(), 2, "the liquidity add is not a swap leg");
+        assert_eq!(by_tx[&tx_a].len(), 3, "all three pools, and not the next block's swap");
+        assert_eq!(by_tx[&tx_b].len(), 1);
+        assert!(!by_tx.contains_key(&tx_c));
+
+        // End to end: what TORT's feed would get attached for tx A.
+        let route = route_json(&build_route(by_tx[&tx_a].clone()), &tort);
+        assert_eq!(route["hops"], json!(3));
+        assert_eq!(route["pass_through"], json!(true));
+        assert_eq!(route["token_out"], json!("2:0"));
+        assert_eq!(route["amount_out"], json!("1437689"));
+        // A cycle is ordered to start and end on the token that came out ahead.
+        let legs = route["legs"].as_array().unwrap();
+        assert_eq!(legs[0]["pool"], json!("2:77087"));
+        assert_eq!(legs[1]["pool"], json!("2:77269"));
+        assert_eq!(legs[2]["pool"], json!("2:70020"));
     }
 
     #[test]

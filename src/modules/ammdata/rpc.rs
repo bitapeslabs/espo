@@ -439,6 +439,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
                         dir: payload.get("dir").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        include_route: payload.get("include_route").and_then(|v| v.as_bool()),
                     };
                     let view = match mdb_for_handler.with_height(
                         payload.get("height").and_then(|v| v.as_u64()),
