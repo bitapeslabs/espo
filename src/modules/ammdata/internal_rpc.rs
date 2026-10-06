@@ -9,13 +9,13 @@
 //! internally still serve height-pinned views correctly.
 
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetIndexHeightParams, GetIndexHeightResult, GetLatestBtcUsdPriceParams,
-    GetListEntriesDescParams, GetListEntriesDescResult, GetListKeysByPrefixParams,
-    GetListKeysByPrefixResult, GetPoolDefsParams, GetPoolDefsResult, GetTokenActivityPageParams,
-    GetTokenActivityPageResult, GetTokenDerivedMetricsParams, GetTokenDerivedMetricsResult,
-    GetTokenMetricsParams, GetTokenMetricsResult, GetTokenPoolsParams, GetTokenPoolsResult,
-    GetTokenSearchIndexPageParams, GetTokenSearchIndexPageResult, RpcGetCandlesParams,
-    RpcGetCandlesResult,
+    AmmDataProvider, FullChartTargetParams, FullChartTargetResult, GetIndexHeightParams,
+    GetIndexHeightResult, GetLatestBtcUsdPriceParams, GetListEntriesDescParams,
+    GetListEntriesDescResult, GetListKeysByPrefixParams, GetListKeysByPrefixResult,
+    GetPoolDefsParams, GetPoolDefsResult, GetTokenActivityPageParams, GetTokenActivityPageResult,
+    GetTokenDerivedMetricsParams, GetTokenDerivedMetricsResult, GetTokenMetricsParams,
+    GetTokenMetricsResult, GetTokenPoolsParams, GetTokenPoolsResult, GetTokenSearchIndexPageParams,
+    GetTokenSearchIndexPageResult, RpcGetCandlesParams, RpcGetCandlesResult,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::EssentialsProvider;
@@ -64,6 +64,13 @@ pub fn remote_get_token_derived_metrics(
     params: GetTokenDerivedMetricsParams,
 ) -> Result<GetTokenDerivedMetricsResult> {
     remote.getter("internal.ammdata_get_token_derived_metrics", &params)
+}
+
+pub fn remote_full_chart_target(
+    remote: &RemoteEspoClient,
+    params: FullChartTargetParams,
+) -> Result<FullChartTargetResult> {
+    remote.getter("internal.ammdata_full_chart_target", &params)
 }
 
 pub fn remote_get_token_pools(
@@ -193,6 +200,9 @@ pub fn register_internal_getters(reg: &RpcNsRegistrar) {
     });
     register_getter(reg, "ammdata_get_token_derived_metrics", |p: GetTokenDerivedMetricsParams| {
         provider_at(p.blockhash).get_token_derived_metrics(p)
+    });
+    register_getter(reg, "ammdata_full_chart_target", |p: FullChartTargetParams| {
+        provider_at(StateAt::Latest).full_chart_target(p)
     });
     register_getter(reg, "ammdata_get_token_pools", |p: GetTokenPoolsParams| {
         provider_at(p.blockhash).get_token_pools(p)

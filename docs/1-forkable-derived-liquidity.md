@@ -154,7 +154,12 @@ The response reports what was served:
 ```
 
 `ammdata.get_alkanes_quote` orders its derived quotes the same way, so a quote
-agrees with the `-full` chart.
+agrees with the `-full` chart. The explorer's token page does too: the price,
+market cap and changes shown above the chart, and the chart itself, come from
+whatever `<alkane>-full` resolves to (`AmmDataProvider::full_chart_target`),
+not from the first derived quote that happens to have data. A client-mode
+explorer asks the data instance, since the answer depends on its config, tip
+and fork markers.
 
 ---
 

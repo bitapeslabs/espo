@@ -28,9 +28,9 @@ use crate::explorer::phishing::{is_phishing_alkane, phishing_warning_for};
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, FRBTC_ALKANE_ID, PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::schemas::{SchemaTokenMetricsV1, Timeframe};
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, AmmDataTable, GetLatestBtcUsdPriceParams, GetListKeysByPrefixParams,
-    GetPoolDefsParams, GetTokenDerivedMetricsParams, GetTokenMetricsParams, GetTokenPoolsParams,
-    parse_change_basis_points,
+    AmmDataProvider, AmmDataTable, FullChartTargetParams, GetLatestBtcUsdPriceParams,
+    GetListKeysByPrefixParams, GetPoolDefsParams, GetTokenDerivedMetricsParams,
+    GetTokenMetricsParams, GetTokenPoolsParams, parse_change_basis_points,
 };
 use crate::modules::essentials::storage::{
     BalanceEntry, HolderId, load_creation_record, spk_to_address_str,
@@ -863,10 +863,13 @@ pub async fn alkane_page(
         });
     let token_activity_filtered_by_quote = token_activity_quote_filter.is_some();
 
-    // Resolved from the data instance in client mode (no local modules config).
-    let derived_quotes: Vec<SchemaAlkaneId> =
-        crate::modules::ammdata::internal_rpc::explorer_amm_config().derived_quotes;
-    let is_derived_quote_token = is_diesel;
+    // The market shown above the chart is whatever `<alkane>-full` resolves to on
+    // the data instance: the derived chart against the alkane's target quote, or
+    // its direct chart. The candle RPC decides this, so the page agrees with it.
+    let market_quote: Option<SchemaAlkaneId> = amm_provider
+        .full_chart_target(FullChartTargetParams { token: alk })
+        .map(|res| res.target)
+        .unwrap_or(None);
     let has_prefix = |rel_prefix: Vec<u8>| -> bool {
         amm_provider
             .get_list_keys_by_prefix(GetListKeysByPrefixParams {
@@ -876,17 +879,11 @@ pub async fn alkane_page(
             .map(|res| !res.keys.is_empty())
             .unwrap_or(false)
     };
-    let market_quote = if is_derived_quote_token {
-        None
-    } else {
-        derived_quotes.iter().copied().find(|quote| {
-            has_prefix(amm_table.token_derived_mcusd_candle_ns_prefix(&alk, quote, Timeframe::D1))
-        })
-    };
-    let has_market_chart = if is_derived_quote_token {
-        has_prefix(amm_table.token_usd_candle_ns_prefix(&alk, Timeframe::D1))
-    } else {
-        market_quote.is_some()
+    let has_market_chart = match market_quote {
+        Some(quote) => {
+            has_prefix(amm_table.token_derived_mcusd_candle_ns_prefix(&alk, &quote, Timeframe::D1))
+        }
+        None => has_prefix(amm_table.token_usd_candle_ns_prefix(&alk, Timeframe::D1)),
     };
     let tv_iframe_src: Option<String> = {
         let series_id = {
@@ -908,23 +905,20 @@ pub async fn alkane_page(
         }
     };
     let market_summary = if tv_iframe_src.is_some() {
-        if is_derived_quote_token {
-            amm_provider
+        match market_quote {
+            Some(quote) => amm_provider
+                .get_token_derived_metrics(GetTokenDerivedMetricsParams {
+                    blockhash: StateAt::Latest,
+                    token: alk,
+                    quote,
+                })
+                .ok()
+                .and_then(|res| res.metrics)
+                .and_then(|metrics| alkane_market_summary_from_metrics(&metrics)),
+            None => amm_provider
                 .get_token_metrics(GetTokenMetricsParams { blockhash: StateAt::Latest, token: alk })
                 .ok()
-                .and_then(|res| alkane_market_summary_from_metrics(&res.metrics))
-        } else {
-            market_quote.and_then(|quote| {
-                amm_provider
-                    .get_token_derived_metrics(GetTokenDerivedMetricsParams {
-                        blockhash: StateAt::Latest,
-                        token: alk,
-                        quote,
-                    })
-                    .ok()
-                    .and_then(|res| res.metrics)
-                    .and_then(|metrics| alkane_market_summary_from_metrics(&metrics))
-            })
+                .and_then(|res| alkane_market_summary_from_metrics(&res.metrics)),
         }
     } else {
         None

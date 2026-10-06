@@ -273,8 +273,10 @@ code that serves the chart it proxies to:
 a forked quote on the token's first trade after the height, so until then
 `-full` stays on the default quote rather than going blank at the fork height.
 The response keeps `pool` as requested and adds `resolved_pool`.
-`get_alkanes_quote` orders its derived quotes the same way, so a quote agrees
-with the `-full` chart.
+`get_alkanes_quote` orders its derived quotes the same way, and the explorer's
+token page takes its market summary and chart source from the same resolver
+(`AmmDataProvider::full_chart_target`, remote-aware for client-mode explorers),
+so quote, page and chart agree.
 
 A `target` that is not in `derived_liquidity` at all is a config error; one that
 is listed but not in force yet is just "not yet". `target` may be omitted on an

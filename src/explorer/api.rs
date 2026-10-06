@@ -19,7 +19,8 @@ use crate::explorer::pages::common::{ALKANE_SCALE, fmt_alkane_amount, fmt_scaled
 use crate::explorer::paths::explorer_path;
 use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
+    AmmDataProvider, FullChartTargetParams, GetTokenSearchIndexPageParams, RpcGetCandlesParams,
+    SearchIndexField,
 };
 use crate::modules::essentials::storage::{
     BlockSummaryPool, EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
@@ -1499,6 +1500,34 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty());
     let mut quote = q.quote.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    // First choice: what `<alkane>-full` resolves to, so the chart matches the
+    // price shown above it. The older search below stays as the fallback.
+    if source.is_none() {
+        match provider.full_chart_target(FullChartTargetParams { token: alkane }) {
+            Ok(res) => {
+                let (pool, kind, q) = match res.target {
+                    Some(quote_id) => (
+                        format!(
+                            "{}-derived_{}-usd",
+                            alkane_id_str(&alkane),
+                            alkane_id_str(&quote_id)
+                        ),
+                        "derived",
+                        Some(alkane_id_str(&quote_id)),
+                    ),
+                    None => (format!("{}-usd", alkane_id_str(&alkane)), "usd", None),
+                };
+                if candles_available(&provider, &pool, timeframe) {
+                    source = Some(kind.to_string());
+                    quote = q;
+                }
+            }
+            Err(e) => {
+                eprintln!("[explorer] full_chart_target failed for {}: {e}", alkane_id_str(&alkane))
+            }
+        }
+    }
 
     if source.is_none() {
         let pool = format!("{}-usd", alkane_id_str(&alkane));

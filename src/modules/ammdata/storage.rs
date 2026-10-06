@@ -4269,6 +4269,48 @@ impl AmmDataProvider {
         })
     }
 
+    /// The derived quote `<token>-full` proxies to right now, or `None` for the
+    /// direct chart. One place decides this - the candle RPC, the explorer's token
+    /// page and its chart endpoint all ask here - so they cannot disagree.
+    ///
+    /// A client-mode explorer asks the data instance: the answer depends on that
+    /// instance's config, tip and fork markers.
+    pub fn full_chart_target(
+        &self,
+        params: FullChartTargetParams,
+    ) -> Result<FullChartTargetResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::ammdata::internal_rpc::remote_full_chart_target(
+                &remote, params,
+            );
+        }
+        let token = params.token;
+        let tip = get_espo_indexed_height().unwrap_or(0);
+        let config = AmmDataConfig::load_from_global_config().ok();
+        let mut target = config.as_ref().and_then(|c| c.full_target(&token, tip));
+
+        // A quote that came into force at a height only has candles for a token
+        // once that token's history has been forked across, which happens on its
+        // first trade after the height. Until then the pair is still on the
+        // default quote, so an illiquid token does not go blank at the fork height.
+        if let (Some(config), Some(t)) = (config.as_ref(), target) {
+            let plan = config.derived_index_plan(tip);
+            if plan.is_forked_quote(&t)
+                && t != token
+                && !self.token_derived_fork_done(&token, &t).unwrap_or(false)
+            {
+                target = plan.fork_source.filter(|d| {
+                    config.derived_quotes().iter().any(|q| q.alkane == *d && q.active_at(tip))
+                });
+            }
+        }
+        // The token is the quote it would proxy to: that chart does not exist.
+        if target == Some(token) {
+            target = None;
+        }
+        Ok(FullChartTargetResult { target })
+    }
+
     pub fn rpc_get_candles(&self, params: RpcGetCandlesParams) -> Result<RpcGetCandlesResult> {
         if let Some(remote) = crate::config::explorer_remote() {
             return crate::modules::ammdata::internal_rpc::remote_rpc_get_candles(&remote, params);
@@ -6434,6 +6476,18 @@ pub struct RpcGetBtcUsdCandlesResult {
     pub value: Value,
 }
 
+/// Which chart `<token>-full` resolves to.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FullChartTargetParams {
+    pub token: SchemaAlkaneId,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FullChartTargetResult {
+    /// `Some(quote)`: the token's derived chart against `quote`. `None`: its direct chart.
+    pub target: Option<SchemaAlkaneId>,
+}
+
 pub struct RpcGetTvlCandlesParams {
     /// Omit for the protocol-wide line; set to an alkane id for that token's line.
     pub token: Option<String>,
@@ -7554,25 +7608,7 @@ fn resolve_full_chart_id(provider: &AmmDataProvider, raw: &str) -> Option<String
         return None;
     }
     let token = parse_id_from_str(token_part)?;
-    let tip = get_espo_indexed_height().unwrap_or(0);
-    let config = AmmDataConfig::load_from_global_config().ok();
-    let mut target = config.as_ref().and_then(|c| c.full_target(&token, tip));
-
-    // A quote that came into force at a height only has candles for a token once
-    // that token's history has been forked across, which happens on its first
-    // trade after the height. Until then the pair is still on the default quote,
-    // so an illiquid token's chart does not go blank at the fork height.
-    if let (Some(config), Some(t)) = (config.as_ref(), target) {
-        let plan = config.derived_index_plan(tip);
-        if plan.is_forked_quote(&t)
-            && t != token
-            && !provider.token_derived_fork_done(&token, &t).unwrap_or(false)
-        {
-            target = plan.fork_source.filter(|d| {
-                config.derived_quotes().iter().any(|q| q.alkane == *d && q.active_at(tip))
-            });
-        }
-    }
+    let target = provider.full_chart_target(FullChartTargetParams { token }).ok()?.target;
     Some(full_chart_id(token_part, &token, target, kind))
 }
 
