@@ -346,6 +346,65 @@ static TRACE_QUEUE: OnceLock<Arc<Mutex<VecDeque<Txid>>>> = OnceLock::new();
 static MEMPOOL_EVENTS: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 static RECALCULATE_TEMPLATES_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static HYDRATION_RUNNING: AtomicBool = AtomicBool::new(false);
+/// The txids of the last `CONFIRMED_BLOCKS_REMEMBERED` indexed blocks (see
+/// `remember_confirmed`): a transaction the chain has mined is never entered
+/// into this store again, whatever feed brings it.
+static RECENTLY_CONFIRMED: OnceLock<Mutex<RecentlyConfirmed>> = OnceLock::new();
+const CONFIRMED_BLOCKS_REMEMBERED: usize = 12;
+
+#[derive(Default)]
+struct RecentlyConfirmed {
+    blocks: VecDeque<Vec<Txid>>,
+    txids: HashSet<Txid>,
+}
+
+fn recently_confirmed_state() -> &'static Mutex<RecentlyConfirmed> {
+    RECENTLY_CONFIRMED.get_or_init(|| Mutex::new(RecentlyConfirmed::default()))
+}
+
+/// Remember a block's txids as MINED for the next `CONFIRMED_BLOCKS_REMEMBERED`
+/// blocks. bitcoind's `rawtx` ZMQ topic publishes not only mempool arrivals
+/// but EVERY transaction of a block it connects (and disconnects), and the
+/// subscriber thread falls behind during a mint storm (one `getmempoolentry`
+/// per message): on 2026 10 05 mainnet espo re-entered the transactions of
+/// block 970,124 as mempool arrivals 26 minutes after their block — `first_seen`
+/// past the block's time, fee 0 (the node no longer held them), projected block
+/// 7 — long after the indexer had purged them, and a reverted swap among them
+/// read as pending on pizza.fun for an hour. Purge first, then refuse.
+fn remember_confirmed(txids: &[Txid]) {
+    if txids.is_empty() {
+        return;
+    }
+    let Ok(mut recent) = recently_confirmed_state().lock() else { return };
+    recent.blocks.push_back(txids.to_vec());
+    for txid in txids {
+        recent.txids.insert(*txid);
+    }
+    while recent.blocks.len() > CONFIRMED_BLOCKS_REMEMBERED {
+        let Some(old) = recent.blocks.pop_front() else { break };
+        for txid in old {
+            recent.txids.remove(&txid);
+        }
+    }
+}
+
+/// The chain mined this transaction within the last blocks: never a mempool entry.
+fn recently_confirmed(txid: &Txid) -> bool {
+    recently_confirmed_state()
+        .lock()
+        .map(|recent| recent.txids.contains(txid))
+        .unwrap_or(false)
+}
+
+/// bitcoind's answer to `getmempoolentry` for a txid its mempool does not hold
+/// (RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool"): a block's
+/// transaction published on `rawtx`, or one mined / evicted since it was sent.
+fn not_in_node_mempool(e: &bitcoincore_rpc::Error) -> bool {
+    matches!(
+        e,
+        bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(err)) if err.code == -5
+    )
+}
 
 fn mempool_state() -> &'static Arc<RwLock<InMemoryMempool>> {
     IN_MEMORY_MEMPOOL.get_or_init(|| Arc::new(RwLock::new(InMemoryMempool::default())))
@@ -1965,6 +2024,10 @@ fn build_memory_metadata_entry(
 
 fn upsert_memory_entry(entry: MempoolTransactionStruct) {
     let txid = entry.txid;
+    // mined within the last blocks: no feed re-enters it (see `remember_confirmed`)
+    if recently_confirmed(&txid) {
+        return;
+    }
     let Ok(mut state) = mempool_state().write() else { return };
     let mut should_enqueue = !entry.protostones.is_empty() && !entry.is_diesel_mint;
     let mut removed_conflicts = HashSet::new();
@@ -2802,7 +2865,8 @@ async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()
     let protection_expired = clear_until.map(|until| until <= now).unwrap_or(false);
     let sharp_drop = current_count > 20_000
         && canonical.len().saturating_mul(100) <= current_count.saturating_mul(80);
-    let skip_removal = !protection_expired && (sharp_drop || (clear_active && canonical.len() < current_count));
+    let skip_removal =
+        !protection_expired && (sharp_drop || (clear_active && canonical.len() < current_count));
     let mut protected_refresh = false;
     if skip_removal {
         protected_refresh = true;
@@ -3060,8 +3124,21 @@ fn ingest_zmq_rawtx(url: String, network: Network) {
             }
             let Ok(tx) = deserialize::<Transaction>(&body) else { continue };
             let txid = tx.compute_txid();
-            let verbose: Option<VerboseMempoolEntry> =
-                rpc.call("getmempoolentry", &[json!(txid.to_string())]).ok();
+            if recently_confirmed(&txid) {
+                continue;
+            }
+            /* `rawtx` carries every transaction of a connected block too: the node
+            answers "not in mempool" for those, and for one mined or evicted since
+            it was announced — none of them is a mempool entry. A node that did not
+            answer at all leaves the entry fee-less as before; the canonical refresh
+            settles it. */
+            let verbose: Option<VerboseMempoolEntry> = match rpc
+                .call::<VerboseMempoolEntry>("getmempoolentry", &[json!(txid.to_string())])
+            {
+                Ok(verbose) => Some(verbose),
+                Err(e) if not_in_node_mempool(&e) => continue,
+                Err(_) => None,
+            };
             let entry = build_memory_entry(txid, tx, verbose.as_ref(), network);
             upsert_memory_entry(entry);
             recalculate_memory_templates();
@@ -3218,7 +3295,8 @@ pub fn fetch_mempool_tx_on_demand(txid: &Txid) -> Option<MempoolEntry> {
         return get_tx_from_mempool(txid);
     }
     let rpc = get_bitcoind_rpc_client();
-    let verbose: VerboseMempoolEntry = rpc.call("getmempoolentry", &[json!(txid.to_string())]).ok()?;
+    let verbose: VerboseMempoolEntry =
+        rpc.call("getmempoolentry", &[json!(txid.to_string())]).ok()?;
     let raw_hex = rpc.get_raw_transaction_hex(txid, None).ok()?;
     let raw = hex::decode(raw_hex.trim()).ok()?;
     let tx = deserialize::<Transaction>(&raw).ok()?;
@@ -3408,6 +3486,7 @@ pub fn pending_for_address(addr: &str) -> Vec<MempoolEntry> {
 }
 
 pub fn purge_confirmed_txids(txids: &[Txid]) -> Result<usize> {
+    remember_confirmed(txids);
     let Ok(mut state) = mempool_state().write() else { return Ok(0) };
     let mut removed = 0usize;
     for txid in txids {
@@ -3767,5 +3846,40 @@ mod tests {
         );
         assert!(actions.is_empty());
         assert_eq!(actions_total, 0);
+    }
+
+    #[test]
+    fn a_mined_transaction_is_refused_for_the_remembered_blocks() {
+        let mined = sample_tx().compute_txid();
+        remember_confirmed(&[mined]);
+        assert!(recently_confirmed(&mined));
+        // the window slides: after CONFIRMED_BLOCKS_REMEMBERED more blocks it is forgotten
+        for i in 0..CONFIRMED_BLOCKS_REMEMBERED {
+            let mut tx = sample_tx();
+            tx.lock_time = LockTime::from_consensus(1_000 + i as u32);
+            remember_confirmed(&[tx.compute_txid()]);
+        }
+        assert!(!recently_confirmed(&mined));
+        remember_confirmed(&[]);
+    }
+
+    #[test]
+    fn not_in_mempool_is_the_node_s_minus_five() {
+        let not_held = bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(
+            bitcoincore_rpc::jsonrpc::error::RpcError {
+                code: -5,
+                message: "Transaction not in mempool".to_string(),
+                data: None,
+            },
+        ));
+        assert!(not_in_node_mempool(&not_held));
+        let transport = bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(
+            bitcoincore_rpc::jsonrpc::error::RpcError {
+                code: -1,
+                message: "HTTP connect failed".to_string(),
+                data: None,
+            },
+        ));
+        assert!(!not_in_node_mempool(&transport));
     }
 }
